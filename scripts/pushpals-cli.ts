@@ -103,6 +103,7 @@ type CliClearTarget = {
 
 type CliClearFailure = CliClearTarget & {
   detail: string;
+  unconfirmed?: boolean;
 };
 
 type CliClearRemoveResult = "removed" | "missing" | CliClearFailure;
@@ -3600,13 +3601,32 @@ function resolveConfiguredDockerExecutable(
   return configured || (platform === "win32" ? "docker.exe" : "docker");
 }
 
+export type WorkerpalDockerCleanupStatus =
+  | { ok: true; outcome: "removed" | "absent"; detail: string }
+  | { ok: false; outcome: "skipped" | "timed_out" | "failed"; detail: string };
+
+export function formatWorkerpalWarmCleanupNotice(
+  result: WorkerpalDockerCleanupStatus & { removed: number },
+  phase: string,
+): { level: "log" | "warn"; line: string } | null {
+  if (!result.ok) {
+    return {
+      level: "warn",
+      line: `[pushpals] WorkerPal warm-container cleanup warning (${phase}, ${result.outcome}): ${result.detail}`,
+    };
+  }
+  return result.removed > 0
+    ? { level: "log", line: `[pushpals] ${result.detail} (${phase}).` }
+    : null;
+}
+
 export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   repoRoot: string;
   env: Record<string, string>;
   platform?: NodeJS.Platform;
   runCommandWithEnvFn?: typeof runCommandWithEnv;
   commandTimeoutMs?: number;
-}): Promise<{ ok: boolean; detail: string; removed: number }> {
+}): Promise<WorkerpalDockerCleanupStatus & { removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
   const commandTimeoutMs =
     typeof opts.commandTimeoutMs === "number" && Number.isFinite(opts.commandTimeoutMs)
@@ -3634,20 +3654,23 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
     const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
     if (isDockerUnavailableDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "skipped",
         detail: `docker unavailable; skipped WorkerPal warm-container cleanup: ${detail}`,
         removed: 0,
       };
     }
     if (isDockerCleanupTimeoutDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "timed_out",
         detail: `docker cleanup timed out; skipped WorkerPal warm-container cleanup: ${detail}`,
         removed: 0,
       };
     }
     return {
       ok: false,
+      outcome: "failed",
       detail: `failed to inspect lingering WorkerPal warm containers: ${detail}`,
       removed: 0,
     };
@@ -3660,6 +3683,7 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   if (containerIds.length === 0) {
     return {
       ok: true,
+      outcome: "absent",
       detail: "no lingering WorkerPal warm containers found",
       removed: 0,
     };
@@ -3675,26 +3699,30 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
     const detail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
     if (isDockerUnavailableDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "skipped",
         detail: `docker unavailable; skipped WorkerPal warm-container cleanup: ${detail}`,
         removed: 0,
       };
     }
     if (isDockerCleanupTimeoutDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "timed_out",
         detail: `docker cleanup timed out; skipped WorkerPal warm-container cleanup: ${detail}`,
         removed: 0,
       };
     }
     return {
       ok: false,
+      outcome: "failed",
       detail: `failed to remove lingering WorkerPal warm containers: ${detail}`,
       removed: 0,
     };
   }
   return {
     ok: true,
+    outcome: "removed",
     detail: `removed ${containerIds.length} lingering WorkerPal warm container(s)`,
     removed: containerIds.length,
   };
@@ -3707,11 +3735,12 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
   platform?: NodeJS.Platform;
   runCommandWithEnvFn?: typeof runCommandWithEnv;
   commandTimeoutMs?: number;
-}): Promise<{ ok: boolean; detail: string; removed: boolean; imageName: string }> {
+}): Promise<WorkerpalDockerCleanupStatus & { removed: boolean; imageName: string }> {
   const imageName = String(opts.dockerImage ?? "").trim();
   if (!imageName) {
     return {
       ok: true,
+      outcome: "absent",
       detail: "no local WorkerPal sandbox image configured",
       removed: false,
       imageName: "",
@@ -3738,6 +3767,7 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
     if (isMissingDockerImageDetail(detail)) {
       return {
         ok: true,
+        outcome: "absent",
         detail: `no local WorkerPal sandbox image found for ${imageName}`,
         removed: false,
         imageName,
@@ -3745,7 +3775,8 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
     }
     if (isDockerUnavailableDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "skipped",
         detail: `docker unavailable; skipped WorkerPal sandbox image cleanup: ${detail}`,
         removed: false,
         imageName,
@@ -3753,7 +3784,8 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
     }
     if (isDockerCleanupTimeoutDetail(detail)) {
       return {
-        ok: true,
+        ok: false,
+        outcome: "timed_out",
         detail: `docker cleanup timed out; skipped WorkerPal sandbox image cleanup: ${detail}`,
         removed: false,
         imageName,
@@ -3761,6 +3793,7 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
     }
     return {
       ok: false,
+      outcome: "failed",
       detail: `failed to remove local WorkerPal sandbox image ${imageName}: ${detail}`,
       removed: false,
       imageName,
@@ -3769,6 +3802,7 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
 
   return {
     ok: true,
+    outcome: "removed",
     detail: `removed local WorkerPal sandbox image ${imageName}`,
     removed: true,
     imageName,
@@ -3917,7 +3951,11 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
 }
 
 function isMissingDockerImageDetail(detail: string): boolean {
-  return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
+  return (
+    !isDockerUnavailableDetail(detail) &&
+    !isDockerCleanupTimeoutDetail(detail) &&
+    /\b(no such object|no such image)\b|\bimage\b[^\r\n]*\bnot found\b/i.test(String(detail ?? ""))
+  );
 }
 
 export function isDockerCleanupTimeoutDetail(detail: string): boolean {
@@ -3936,6 +3974,8 @@ export function isDockerUnavailableDetail(detail: string): boolean {
     /executable not found[^\r\n]*["']?docker(?:\.exe)?/i.test(text) ||
     /docker(?:\.exe)?: command not found/i.test(text) ||
     /spawn\s+docker(?:\.exe)?\s+ENOENT/i.test(text) ||
+    /\bENOENT\b[^\r\n]*\b(?:posix_spawn|spawn)\b/i.test(text) ||
+    /\bspawn\b[^\r\n]*\bENOENT\b/i.test(text) ||
     /docker(?:\.exe)?'?\s+is not recognized as an internal or external command/i.test(text)
   );
 }
@@ -5075,6 +5115,56 @@ async function requestLocalRuntimeShutdown(
   }
 }
 
+/** Finish local cleanup even when Docker cleanup is unconfirmed, but never report full success. */
+export async function completeCliStateClear(
+  targets: readonly CliClearTarget[],
+  initialFailures: readonly CliClearFailure[] = [],
+  writeLine: (level: "log" | "warn" | "error", line: string) => void = (level, line) =>
+    console[level](line),
+): Promise<number> {
+  const removed: CliClearTarget[] = [];
+  const missing: CliClearTarget[] = [];
+  const failed: CliClearFailure[] = [...initialFailures];
+  for (const target of targets) {
+    const result = await removeCliClearTarget(target);
+    if (result === "removed") {
+      removed.push(target);
+    } else if (result === "missing") {
+      missing.push(target);
+    } else {
+      failed.push(result);
+    }
+  }
+
+  for (const target of removed) {
+    writeLine("log", `[pushpals] Cleared ${target.label}: ${target.path}`);
+  }
+  for (const target of missing) {
+    writeLine("log", `[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
+  }
+  for (const failure of failed) {
+    writeLine(
+      failure.unconfirmed ? "warn" : "error",
+      failure.unconfirmed
+        ? `[pushpals] Cleanup unconfirmed for ${failure.label}: ${failure.path} (${failure.detail})`
+        : `[pushpals] Failed to clear ${failure.label}: ${failure.path} (${failure.detail})`,
+    );
+  }
+  if (failed.some((failure) => failure.unconfirmed)) {
+    writeLine(
+      "error",
+      "[pushpals] Clear incomplete: requested Docker cleanup could not be confirmed.",
+    );
+    return 1;
+  }
+  if (failed.length > 0) {
+    writeLine("error", "[pushpals] Clear completed with errors.");
+    return 1;
+  }
+  writeLine("log", "[pushpals] Clear completed.");
+  return 0;
+}
+
 async function clearPushpalsState(opts: {
   repoRoot: string;
   runtimeRoot: string;
@@ -5143,9 +5233,7 @@ async function clearPushpalsState(opts: {
     config: opts.config,
     cliStatePath: opts.cliStatePath,
   });
-  const removed: CliClearTarget[] = [];
-  const missing: CliClearTarget[] = [];
-  let failed: CliClearFailure[] = [];
+  const failed: CliClearFailure[] = [];
 
   if (opts.config.remotebuddy.workerpalDocker || opts.config.remotebuddy.workerpalRequireDocker) {
     const dockerEnv = normalizeChildProcessEnv(process.env as Record<string, string | undefined>);
@@ -5164,6 +5252,7 @@ async function clearPushpalsState(opts: {
         label: "WorkerPal warm containers",
         path: opts.repoRoot,
         detail: warmCleanup.detail,
+        unconfirmed: warmCleanup.outcome === "skipped" || warmCleanup.outcome === "timed_out",
       });
     }
 
@@ -5183,43 +5272,12 @@ async function clearPushpalsState(opts: {
         label: "WorkerPal sandbox image",
         path: imageCleanup.imageName || opts.repoRoot,
         detail: imageCleanup.detail,
+        unconfirmed: imageCleanup.outcome === "skipped" || imageCleanup.outcome === "timed_out",
       });
     }
   }
 
-  for (const target of targets) {
-    const result = await removeCliClearTarget(target);
-    if (result === "removed") {
-      removed.push(target);
-      continue;
-    }
-    if (result === "missing") {
-      missing.push(target);
-      continue;
-    }
-    failed.push(result);
-  }
-
-  for (const target of removed) {
-    console.log(`[pushpals] Cleared ${target.label}: ${target.path}`);
-  }
-  for (const target of missing) {
-    console.log(`[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
-  }
-
-  for (const failure of failed) {
-    console.error(
-      `[pushpals] Failed to clear ${failure.label}: ${failure.path} (${failure.detail})`,
-    );
-  }
-
-  if (failed.length > 0) {
-    console.error("[pushpals] Clear completed with errors.");
-    return 1;
-  }
-
-  console.log("[pushpals] Clear completed.");
-  return 0;
+  return await completeCliStateClear(targets, failed);
 }
 
 async function probeServer(serverUrl: string): Promise<boolean> {
@@ -7547,15 +7605,8 @@ async function main(): Promise<void> {
       repoRoot,
       env: workerpalDockerPrecheck.env,
     });
-    if (!cleanup.ok) {
-      console.warn(
-        `[pushpals] WorkerPal warm-container cleanup warning (${phase}): ${cleanup.detail}`,
-      );
-      return;
-    }
-    if (cleanup.removed > 0) {
-      console.log(`[pushpals] ${cleanup.detail} (${phase}).`);
-    }
+    const notice = formatWorkerpalWarmCleanupNotice(cleanup, phase);
+    if (notice) console[notice.level](notice.line);
   };
   const cleanupPushPalsGitWorktreesIfNeeded = async (phase: string): Promise<void> => {
     const cleanup = await cleanupLingeringPushPalsGitWorktrees({

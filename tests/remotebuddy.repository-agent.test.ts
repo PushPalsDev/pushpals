@@ -492,6 +492,362 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     }
   }, 30_000);
 
+  test.each([
+    ["objective_type_not_allowed", { objective_type: "feature_large" }],
+    ["risk_exceeds_policy", { risk_level: "high" }],
+    ["scope_validation_failed", { target_paths: [] }],
+    ["scope_validation_failed", { scope: { read_anywhere: true, write_globs: ["../outside"] } }],
+    ["missing_vision_section_refs", { vision_section_refs: ["99"] }],
+    [
+      "target_paths_missing_in_repo",
+      {
+        target_paths: ["src/missing.ts"],
+        scope: { read_anywhere: true, write_globs: ["src/missing.ts"] },
+      },
+    ],
+    ["pushpals_internal_leak", { title: "Add WorkerPal runtime telemetry" }],
+    ["pushpals_internal_leak", { title: "Add LocalBuddy runtime telemetry" }],
+    ["pushpals_internal_leak", { title: "Add PushPal runtime telemetry" }],
+    ["confidence_below_threshold", { confidence: 0.4 }],
+  ] as Array<[string, Record<string, unknown>]>)(
+    "advances discovery instead of replaying a positive rejected for %s",
+    async (reason, overrides) => {
+      const repo = createCoverageRepository();
+      const request = await coverageRequest(repo);
+      request.context!.vision = {
+        ...(request.context!.vision as any),
+        sections: [{ number: "1", title: "Priorities" }],
+      };
+      request.context!.deterministicPolicy = { minimumConfidence: 0.6 };
+      const memory = new InMemoryMemoryStore();
+      const warnings: string[] = [];
+      let calls = 0;
+      const llm = new FakeLlm(() => {
+        const response = modelResponse() as any;
+        if (++calls === 1) Object.assign(response.data.candidates[0], overrides);
+        return response;
+      });
+      const worker = () =>
+        new RepositoryAgentWorker({
+          control: unusedControl(),
+          memory,
+          llm,
+          logger: { ...quietLogger, warn: (line) => warnings.push(String(line)) },
+        });
+      const rejected = await worker().analyze("rejected-positive", request);
+      expect((rejected.data as any).candidates).toEqual([]);
+      expect(rejected.summary).toContain(reason);
+      expect(warnings.join("\n")).toContain('"outcome":"no_structurally_admissible_candidates"');
+      const next = await worker().analyze("next-page-positive", request);
+      expect((next.data as any).candidates).toHaveLength(1);
+      expect(next.cache.hit).toBe(false);
+      const cached = await worker().analyze("next-page-cache", request);
+      expect(cached.cache.hit).toBe(true);
+      expect((cached.data as any).candidates).toHaveLength(1);
+      expect(
+        llm.analysisCalls.map(
+          (input) => JSON.parse(input.messages[0]!.content).evidencePacket.discoveryCoverage.page,
+        ),
+      ).toEqual([1, 2]);
+      const [cursor] = await coverageRecords(memory, request);
+      expect((cursor!.value as any).nextPage).toBe(1);
+    },
+  );
+
+  test("cache identity fences read-anywhere policy without caching transient cooldown rejection", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const allowed = await worker.analyze("policy-allowed", request);
+    expect((allowed.data as any).candidates).toHaveLength(1);
+    const blocked = await worker.analyze("policy-denied", {
+      ...request,
+      context: { ...request.context, deterministicPolicy: { allowReadAnywhere: false } },
+    });
+    expect(blocked.cache.hit).toBe(false);
+    expect((blocked.data as any).candidates).toEqual([]);
+    expect(blocked.summary).toContain("read_anywhere_not_allowed");
+    const transient = await worker.analyze("policy-transient", {
+      ...request,
+      context: {
+        ...request.context,
+        runtimeSignals: {
+          activeCooldowns: [{ path: "src/index.ts", until: "2099-01-01" }],
+          openObjectives: [{ target_paths: ["src/index.ts"] }],
+        },
+      },
+    });
+    expect(transient.cache.hit).toBe(true);
+    expect((transient.data as any).candidates).toHaveLength(1);
+    expect(llm.analysisCalls).toHaveLength(2);
+  });
+
+  test("keeps admitted siblings in a mixed batch without replaying rejected proposals", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(() => {
+      const response = modelResponse() as any;
+      response.data.candidates.push({
+        ...response.data.candidates[0],
+        id: "internal",
+        title: "Add WorkerPal orchestration",
+      });
+      return response;
+    });
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const first = await worker.analyze("mixed-first", request);
+    const second = await worker.analyze("mixed-cache", request);
+    expect((first.data as any).candidates.map((entry: any) => entry.id)).toEqual([
+      "reliability-candidate",
+    ]);
+    expect(second.data).toEqual(first.data);
+    expect(second.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+  });
+
+  test.each([
+    [{ disabledObjectiveTypes: ["feature_small"] }, "objective_type_not_allowed"],
+    [{ disabledComponents: ["src"] }, "component_disabled_by_policy"],
+  ])(
+    "fences explicitly disabled configuration %j from reusable allowed proposals",
+    async (policy, reason) => {
+      const repo = createCoverageRepository();
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const llm = new FakeLlm();
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      expect((await worker.analyze("before-disable", request)).cache.hit).toBe(false);
+      const disabled = await worker.analyze("disabled", {
+        ...request,
+        context: { ...request.context, deterministicPolicy: policy },
+      });
+      expect(disabled.cache.hit).toBe(false);
+      expect((disabled.data as any).candidates).toEqual([]);
+      expect(disabled.summary).toContain(reason as string);
+      const restored = await worker.analyze("restored", request);
+      expect(restored.cache.hit).toBe(true);
+      expect((restored.data as any).candidates).toHaveLength(1);
+      expect(llm.analysisCalls).toHaveLength(2);
+    },
+  );
+
+  test("advances a proposal without inferable validation but keeps inferred validation for another target", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-unknown-validation-"));
+    tempDirs.push(repo);
+    git(repo, ["init"]);
+    mkdirSync(join(repo, "src"));
+    writeFileSync(join(repo, "vision.md"), "# Vision\n\n## Priorities\n\nKeep formats correct.\n");
+    for (let index = 0; index < 9; index++)
+      writeFileSync(join(repo, "src", `format-${index}.wat`), "(module)\n");
+    writeFileSync(join(repo, "src", "valid.js"), "export const ready = true;\n");
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "fixture",
+    ]);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() => {
+      const response = modelResponse() as any;
+      const target = ++calls === 1 ? "src/format-0.wat" : "src/valid.js";
+      Object.assign(response.data.candidates[0], {
+        target_paths: [target],
+        scope: { read_anywhere: true, write_globs: [target] },
+        expected_validation: calls === 1 ? ["bun test"] : [],
+      });
+      return response;
+    });
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const rejected = await worker.analyze("unvalidated", request);
+    expect((rejected.data as any).candidates).toEqual([]);
+    expect(rejected.summary).toContain("missing_validation_steps");
+    const accepted = await worker.analyze("inferable", request);
+    expect((accepted.data as any).candidates).toHaveLength(1);
+    expect((accepted.data as any).candidates[0].expected_validation).toEqual([]);
+    expect(accepted.cache.hit).toBe(false);
+    expect((await worker.analyze("inferable-cached", request)).cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(2);
+  });
+
+  test("revalidates a cached positive before delivery and advances only after an actual cache read", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const first = await worker.analyze("before-invalid-cache", request);
+    const scope = {
+      namespace: "repository_agent_cache",
+      repositoryId: request.repository.identity,
+    };
+    const key = first.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key;
+    expect(key).toBeTruthy();
+    const record = await memory.get({ scope, key: key! });
+    expect(record).not.toBeNull();
+    const value = structuredClone(record!.value) as any;
+    value.result.data.candidates[0].title = "Add RemoteBuddy internal telemetry";
+    await memory.put({
+      scope,
+      key: record!.key,
+      kind: record!.kind,
+      summary: record!.summary,
+      value,
+      provenance: record!.provenance,
+      confidence: record!.confidence,
+    });
+    const readOnly = await worker.analyze("invalid-cache-readonly", {
+      ...request,
+      freshness: "cache_only",
+    });
+    expect(readOnly.cache.hit).toBe(true);
+    expect((readOnly.data as any).candidates).toEqual([]);
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+    const rejected = await worker.analyze("invalid-cache-rejected", request);
+    expect(rejected.cache.hit).toBe(true);
+    expect((rejected.data as any).candidates).toEqual([]);
+    const next = await worker.analyze("after-invalid-cache", request);
+    expect(next.cache.hit).toBe(false);
+    expect((next.data as any).candidates).toHaveLength(1);
+    expect(llm.analysisCalls).toHaveLength(2);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "never uses a linked external manifest to admit or invalidate a same-tree candidate",
+    async () => {
+      const repo = createRepository();
+      const outside = mkdtempSync(join(tmpdir(), "pushpals-validation-outside-"));
+      tempDirs.push(outside);
+      const manifest = join(outside, "package.json");
+      writeFileSync(manifest, JSON.stringify({ scripts: { test: "bun test" } }));
+      rmSync(join(repo, "package.json"));
+      symlinkSync(manifest, join(repo, "package.json"));
+      git(repo, ["add", "package.json"]);
+      git(repo, [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "linked manifest",
+      ]);
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const llm = new FakeLlm();
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      const first = await worker.analyze("linked-validation", request);
+      expect((first.data as any).candidates).toEqual([]);
+      expect(first.summary).toContain("missing_validation_steps");
+      writeFileSync(manifest, JSON.stringify({ scripts: { check: "node outside-host-only.js" } }));
+      const second = await worker.analyze("linked-validation-cache", request);
+      expect(second.cache.hit).toBe(true);
+      expect((second.data as any).candidates).toEqual([]);
+      expect(llm.analysisCalls).toHaveLength(1);
+    },
+  );
+
+  test("does not cache missing validation when manifest inspection exceeds its bounded evidence budget", async () => {
+    const repo = createRepository();
+    writeFileSync(
+      join(repo, "package.json"),
+      JSON.stringify({
+        padding: "x".repeat(600_000),
+        scripts: { test: "bun test" },
+      }),
+    );
+    git(repo, ["add", "package.json"]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "large manifest",
+    ]);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm: new FakeLlm(),
+      logger: quietLogger,
+    });
+    await expect(worker.analyze("bounded-validation", request)).rejects.toThrow(
+      "Bounded validation snapshot unavailable",
+    );
+    expect(await coverageRecords(memory, request)).toEqual([]);
+    expect(
+      await memory.search({
+        scope: { namespace: "repository_agent_cache", repositoryId: request.repository.identity },
+        kinds: ["exact_repository_analysis"],
+      }),
+    ).toEqual([]);
+  });
+
+  test("incomplete tracked inventory cannot establish validation-manifest absence", async () => {
+    const repo = createRepository();
+    const request = await coverageRequest(repo);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm: new FakeLlm(),
+      logger: quietLogger,
+    });
+    await expect(
+      (worker as any).validationSnapshotFileSystem(
+        repo,
+        request,
+        {
+          paths: ["src/index.ts"],
+          pathByComparable: new Map([["src/index.ts", "src/index.ts"]]),
+        },
+        ["src/index.ts"],
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("tracked inventory is incomplete");
+  });
+
   test("caps evidence pages and reports bounded exhaustion without claiming the repo is exhausted", async () => {
     const repo = createCoverageRepository(100);
     const request = await coverageRequest(repo);

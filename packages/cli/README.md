@@ -56,6 +56,8 @@ Run from inside the Git repository you want PushPals to manage.
 
 The CLI refuses to run outside a Git repository or against a Server attached to a different repository. Embedded release assets live under `~/.pushpals/runtime`; repo-specific CLI state lives in the repository's Git metadata directory.
 
+When Docker cleanup is requested, `--clear` exits with code 1 if Docker is unavailable or cleanup times out, even if local state was successfully removed. The output identifies the unconfirmed cleanup; retry when Docker is responsive. Startup cleanup remains best-effort and warns without blocking startup indefinitely.
+
 ## Implementation Map
 
 - `bin/pushpals.cjs` - npm shim, Bun version check, bootstrap watchdog, and signal forwarding.

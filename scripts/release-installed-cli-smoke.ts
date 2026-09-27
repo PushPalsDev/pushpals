@@ -52,6 +52,20 @@ const RUNTIME_SERVICE_TOKENS = [
   "source-control-manager",
 ] as const;
 
+export function installedSmokeWorkerEnv(workerpalAutospawn: boolean): Record<string, string> {
+  if (workerpalAutospawn) return {};
+  // A no-worker smoke clears only local state. Disabling autospawn alone does
+  // not disable explicitly requested Docker cleanup during `pushpals --clear`.
+  return {
+    REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false",
+    WORKERPALS_EXECUTION_PLATFORM: "auto",
+    PUSHPALS_WORKERPALS_EXECUTION_PLATFORM: "auto",
+    REMOTEBUDDY_WORKERPAL_DOCKER: "false",
+    REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER: "false",
+    WORKERPALS_REQUIRE_DOCKER: "false",
+  };
+}
+
 export function runtimeCandidateBinaryNames(platformKey: string): string[] {
   if (!/^(?:linux|windows|macos)-(?:x64|arm64)$/.test(platformKey)) {
     throw new Error(`Unsupported candidate runtime platform: ${platformKey}`);
@@ -659,7 +673,7 @@ async function main(): Promise<void> {
       PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
       OPENAI_API_KEY: process.env.OPENAI_API_KEY || "pushpals-installed-cli-smoke-openai-key",
       REMOTEBUDDY_AUTONOMY_ENABLED: "true",
-      ...(options.workerpalAutospawn ? {} : { REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false" }),
+      ...installedSmokeWorkerEnv(options.workerpalAutospawn),
       ...(options.useRepoDataDir ? {} : { PUSHPALS_DATA_DIR_OVERRIDE: dataDir }),
     } as Record<string, string>;
     finalClear = { pushpalsPath, repoPath, commandEnv };

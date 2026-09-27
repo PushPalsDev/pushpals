@@ -203,8 +203,12 @@ pushpals --clear
 - The CLI package payload check fails because an external tool binary, native
   library, virtualenv, or `node_modules` directory would be shipped. Remove the
   vendored artifact and rely on environment discovery/downloads instead.
-- Docker is unavailable in an installed-CLI smoke environment; cleanup should be
-  best-effort, not a hard failure.
+- Docker is unavailable or cleanup times out: explicit `pushpals --clear` still
+  clears local state but exits `1` with an incomplete summary when requested
+  Docker cleanup cannot be confirmed. No-worker installed-CLI smokes explicitly
+  disable Docker configuration and must still require a successful clear;
+  worker-enabled smokes retain Docker cleanup requirements. Automatic startup
+  and shutdown cleanup remain warning-only and best-effort.
 - User-local `runtime/configs/local.toml` overrides new defaults during manual
   smoke testing.
 - Git cannot fetch or push on Windows due to certificate backend mismatch; retry

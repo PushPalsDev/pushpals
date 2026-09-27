@@ -7831,7 +7831,7 @@ class PersistentSessionMemory {
 
 // apps/remotebuddy/src/remotebuddy_main.ts
 import { existsSync as existsSync6, mkdirSync as mkdirSync2, readFileSync as readFileSync5 } from "fs";
-import { resolve as resolve8 } from "path";
+import { resolve as resolve9 } from "path";
 
 // apps/remotebuddy/src/autonomous_engine.ts
 import { createHash as createHash5, randomUUID as randomUUID2 } from "crypto";
@@ -7846,7 +7846,7 @@ import {
   rmSync as rmSync2,
   statSync as statSync2
 } from "fs";
-import { dirname, relative as relative2, resolve as resolve6 } from "path";
+import { dirname, relative as relative3, resolve as resolve7 } from "path";
 
 // apps/remotebuddy/src/autonomy_candidate_contract.ts
 var AUTONOMY_CANDIDATE_ENUMS = {
@@ -7981,6 +7981,305 @@ function autonomyCandidateContractErrors(data) {
   return errors.slice(0, 16);
 }
 
+// apps/remotebuddy/src/autonomy_candidate_policy.ts
+var AUTONOMY_CANDIDATE_POLICY = {
+  flaky_test: {
+    maxRisk: "low",
+    maxBreadth: "narrow",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  lint_fix: {
+    maxRisk: "low",
+    maxBreadth: "narrow",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  type_fix: {
+    maxRisk: "low",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  small_refactor: {
+    maxRisk: "medium",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  feature_small: {
+    maxRisk: "low",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  feature_medium: {
+    maxRisk: "medium",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true
+  },
+  feature_large: {
+    maxRisk: "high",
+    maxBreadth: "broad",
+    autonomousAllowed: false,
+    requireValidation: true
+  },
+  docs: { maxRisk: "low", maxBreadth: "medium", autonomousAllowed: true, requireValidation: false },
+  dep_bump: {
+    maxRisk: "medium",
+    maxBreadth: "narrow",
+    autonomousAllowed: false,
+    requireValidation: true
+  }
+};
+var AUTONOMY_RISK_ORDER = { low: 0, medium: 1, high: 2 };
+function staticAutonomyCandidateRejection(candidate, context) {
+  const type = candidate.objective_type;
+  if (Number(candidate.confidence) < context.minimumConfidence)
+    return "confidence_below_threshold";
+  const policy = AUTONOMY_CANDIDATE_POLICY[type];
+  if (!policy?.autonomousAllowed || context.disabledObjectiveTypes.includes(type) || context.allowedObjectiveTypes.length > 0 && !context.allowedObjectiveTypes.includes(type)) {
+    return "objective_type_not_allowed";
+  }
+  const risk = candidate.risk_level;
+  if (!(risk in AUTONOMY_RISK_ORDER))
+    return "invalid_risk_level";
+  if (AUTONOMY_RISK_ORDER[risk] > AUTONOMY_RISK_ORDER[policy.maxRisk])
+    return "risk_exceeds_policy";
+  const scope = candidate.scope;
+  const checked = validateScopeInvariants(candidate.component_area, candidate.target_paths, scope.write_globs, { requireWriteGlobs: true, hintsOnly: true });
+  if (!checked.ok)
+    return "scope_validation_failed";
+  if (context.disabledComponents.includes(checked.componentArea ?? String(candidate.component_area)))
+    return "component_disabled_by_policy";
+  if (scope.read_anywhere && !context.allowReadAnywhere)
+    return "read_anywhere_not_allowed";
+  if (context.visionSectionNumbers.size > 0 && normalizeVisionSectionRefs(candidate.vision_section_refs, new Set(context.visionSectionNumbers)).length === 0)
+    return "missing_vision_section_refs";
+  const tracked = new Set(context.trackedPaths);
+  if (checked.normalizedTargetPaths.some((path) => !tracked.has(path) && !context.trackedPaths.some((file) => file.startsWith(`${path}/`)))) {
+    return "target_paths_missing_in_repo";
+  }
+  return null;
+}
+
+// apps/remotebuddy/src/autonomy_candidate_admission.ts
+var INTERNAL_TEXT_PATTERNS = [
+  /\b(workerpals?|remotebuddy|localbuddy|pushpals?)\b/i,
+  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
+  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
+  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
+  /\bautonomy[-_\s]?internal\b/i
+];
+function containsPushPalsInternalUserRepoText(text) {
+  return INTERNAL_TEXT_PATTERNS.some((pattern) => pattern.test(text));
+}
+var text = (value) => typeof value === "string" ? value : "";
+var strings2 = (value) => Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+var blobOid = (value) => typeof value === "string" && /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(value);
+function relativePath(value) {
+  const path = value.trim().replace(/\\/g, "/");
+  if (!path || path.startsWith("/") || /^[a-z]:/i.test(path) || /[\0\r\n]/.test(path))
+    return null;
+  if (path.split("/").some((part) => !part || part === "." || part === ".."))
+    return null;
+  return path;
+}
+function sameRepository(provenance) {
+  const current = provenance.currentRepository;
+  const evidence = provenance.evidenceRepository;
+  return Boolean(current && evidence && current.identity.trim() && current.revision.trim() && current.tree.trim() && current.identity === evidence.identity && current.revision === evidence.revision && current.tree === evidence.tree);
+}
+function quotedStrings(value) {
+  const pattern = /"([^"\r\n]{1,512})"|'([^'\r\n]{1,512})'|`([^`\r\n]{1,512})`|\u201C([^\u201D\r\n]{1,512})\u201D|\u2018([^\u2019\r\n]{1,512})\u2019/g;
+  return [...value.matchAll(pattern)].slice(0, 64).map((match) => ({
+    value: match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5] ?? "",
+    index: match.index ?? 0,
+    length: match[0].length
+  }));
+}
+function escapeRegex2(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function maskGroundedSourceQuotations(candidate, provenance) {
+  const problem = text(candidate.problem_statement);
+  const title = text(candidate.title);
+  if (problem.length > 32000 || !sameRepository(provenance) || !/\b(correct|fix|repair|replace|remove|rename|eliminate|align|update|clean\s*up)\b/i.test(title) || !/\b(name|names|naming|label|labels|landmark|brand|branding|text|string|literal|copy)\b/i.test(title)) {
+    return { problem, masked: false };
+  }
+  const targets = new Set(strings2(candidate.target_paths).map(relativePath).filter(Boolean));
+  const currentBlobs = new Map((provenance.verifiedTargetPaths ?? []).slice(0, 128).flatMap((entry) => {
+    const path = relativePath(entry.path);
+    return path && targets.has(path) && blobOid(entry.blobHash) ? [[path, entry.blobHash]] : [];
+  }));
+  const sources = (provenance.evidence ?? []).slice(0, 64).flatMap((entry) => {
+    const path = relativePath(entry.path);
+    if (!path || !targets.has(path) || entry.revision !== provenance.currentRepository.revision || !blobOid(entry.blobHash) || currentBlobs.get(path) !== entry.blobHash || !entry.excerpt || entry.excerpt.length > 4000 || !Number.isInteger(entry.startLine) || entry.startLine < 1 || entry.endLine !== undefined && (!Number.isInteger(entry.endLine) || entry.endLine < entry.startLine)) {
+      return [];
+    }
+    const observation = new RegExp(`(?:^|[.!?;\\n]\\s*|,\\s*(?:and\\s+)?)` + `\`?${escapeRegex2(path)}\`?(?::([1-9]\\d*)(?:-([1-9]\\d*))?)?\\s+` + `(?:(?:currently|still)\\s+)?(?:exports?|declares?|contains?|defines?|uses?|reads?)\\s+` + `(?:(?:the|a|an|shared|user-visible|constant|string|literal|value|label|as|named)\\s+){0,6}$`);
+    return [
+      {
+        observation,
+        startLine: entry.startLine,
+        endLine: entry.endLine ?? entry.startLine,
+        literals: new Set(quotedStrings(entry.excerpt).map((quote) => quote.value))
+      }
+    ];
+  });
+  let output = "";
+  let copiedThrough = 0;
+  let masked = false;
+  for (const quote of quotedStrings(problem)) {
+    if (!containsPushPalsInternalUserRepoText(quote.value))
+      continue;
+    const prefix = problem.slice(Math.max(0, quote.index - 1000), quote.index);
+    const grounded = sources.some((source) => {
+      if (!source.literals.has(quote.value))
+        return false;
+      const match = source.observation.exec(prefix);
+      if (!match)
+        return false;
+      if (!match[1])
+        return true;
+      const startLine = Number(match[1]);
+      const endLine = Number(match[2] ?? match[1]);
+      return startLine >= source.startLine && endLine >= startLine && endLine <= source.endLine;
+    });
+    if (!grounded)
+      continue;
+    output += problem.slice(copiedThrough, quote.index) + "[existing source literal; see cited location]";
+    copiedThrough = quote.index + quote.length;
+    masked = true;
+  }
+  return { problem: output + problem.slice(copiedThrough), masked };
+}
+function evaluateAutonomyInternalWork(candidate, provenance = {}) {
+  if (provenance.allowInternalRepository === true) {
+    return {
+      ok: true,
+      reason: null,
+      groundedQuotedSource: false,
+      repositoryNativeProblemStatement: text(candidate.problem_statement)
+    };
+  }
+  const grounded = maskGroundedSourceQuotations(candidate, provenance);
+  const publicText = [
+    text(candidate.title),
+    grounded.problem,
+    text(candidate.vision_alignment_reason),
+    ...strings2(candidate.feature_hypotheses),
+    ...strings2(candidate.target_paths),
+    text(candidate.component_area)
+  ].join(`
+`);
+  const rejected = containsPushPalsInternalUserRepoText(publicText);
+  return {
+    ok: !rejected,
+    reason: rejected ? "pushpals_internal_leak" : null,
+    groundedQuotedSource: !rejected && grounded.masked,
+    repositoryNativeProblemStatement: rejected ? text(candidate.problem_statement) : grounded.problem
+  };
+}
+
+// apps/remotebuddy/src/autonomy_validation_filesystem.ts
+import { isAbsolute as isAbsolute4, relative as relative2, resolve as resolve6 } from "path";
+
+class ValidationSnapshotUnavailableError extends Error {
+  constructor() {
+    super("Required validation snapshot content is unavailable or truncated");
+    this.name = "ValidationSnapshotUnavailableError";
+  }
+}
+function validationManifestReadLimit(path) {
+  const segments = path.replace(/\\/g, "/").split("/");
+  const name = segments[segments.length - 1] ?? "";
+  if (["package.json", "composer.json"].includes(name))
+    return 512 * 1024;
+  if (name === "Makefile")
+    return 300000;
+  if ([
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "pytest.ini",
+    "tox.ini",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "dev-requirements.txt",
+    "Rakefile",
+    "pubspec.yaml",
+    "deps.edn"
+  ].includes(name))
+    return 200000;
+  return null;
+}
+function createValidationSnapshotFileSystem(repoRoot, entries) {
+  const root = resolve6(repoRoot);
+  const files = new Map;
+  const directories = new Set([""]);
+  const children = new Map;
+  const relativeKey = (path) => {
+    if (!isAbsolute4(path))
+      return null;
+    const key = relative2(root, resolve6(path)).replace(/\\/g, "/");
+    return key === ".." || key.startsWith("../") || isAbsolute4(key) ? null : key;
+  };
+  for (const entry of entries) {
+    const path = entry.path.replace(/\\/g, "/");
+    if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path) || /[\0\r\n]/.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) {
+      throw new TypeError("Validation snapshot requires exact repository-relative file paths");
+    }
+    if (files.has(path))
+      throw new TypeError(`Duplicate validation snapshot path: ${path}`);
+    files.set(path, {
+      ...entry.text === undefined ? {} : { text: entry.text },
+      truncated: entry.truncated === true
+    });
+    const parts = path.split("/");
+    const name = parts.pop();
+    const parent = parts.join("/");
+    const names = children.get(parent) ?? [];
+    names.push(name);
+    children.set(parent, names);
+    while (parts.length) {
+      directories.add(parts.join("/"));
+      parts.pop();
+    }
+  }
+  for (const names of children.values())
+    names.sort();
+  return {
+    exists(path) {
+      const key = relativeKey(path);
+      return key !== null && (files.has(key) || directories.has(key));
+    },
+    isDirectory(path) {
+      const key = relativeKey(path);
+      return key !== null && directories.has(key);
+    },
+    fileNames(directory) {
+      const key = relativeKey(directory);
+      return key === null ? [] : [...children.get(key) ?? []];
+    },
+    readText(path, maxBytes) {
+      const key = relativeKey(path);
+      const file = key === null ? undefined : files.get(key);
+      if (!file)
+        throw new Error("Validation snapshot path is absent");
+      if (file.text === undefined || file.truncated)
+        throw new ValidationSnapshotUnavailableError;
+      const limit = Math.max(1, Math.floor(maxBytes));
+      if (!Number.isFinite(limit))
+        throw new TypeError("Validation read limit must be finite");
+      const bytes = Buffer.from(file.text, "utf8");
+      if (bytes.length > limit)
+        throw new ValidationSnapshotUnavailableError;
+      return { text: file.text, truncated: false };
+    }
+  };
+}
 // apps/remotebuddy/src/command_policy.ts
 var YARN_NON_SCRIPT_COMMANDS = new Set([
   "add",
@@ -8032,8 +8331,8 @@ function canonicalizeValidationCommandForBun(command) {
   }
   return value.trim();
 }
-function canonicalizeInstructionTextForBun(text) {
-  let value = String(text ?? "");
+function canonicalizeInstructionTextForBun(text2) {
+  let value = String(text2 ?? "");
   if (!value.trim())
     return "";
   value = value.replace(/`([^`\n]+)`/g, (_full, command) => {
@@ -8056,63 +8355,6 @@ function canonicalizeInstructionTextForBun(text) {
 }
 
 // apps/remotebuddy/src/autonomous_engine.ts
-var POLICY = {
-  flaky_test: {
-    maxRisk: "low",
-    maxBreadth: "narrow",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  lint_fix: {
-    maxRisk: "low",
-    maxBreadth: "narrow",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  type_fix: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  small_refactor: {
-    maxRisk: "medium",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  feature_small: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  feature_medium: {
-    maxRisk: "medium",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true
-  },
-  feature_large: {
-    maxRisk: "high",
-    maxBreadth: "broad",
-    autonomousAllowed: false,
-    requireValidation: true
-  },
-  docs: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: false
-  },
-  dep_bump: {
-    maxRisk: "medium",
-    maxBreadth: "narrow",
-    autonomousAllowed: false,
-    requireValidation: true
-  }
-};
-var RISK_ORDER = { low: 0, medium: 1, high: 2 };
 var IDEATION_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_ideation_system_prompt.md").trim();
 var SCORING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_scoring_system_prompt.md").trim();
 var PLANNING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_planning_system_prompt.md").trim();
@@ -8409,8 +8651,8 @@ function scopeIdeationSignalsToRepository(snapshot, includeControlPlaneSignals) 
   return {
     top_signals: snapshot.top_signals.filter((signal) => signal.type !== "queue_health"),
     state_traits: snapshot.state_traits.filter((trait) => {
-      const text = `${trait.trait_id} ${trait.focus} ${trait.evidence}`;
-      return !controlPlaneTrait.test(text) || repositoryRelevantTrait.test(text);
+      const text2 = `${trait.trait_id} ${trait.focus} ${trait.evidence}`;
+      return !controlPlaneTrait.test(text2) || repositoryRelevantTrait.test(text2);
     })
   };
 }
@@ -8440,17 +8682,6 @@ function readUtf8PrefixSync(path, maxBytes) {
     };
   } finally {
     closeSync(fd);
-  }
-}
-function readBoundedJsonObject(path) {
-  try {
-    const bounded = readUtf8PrefixSync(path, MAX_REPO_MANIFEST_BYTES);
-    if (bounded.truncated)
-      return null;
-    const parsed = JSON.parse(bounded.text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
   }
 }
 function asStringArray2(value) {
@@ -8721,10 +8952,10 @@ function slugifyObjectiveId(value, fallback) {
   const slug = asString2(value).toLowerCase().replace(/`([^`]+)`/g, "$1").replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
   return slug || fallback;
 }
-function categorizeVisionText(text) {
+function categorizeVisionText(text2) {
   const matched = [];
   for (const rule of CATEGORY_KEYWORD_RULES) {
-    if (rule.pattern.test(text))
+    if (rule.pattern.test(text2))
       matched.push(rule.category);
   }
   if (matched.length === 0) {
@@ -8970,7 +9201,7 @@ function parseTrackedRepoTargetFiles(output) {
   return output.split("\x00").map((path) => path.replace(/\\/g, "/")).filter(Boolean).filter((path) => !shouldIgnoreRepoTargetPath(path) && isRepoTargetScanFile(path)).slice(0, MAX_TRACKED_REPO_TARGET_FILES);
 }
 function listTrackedRepoTargetFiles(repoRoot) {
-  const cacheKey = resolve6(repoRoot);
+  const cacheKey = resolve7(repoRoot);
   const nowMs = Date.now();
   const cached = TRACKED_REPO_TARGET_CACHE.get(cacheKey);
   if (cached && nowMs - cached.checkedAtMs < TRACKED_REPO_TARGET_CACHE_TTL_MS) {
@@ -9015,7 +9246,7 @@ function listTrackedRepoTargetFiles(repoRoot) {
   }
 }
 async function listTrackedRepoTargetFilesAsync(repoRoot) {
-  const cacheKey = resolve6(repoRoot);
+  const cacheKey = resolve7(repoRoot);
   const nowMs = Date.now();
   const cached = TRACKED_REPO_TARGET_CACHE.get(cacheKey);
   if (cached && nowMs - cached.checkedAtMs < TRACKED_REPO_TARGET_CACHE_TTL_MS) {
@@ -9052,37 +9283,7 @@ async function listTrackedRepoTargetFilesAsync(repoRoot) {
   }
 }
 function isPushPalsRepository(repoRoot) {
-  return existsSync4(resolve6(repoRoot, "apps", "remotebuddy", "src", "autonomous_engine.ts")) && existsSync4(resolve6(repoRoot, "apps", "workerpals", "src", "workerpals_main.ts")) && existsSync4(resolve6(repoRoot, "packages", "shared", "src", "autonomy_policy.ts"));
-}
-function isPushPalsInternalUserRepoPath(path) {
-  const normalized = asString2(path).replace(/\\/g, "/").toLowerCase();
-  if (!normalized)
-    return false;
-  return /(^|\/)(?:pushpals|workerpals?|remotebuddy)(?:\/|$)/.test(normalized);
-}
-var PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS = [
-  /\b(workerpal|workerpals|remotebuddy|pushpals)\b/i,
-  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
-  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
-  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
-  /\bautonomy[-_\s]?internal\b/i
-];
-function containsPushPalsInternalUserRepoText(text) {
-  return PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS.some((pattern) => pattern.test(text));
-}
-function candidateLeaksPushPalsInternals(candidate) {
-  if ([candidate.component_area, ...candidate.target_paths].some((path) => isPushPalsInternalUserRepoPath(path))) {
-    return false;
-  }
-  const publicText = [
-    candidate.title,
-    candidate.problem_statement,
-    candidate.vision_alignment_reason,
-    ...candidate.feature_hypotheses,
-    ...candidate.target_paths
-  ].join(`
-`);
-  return containsPushPalsInternalUserRepoText(publicText);
+  return existsSync4(resolve7(repoRoot, "apps", "remotebuddy", "src", "autonomous_engine.ts")) && existsSync4(resolve7(repoRoot, "apps", "workerpals", "src", "workerpals_main.ts")) && existsSync4(resolve7(repoRoot, "packages", "shared", "src", "autonomy_policy.ts"));
 }
 function buildRepoNativeFallbackInstruction(candidate) {
   return [
@@ -9151,7 +9352,7 @@ function stratifiedDirectoryOrder(entries) {
   return ordered;
 }
 function collectRepoTargetFiles(repoRoot, startRelativePath, maxResults, maxDepth = 3, traversalBudget) {
-  const startPath = resolve6(repoRoot, startRelativePath);
+  const startPath = resolve7(repoRoot, startRelativePath);
   if (!existsSync4(startPath))
     return [];
   const out = [];
@@ -9197,7 +9398,7 @@ function collectRepoTargetFiles(repoRoot, startRelativePath, maxResults, maxDept
     }
     for (const child of stratifiedDirectoryOrder(childDirectories)) {
       queue.push({
-        absolutePath: resolve6(current.absolutePath, child.name),
+        absolutePath: resolve7(current.absolutePath, child.name),
         relativePath: child.relativePath,
         depth: current.depth + 1
       });
@@ -9285,7 +9486,7 @@ function discoverRepoTargetProfiles(repoRoot, maxProfiles = 32, trackedFilesOver
     }
   }
   for (const file of COMMON_REPO_TARGET_FILES) {
-    if (existsSync4(resolve6(repoRoot, file)))
+    if (existsSync4(resolve7(repoRoot, file)))
       add(file);
   }
   const byTopLevel = new Map;
@@ -9474,7 +9675,7 @@ function adaptCandidateShapeToRepo(params) {
   };
 }
 function findMissingRepoTargetPaths(repoRoot, targetPaths) {
-  return targetPaths.map((targetPath) => asString2(targetPath)).filter(Boolean).filter((targetPath) => !existsSync4(resolve6(repoRoot, targetPath)));
+  return targetPaths.map((targetPath) => asString2(targetPath)).filter(Boolean).filter((targetPath) => !existsSync4(resolve7(repoRoot, targetPath)));
 }
 var VALIDATION_REPAIR_ACTIVE_STATUSES = new Set([
   "proposed",
@@ -9517,44 +9718,44 @@ function validationRepairObjectiveType(triggerType, incident) {
   return inferObjectiveTypeFromText(`${asString2(incident.command)} ${asString2(incident.failure_class)} ${asString2(incident.sample_error)}`, []);
 }
 function validationRepairCommandTargetCandidates(incident) {
-  const text = `${asString2(incident.command)} ${asString2(incident.failure_class)} ${asString2(incident.sample_error)}`.toLowerCase();
-  if (/\b(ruff|mypy|pytest|python|tox)\b/.test(text)) {
+  const text2 = `${asString2(incident.command)} ${asString2(incident.failure_class)} ${asString2(incident.sample_error)}`.toLowerCase();
+  if (/\b(ruff|mypy|pytest|python|tox)\b/.test(text2)) {
     return ["pyproject.toml", "ruff.toml", ".ruff.toml", "pytest.ini", "setup.cfg", "tests"];
   }
-  if (/\b(cargo|clippy|rustc|rustfmt)\b/.test(text)) {
+  if (/\b(cargo|clippy|rustc|rustfmt)\b/.test(text2)) {
     return ["Cargo.toml", "Cargo.lock", "src", "tests"];
   }
-  if (/\b(go test|go vet|golangci|golang)\b/.test(text)) {
+  if (/\b(go test|go vet|golangci|golang)\b/.test(text2)) {
     return ["go.mod", "go.sum", "cmd", "internal", "pkg"];
   }
-  if (/(?:\b(?:mvn|maven|gradle|junit|java|kotlin)\b|(?:^|[\\/])(?:mvnw|gradlew)\b)/.test(text)) {
+  if (/(?:\b(?:mvn|maven|gradle|junit|java|kotlin)\b|(?:^|[\\/])(?:mvnw|gradlew)\b)/.test(text2)) {
     return ["pom.xml", "build.gradle", "build.gradle.kts", "src/main", "src/test"];
   }
-  if (/\b(dotnet|msbuild|csharp|fsharp|xunit|nunit)\b/.test(text)) {
+  if (/\b(dotnet|msbuild|csharp|fsharp|xunit|nunit)\b/.test(text2)) {
     return ["global.json", "Directory.Build.props", "src", "tests"];
   }
-  if (/\b(bundle|bundler|rspec|rake|ruby)\b/.test(text)) {
+  if (/\b(bundle|bundler|rspec|rake|ruby)\b/.test(text2)) {
     return ["Gemfile", "Rakefile", ".rspec", "lib", "spec"];
   }
-  if (/\b(composer|phpunit|php)\b/.test(text)) {
+  if (/\b(composer|phpunit|php)\b/.test(text2)) {
     return ["composer.json", "phpunit.xml", "phpunit.xml.dist", "src", "tests"];
   }
-  if (/\b(terraform|tofu|hcl)\b/.test(text)) {
+  if (/\b(terraform|tofu|hcl)\b/.test(text2)) {
     return ["main.tf", "versions.tf", "terraform.tf", ".terraform.lock.hcl"];
   }
-  if (/\b(clojure|lein)\b/.test(text)) {
+  if (/\b(clojure|lein)\b/.test(text2)) {
     return ["deps.edn", "project.clj", "src", "test"];
   }
-  if (/\b(swift test|swiftpm)\b/.test(text)) {
+  if (/\b(swift test|swiftpm)\b/.test(text2)) {
     return ["Package.swift", "Sources", "Tests"];
   }
-  if (/\b(flutter|dart test)\b/.test(text)) {
+  if (/\b(flutter|dart test)\b/.test(text2)) {
     return ["pubspec.yaml", "lib", "test"];
   }
-  if (/\b(mix test|elixir)\b/.test(text)) {
+  if (/\b(mix test|elixir)\b/.test(text2)) {
     return ["mix.exs", "lib", "test"];
   }
-  if (/\b(bazel|buf lint|zig build|cmake|ctest)\b/.test(text)) {
+  if (/\b(bazel|buf lint|zig build|cmake|ctest)\b/.test(text2)) {
     return [
       "MODULE.bazel",
       "WORKSPACE",
@@ -9565,7 +9766,7 @@ function validationRepairCommandTargetCandidates(incident) {
       "src"
     ];
   }
-  if (/\b(lint|eslint|prettier|format)\b/.test(text)) {
+  if (/\b(lint|eslint|prettier|format)\b/.test(text2)) {
     return [
       "eslint.config.js",
       "eslint.config.mjs",
@@ -9574,10 +9775,10 @@ function validationRepairCommandTargetCandidates(incident) {
       "package.json"
     ];
   }
-  if (/\b(tsc|typecheck|typescript|type error)\b/.test(text)) {
+  if (/\b(tsc|typecheck|typescript|type error)\b/.test(text2)) {
     return ["tsconfig.json", "package.json"];
   }
-  if (/\b(web|e2e|browser|smoke|playwright)\b/.test(text)) {
+  if (/\b(web|e2e|browser|smoke|playwright)\b/.test(text2)) {
     return [
       "scripts/test-web-e2e.js",
       "scripts/web-e2e.js",
@@ -9588,7 +9789,7 @@ function validationRepairCommandTargetCandidates(incident) {
       "package.json"
     ];
   }
-  if (/\b(test|vitest|jest|bun test)\b/.test(text)) {
+  if (/\b(test|vitest|jest|bun test)\b/.test(text2)) {
     return ["tests", "test", "__tests__", "package.json"];
   }
   return [
@@ -9608,7 +9809,7 @@ function validationRepairTargetPaths(params) {
   const incidentHints = asStringArray2(params.incident.target_path_hints);
   const normalizedHints = incidentHints.map((candidate) => normalizeAutonomyComponentArea(candidate)).filter((candidate) => Boolean(candidate)).filter((candidate, index, values) => values.indexOf(candidate) === index);
   const candidateSpecific = asString2(params.incident.validation_scope) === "candidate_specific";
-  const exactEvidenceHints = candidateSpecific ? normalizedHints : normalizedHints.filter((candidate) => existsSync4(resolve6(params.repoRoot, candidate)));
+  const exactEvidenceHints = candidateSpecific ? normalizedHints : normalizedHints.filter((candidate) => existsSync4(resolve7(params.repoRoot, candidate)));
   if (exactEvidenceHints.length > 0)
     return exactEvidenceHints.slice(0, 6);
   const candidates = [...validationRepairCommandTargetCandidates(params.incident)];
@@ -9619,7 +9820,7 @@ function validationRepairTargetPaths(params) {
     if (!normalized || seen.has(normalized))
       continue;
     seen.add(normalized);
-    if (existsSync4(resolve6(params.repoRoot, normalized))) {
+    if (existsSync4(resolve7(params.repoRoot, normalized))) {
       existing.push(normalized);
       if (existing.length >= 3)
         return existing;
@@ -10360,7 +10561,26 @@ function shellPathArgument(value) {
   const optionSafeValue = value.startsWith("-") ? `./${value}` : value;
   return optionSafeValue.includes(" ") ? `"${optionSafeValue}"` : optionSafeValue;
 }
-function validationSearchDirectories(repoRoot, targetPaths) {
+var DEFAULT_VALIDATION_FILE_SYSTEM = {
+  exists: existsSync4,
+  isDirectory: (path) => statSync2(path).isDirectory(),
+  fileNames: (directory) => readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name),
+  readText: readUtf8PrefixSync
+};
+function readValidationJsonObject(path, fileSystem) {
+  try {
+    const bounded = fileSystem.readText(path, MAX_REPO_MANIFEST_BYTES);
+    if (bounded.truncated)
+      return null;
+    const parsed = JSON.parse(bounded.text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError)
+      throw error;
+    return null;
+  }
+}
+function validationSearchDirectories(repoRoot, targetPaths, fileSystem) {
   const directories = [];
   const seen = new Set;
   const add = (directory) => {
@@ -10375,9 +10595,12 @@ function validationSearchDirectories(repoRoot, targetPaths) {
       continue;
     let directory = pathDirname(normalized);
     try {
-      if (statSync2(resolve6(repoRoot, normalized)).isDirectory())
+      if (fileSystem.isDirectory(resolve7(repoRoot, normalized)))
         directory = normalized;
-    } catch {}
+    } catch (error) {
+      if (error instanceof ValidationSnapshotUnavailableError)
+        throw error;
+    }
     while (directory) {
       add(directory);
       directory = pathDirname(directory);
@@ -10386,19 +10609,19 @@ function validationSearchDirectories(repoRoot, targetPaths) {
   add("");
   return directories;
 }
-function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRoot) {
+function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRoot, fileSystem) {
   try {
-    const packageJson = readBoundedJsonObject(packageJsonPath);
+    const packageJson = readValidationJsonObject(packageJsonPath, fileSystem);
     if (!packageJson)
       return null;
     const scripts = packageJson.scripts ?? {};
     const readDeclaredManager = (directory) => {
-      const manifest = readBoundedJsonObject(resolve6(directory, "package.json"));
+      const manifest = readValidationJsonObject(resolve7(directory, "package.json"), fileSystem);
       const declared = asString2(manifest?.packageManager).split("@")[0]?.toLowerCase();
       return ["bun", "pnpm", "yarn", "npm"].includes(declared) ? declared : null;
     };
-    const managerFromDirectory = (directory) => readDeclaredManager(directory) ?? (existsSync4(resolve6(directory, "bun.lock")) || existsSync4(resolve6(directory, "bun.lockb")) ? "bun" : existsSync4(resolve6(directory, "pnpm-lock.yaml")) ? "pnpm" : existsSync4(resolve6(directory, "yarn.lock")) ? "yarn" : existsSync4(resolve6(directory, "package-lock.json")) ? "npm" : null);
-    const absoluteRepoRoot = resolve6(repoRoot);
+    const managerFromDirectory = (directory) => readDeclaredManager(directory) ?? (fileSystem.exists(resolve7(directory, "bun.lock")) || fileSystem.exists(resolve7(directory, "bun.lockb")) ? "bun" : fileSystem.exists(resolve7(directory, "pnpm-lock.yaml")) ? "pnpm" : fileSystem.exists(resolve7(directory, "yarn.lock")) ? "yarn" : fileSystem.exists(resolve7(directory, "package-lock.json")) ? "npm" : null);
+    const absoluteRepoRoot = resolve7(repoRoot);
     let manager = null;
     let managerDirectory = dirname(packageJsonPath);
     while (true) {
@@ -10406,7 +10629,7 @@ function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRo
       if (manager || managerDirectory === absoluteRepoRoot)
         break;
       const parent = dirname(managerDirectory);
-      const relativeParent = relative2(absoluteRepoRoot, parent).replace(/\\/g, "/");
+      const relativeParent = relative3(absoluteRepoRoot, parent).replace(/\\/g, "/");
       if (parent === managerDirectory || relativeParent.startsWith("../"))
         break;
       managerDirectory = parent;
@@ -10416,7 +10639,12 @@ function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRo
     if (packageDirectory && !directoryArg)
       return null;
     const prefix = manager === "bun" ? directoryArg ? `bun --cwd ${directoryArg} run` : "bun run" : manager === "pnpm" ? directoryArg ? `pnpm --dir ${directoryArg} run` : "pnpm run" : manager === "yarn" ? directoryArg ? `yarn --cwd ${directoryArg} run` : "yarn run" : directoryArg ? `npm --prefix ${directoryArg} run` : "npm run";
-    const preferredScripts = isPushPalsRepository(repoRoot) ? ["test:root", "test", "check", "lint"] : ["test", "check", "lint"];
+    const ownsPushPalsRuntime = [
+      "apps/remotebuddy/src/autonomous_engine.ts",
+      "apps/workerpals/src/workerpals_main.ts",
+      "packages/shared/src/autonomy_policy.ts"
+    ].every((path) => fileSystem.exists(resolve7(repoRoot, path)));
+    const preferredScripts = ownsPushPalsRuntime ? ["test:root", "test", "check", "lint"] : ["test", "check", "lint"];
     for (const name of preferredScripts) {
       const script = typeof scripts[name] === "string" ? scripts[name].trim() : "";
       if (!script)
@@ -10426,7 +10654,10 @@ function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRo
       }
       return `${prefix} ${name}`;
     }
-  } catch {}
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError)
+      throw error;
+  }
   return null;
 }
 var DIFF_CHECK_ONLY_EXTENSIONS = new Set([
@@ -10454,36 +10685,36 @@ function supportsDiffCheckOnlyValidation(targetPaths) {
     return DIFF_CHECK_ONLY_EXTENSIONS.has(extension) || /(^|\/)(?:docs?|documentation)(?:\/|$)/.test(normalized) || /(^|\/)(?:readme|changelog|contributing|license)(?:\.|$)/.test(normalized);
   });
 }
-function findManifestOwnedValidation(repoRoot, directories, targetPaths) {
+function findManifestOwnedValidation(repoRoot, directories, targetPaths, fileSystem) {
   const wantsProto = targetPaths.some((targetPath) => pathExtname(targetPath) === ".proto");
   const bazelWorkspaceNames = ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"];
   const workspaceDirectoryFor = (directory) => {
     const startIndex = Math.max(0, directories.indexOf(directory));
     for (const ancestor of directories.slice(startIndex)) {
-      const root = ancestor ? resolve6(repoRoot, ancestor) : repoRoot;
-      if (bazelWorkspaceNames.some((name) => existsSync4(resolve6(root, name))))
+      const root = ancestor ? resolve7(repoRoot, ancestor) : repoRoot;
+      if (bazelWorkspaceNames.some((name) => fileSystem.exists(resolve7(root, name))))
         return ancestor;
     }
     return null;
   };
   for (const directory of directories) {
-    const root = directory ? resolve6(repoRoot, directory) : repoRoot;
-    if (wantsProto && (existsSync4(resolve6(root, "buf.yaml")) || existsSync4(resolve6(root, "buf.work.yaml")))) {
+    const root = directory ? resolve7(repoRoot, directory) : repoRoot;
+    if (wantsProto && (fileSystem.exists(resolve7(root, "buf.yaml")) || fileSystem.exists(resolve7(root, "buf.work.yaml")))) {
       return { ecosystem: "proto", directory };
     }
-    if (existsSync4(resolve6(root, "BUILD")) || existsSync4(resolve6(root, "BUILD.bazel"))) {
+    if (fileSystem.exists(resolve7(root, "BUILD")) || fileSystem.exists(resolve7(root, "BUILD.bazel"))) {
       const workspaceDirectory = workspaceDirectoryFor(directory);
       if (workspaceDirectory != null) {
         return { ecosystem: "bazel", directory: workspaceDirectory };
       }
     }
-    if (existsSync4(resolve6(root, "CMakeLists.txt"))) {
+    if (fileSystem.exists(resolve7(root, "CMakeLists.txt"))) {
       return { ecosystem: "native", directory };
     }
-    if (existsSync4(resolve6(root, "buf.yaml")) || existsSync4(resolve6(root, "buf.work.yaml"))) {
+    if (fileSystem.exists(resolve7(root, "buf.yaml")) || fileSystem.exists(resolve7(root, "buf.work.yaml"))) {
       return { ecosystem: "proto", directory };
     }
-    if (existsSync4(resolve6(root, "Makefile"))) {
+    if (fileSystem.exists(resolve7(root, "Makefile"))) {
       return { ecosystem: "make", directory };
     }
   }
@@ -10547,7 +10778,7 @@ function inferPythonValidationCommand(params) {
     "requirements.txt"
   ];
   const pythonTarget = params.targetPaths.map(normalizeValidationTargetPath).find((targetPath) => pathExtname(targetPath) === ".py");
-  if (!manifestNames.some((name) => existsSync4(resolve6(params.manifestRoot, name)))) {
+  if (!manifestNames.some((name) => params.fileSystem.exists(resolve7(params.manifestRoot, name)))) {
     return null;
   }
   const directoryArg = params.directory ? shellPathArgument(params.directory) : "";
@@ -10563,14 +10794,17 @@ function inferPythonValidationCommand(params) {
   for (const name of evidenceFiles) {
     try {
       evidence += `
-${readUtf8PrefixSync(resolve6(params.manifestRoot, name), 200000).text}`;
-    } catch {}
+${params.fileSystem.readText(resolve7(params.manifestRoot, name), 200000).text}`;
+    } catch (error) {
+      if (error instanceof ValidationSnapshotUnavailableError)
+        throw error;
+    }
   }
-  const hasPytestEvidence = /\bpytest\b/i.test(evidence) || existsSync4(resolve6(params.manifestRoot, "pytest.ini")) || existsSync4(resolve6(params.manifestRoot, "conftest.py"));
+  const hasPytestEvidence = /\bpytest\b/i.test(evidence) || params.fileSystem.exists(resolve7(params.manifestRoot, "pytest.ini")) || params.fileSystem.exists(resolve7(params.manifestRoot, "conftest.py"));
   if (hasPytestEvidence) {
     return directoryArg ? `python -m pytest ${directoryArg}` : "python -m pytest";
   }
-  if (existsSync4(resolve6(params.manifestRoot, "manage.py"))) {
+  if (params.fileSystem.exists(resolve7(params.manifestRoot, "manage.py"))) {
     const managePath = params.directory ? `${params.directory}/manage.py` : "manage.py";
     const manageArg = shellPathArgument(managePath);
     return manageArg ? `python ${manageArg} test` : null;
@@ -10578,14 +10812,16 @@ ${readUtf8PrefixSync(resolve6(params.manifestRoot, name), 200000).text}`;
   const compileTarget = shellPathArgument(pythonTarget || params.directory || ".");
   return compileTarget ? `python -m compileall ${compileTarget}` : null;
 }
-function inferMakeValidationCommand(manifestRoot, directory) {
-  const makefilePath = resolve6(manifestRoot, "Makefile");
-  if (!existsSync4(makefilePath))
+function inferMakeValidationCommand(manifestRoot, directory, fileSystem) {
+  const makefilePath = resolve7(manifestRoot, "Makefile");
+  if (!fileSystem.exists(makefilePath))
     return null;
   let makefile = "";
   try {
-    makefile = readUtf8PrefixSync(makefilePath, 300000).text;
-  } catch {
+    makefile = fileSystem.readText(makefilePath, 300000).text;
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError)
+      throw error;
     return null;
   }
   const targets = [...makefile.matchAll(/^([A-Za-z0-9_.-]+)\s*:(?!=)/gm)].map((match) => match[1]);
@@ -10605,12 +10841,12 @@ function resolveWorkerValidationExecutionPlatform(executionPlatform, workerpalDo
     return "linux_docker";
   return hostPlatform === "win32" ? "windows" : "linux_docker";
 }
-function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform = "linux_docker", workerpalDocker = false) {
+function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform = "linux_docker", workerpalDocker = false, fileSystem = DEFAULT_VALIDATION_FILE_SYSTEM) {
   const safeTargetPaths = targetPaths.map(normalizeValidationTargetPath).filter(Boolean);
   if (!repoRoot) {
     return supportsDiffCheckOnlyValidation(safeTargetPaths) ? ["git diff --check"] : [];
   }
-  const directories = validationSearchDirectories(repoRoot, safeTargetPaths);
+  const directories = validationSearchDirectories(repoRoot, safeTargetPaths, fileSystem);
   const effectivePlatform = resolveWorkerValidationExecutionPlatform(executionPlatform, workerpalDocker);
   const commandInDirectory = (directory, command) => {
     if (!directory)
@@ -10626,41 +10862,42 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
     return `sh -c 'cd -- ${directoryArg} && exec ${command}'`;
   };
   const resolveEcosystem = (ecosystem, directory) => {
-    const manifestRoot = directory ? resolve6(repoRoot, directory) : repoRoot;
+    const manifestRoot = directory ? resolve7(repoRoot, directory) : repoRoot;
     const directoryArg = directory ? shellPathArgument(directory) : "";
     if (directory && !directoryArg)
       return null;
     if (ecosystem === "package") {
-      if (!existsSync4(resolve6(manifestRoot, "package.json")))
+      if (!fileSystem.exists(resolve7(manifestRoot, "package.json")))
         return null;
-      return inferPackageValidationCommand(resolve6(manifestRoot, "package.json"), directory, repoRoot);
+      return inferPackageValidationCommand(resolve7(manifestRoot, "package.json"), directory, repoRoot, fileSystem);
     }
     if (ecosystem === "python") {
       return inferPythonValidationCommand({
         manifestRoot,
         directory,
-        targetPaths: safeTargetPaths
+        targetPaths: safeTargetPaths,
+        fileSystem
       });
     }
-    if (ecosystem === "rust" && existsSync4(resolve6(manifestRoot, "Cargo.toml"))) {
+    if (ecosystem === "rust" && fileSystem.exists(resolve7(manifestRoot, "Cargo.toml"))) {
       const manifestArg = shellPathArgument(directory ? `${directory}/Cargo.toml` : "Cargo.toml");
       return manifestArg ? directory ? `cargo test --manifest-path ${manifestArg}` : "cargo test" : null;
     }
-    if (ecosystem === "go" && existsSync4(resolve6(manifestRoot, "go.mod"))) {
+    if (ecosystem === "go" && fileSystem.exists(resolve7(manifestRoot, "go.mod"))) {
       return directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./...";
     }
-    if (ecosystem === "jvm" && (existsSync4(resolve6(manifestRoot, "pom.xml")) || existsSync4(resolve6(manifestRoot, "build.gradle")) || existsSync4(resolve6(manifestRoot, "build.gradle.kts")))) {
-      const isMaven = existsSync4(resolve6(manifestRoot, "pom.xml"));
+    if (ecosystem === "jvm" && (fileSystem.exists(resolve7(manifestRoot, "pom.xml")) || fileSystem.exists(resolve7(manifestRoot, "build.gradle")) || fileSystem.exists(resolve7(manifestRoot, "build.gradle.kts")))) {
+      const isMaven = fileSystem.exists(resolve7(manifestRoot, "pom.xml"));
       const unixWrapperName = isMaven ? "mvnw" : "gradlew";
       const windowsWrapperName = isMaven ? "mvnw.cmd" : "gradlew.bat";
       const unixWrapperPath = `./${directory ? `${directory}/` : ""}${unixWrapperName}`;
       const windowsWrapperPath = `./${directory ? `${directory}/` : ""}${windowsWrapperName}`;
       const projectFlag = isMaven ? directoryArg ? ` -f ${shellPathArgument(`${directory}/pom.xml`)}` : "" : directoryArg ? ` -p ${directoryArg}` : "";
-      if (effectivePlatform === "windows" && existsSync4(resolve6(manifestRoot, windowsWrapperName))) {
+      if (effectivePlatform === "windows" && fileSystem.exists(resolve7(manifestRoot, windowsWrapperName))) {
         const wrapperArg = shellPathArgument(windowsWrapperPath);
         return wrapperArg ? `cmd /c ${wrapperArg}${projectFlag} test` : null;
       }
-      if (effectivePlatform !== "windows" && existsSync4(resolve6(manifestRoot, unixWrapperName))) {
+      if (effectivePlatform !== "windows" && fileSystem.exists(resolve7(manifestRoot, unixWrapperName))) {
         const wrapperArg = shellPathArgument(unixWrapperPath);
         if (!wrapperArg)
           return null;
@@ -10670,25 +10907,29 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
     }
     if (ecosystem === "dotnet") {
       try {
-        const dotnetProject = readdirSync(manifestRoot, { withFileTypes: true }).filter((entry) => entry.isFile() && /\.(?:sln|csproj|fsproj)$/i.test(entry.name)).map((entry) => entry.name).sort()[0];
+        const dotnetProject = fileSystem.fileNames(manifestRoot).filter((name) => /\.(?:sln|csproj|fsproj)$/i.test(name)).sort()[0];
         if (!dotnetProject)
           return null;
         const projectArg = shellPathArgument(directory ? `${directory}/${dotnetProject}` : dotnetProject);
         return projectArg ? `dotnet test ${projectArg}` : null;
-      } catch {
+      } catch (error) {
+        if (error instanceof ValidationSnapshotUnavailableError)
+          throw error;
         return null;
       }
     }
     if (ecosystem === "ruby") {
-      const hasGemfile = existsSync4(resolve6(manifestRoot, "Gemfile"));
-      if (existsSync4(resolve6(manifestRoot, ".rspec")) || existsSync4(resolve6(manifestRoot, "spec"))) {
+      const hasGemfile = fileSystem.exists(resolve7(manifestRoot, "Gemfile"));
+      if (fileSystem.exists(resolve7(manifestRoot, ".rspec")) || fileSystem.exists(resolve7(manifestRoot, "spec"))) {
         return commandInDirectory(directory, hasGemfile ? "bundle exec rspec" : "rspec");
       }
-      if (existsSync4(resolve6(manifestRoot, "Rakefile"))) {
+      if (fileSystem.exists(resolve7(manifestRoot, "Rakefile"))) {
         let rakefile = "";
         try {
-          rakefile = readUtf8PrefixSync(resolve6(manifestRoot, "Rakefile"), 200000).text;
-        } catch {
+          rakefile = fileSystem.readText(resolve7(manifestRoot, "Rakefile"), 200000).text;
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError)
+            throw error;
           rakefile = "";
         }
         if (/\b(?:task\s+[:'\"]?test|Rake::TestTask)\b/i.test(rakefile)) {
@@ -10698,15 +10939,15 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
       return null;
     }
     if (ecosystem === "php") {
-      const composerPath = resolve6(manifestRoot, "composer.json");
-      if (existsSync4(composerPath)) {
-        const composer = readBoundedJsonObject(composerPath);
+      const composerPath = resolve7(manifestRoot, "composer.json");
+      if (fileSystem.exists(composerPath)) {
+        const composer = readValidationJsonObject(composerPath, fileSystem);
         if (composer?.scripts && composer.scripts.test != null) {
           return directoryArg ? `composer --working-dir ${directoryArg} test` : "composer test";
         }
       }
-      if (existsSync4(resolve6(manifestRoot, "phpunit.xml")) || existsSync4(resolve6(manifestRoot, "phpunit.xml.dist"))) {
-        if (existsSync4(composerPath)) {
+      if (fileSystem.exists(resolve7(manifestRoot, "phpunit.xml")) || fileSystem.exists(resolve7(manifestRoot, "phpunit.xml.dist"))) {
+        if (fileSystem.exists(composerPath)) {
           return directoryArg ? `composer --working-dir ${directoryArg} exec -- phpunit` : "composer exec -- phpunit";
         }
         const phpunitPath = shellPathArgument(directory ? `${directory}/vendor/bin/phpunit` : "./vendor/bin/phpunit");
@@ -10714,14 +10955,16 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
       }
       return null;
     }
-    if (ecosystem === "swift" && existsSync4(resolve6(manifestRoot, "Package.swift"))) {
+    if (ecosystem === "swift" && fileSystem.exists(resolve7(manifestRoot, "Package.swift"))) {
       return directoryArg ? `swift test --package-path ${directoryArg}` : "swift test";
     }
-    if (ecosystem === "dart" && existsSync4(resolve6(manifestRoot, "pubspec.yaml"))) {
+    if (ecosystem === "dart" && fileSystem.exists(resolve7(manifestRoot, "pubspec.yaml"))) {
       let pubspec = "";
       try {
-        pubspec = readUtf8PrefixSync(resolve6(manifestRoot, "pubspec.yaml"), 200000).text;
-      } catch {
+        pubspec = fileSystem.readText(resolve7(manifestRoot, "pubspec.yaml"), 200000).text;
+      } catch (error) {
+        if (error instanceof ValidationSnapshotUnavailableError)
+          throw error;
         pubspec = "";
       }
       if (/\bsdk:\s*flutter\b|^flutter:/im.test(pubspec)) {
@@ -10729,10 +10972,10 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
       }
       return directoryArg ? `dart --directory ${directoryArg} test` : "dart test";
     }
-    if (ecosystem === "elixir" && existsSync4(resolve6(manifestRoot, "mix.exs"))) {
+    if (ecosystem === "elixir" && fileSystem.exists(resolve7(manifestRoot, "mix.exs"))) {
       return directoryArg ? `mix --cd ${directoryArg} test` : "mix test";
     }
-    if (ecosystem === "native" && existsSync4(resolve6(manifestRoot, "CMakeLists.txt"))) {
+    if (ecosystem === "native" && fileSystem.exists(resolve7(manifestRoot, "CMakeLists.txt"))) {
       const sourceArg = directoryArg || ".";
       const buildPath = shellPathArgument(directory ? `${directory}/build` : "build");
       return buildPath ? [
@@ -10741,17 +10984,17 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
         `ctest --test-dir ${buildPath} --output-on-failure`
       ] : null;
     }
-    if (ecosystem === "bazel" && ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve6(manifestRoot, name)))) {
-      const buildDirectory = validationSearchDirectories(repoRoot, safeTargetPaths).find((candidateDirectory) => {
-        const candidateRoot = candidateDirectory ? resolve6(repoRoot, candidateDirectory) : repoRoot;
-        return existsSync4(resolve6(candidateRoot, "BUILD")) || existsSync4(resolve6(candidateRoot, "BUILD.bazel"));
+    if (ecosystem === "bazel" && ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => fileSystem.exists(resolve7(manifestRoot, name)))) {
+      const buildDirectory = validationSearchDirectories(repoRoot, safeTargetPaths, fileSystem).find((candidateDirectory) => {
+        const candidateRoot = candidateDirectory ? resolve7(repoRoot, candidateDirectory) : repoRoot;
+        return fileSystem.exists(resolve7(candidateRoot, "BUILD")) || fileSystem.exists(resolve7(candidateRoot, "BUILD.bazel"));
       });
-      const packagePath = buildDirectory != null && directory ? relative2(resolve6(repoRoot, directory), resolve6(repoRoot, buildDirectory)).replace(/\\/g, "/") : buildDirectory ?? "";
+      const packagePath = buildDirectory != null && directory ? relative3(resolve7(repoRoot, directory), resolve7(repoRoot, buildDirectory)).replace(/\\/g, "/") : buildDirectory ?? "";
       const safePackagePath = /^[A-Za-z0-9_@+.,/-]+$/.test(packagePath) ? packagePath : "";
       const target = safePackagePath && !safePackagePath.startsWith("../") ? `//${safePackagePath}/...` : "//...";
       return commandInDirectory(directory, `bazel test ${target}`);
     }
-    if (ecosystem === "zig" && existsSync4(resolve6(manifestRoot, "build.zig"))) {
+    if (ecosystem === "zig" && fileSystem.exists(resolve7(manifestRoot, "build.zig"))) {
       return directoryArg ? `zig build --build-file ${directoryArg}/build.zig test` : "zig build test";
     }
     if (ecosystem === "terraform") {
@@ -10762,14 +11005,16 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
       return formatTarget ? `terraform fmt -check ${formatTarget}` : null;
     }
     if (ecosystem === "clojure") {
-      if (existsSync4(resolve6(manifestRoot, "project.clj"))) {
+      if (fileSystem.exists(resolve7(manifestRoot, "project.clj"))) {
         return commandInDirectory(directory, "lein test");
       }
-      if (existsSync4(resolve6(manifestRoot, "deps.edn"))) {
+      if (fileSystem.exists(resolve7(manifestRoot, "deps.edn"))) {
         let deps = "";
         try {
-          deps = readUtf8PrefixSync(resolve6(manifestRoot, "deps.edn"), 200000).text;
-        } catch {
+          deps = fileSystem.readText(resolve7(manifestRoot, "deps.edn"), 200000).text;
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError)
+            throw error;
           deps = "";
         }
         if (/:test\b/.test(deps))
@@ -10794,16 +11039,16 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
       return targetArg ? `luac -p ${targetArg}` : null;
     }
     if (ecosystem === "proto") {
-      if (existsSync4(resolve6(manifestRoot, "buf.yaml")) || existsSync4(resolve6(manifestRoot, "buf.work.yaml"))) {
+      if (fileSystem.exists(resolve7(manifestRoot, "buf.yaml")) || fileSystem.exists(resolve7(manifestRoot, "buf.work.yaml"))) {
         return commandInDirectory(directory, "buf lint");
       }
       return null;
     }
     if (ecosystem === "make")
-      return inferMakeValidationCommand(manifestRoot, directory);
+      return inferMakeValidationCommand(manifestRoot, directory, fileSystem);
     return null;
   };
-  const manifestOwned = findManifestOwnedValidation(repoRoot, directories, safeTargetPaths);
+  const manifestOwned = findManifestOwnedValidation(repoRoot, directories, safeTargetPaths, fileSystem);
   const preferred = manifestOwned?.ecosystem ?? preferredValidationEcosystem(safeTargetPaths);
   if (preferred) {
     const preferredDirectories = manifestOwned ? [
@@ -10988,70 +11233,70 @@ function extractValidationCommandFromIdea(value) {
 function isRepoNativeValidationCommand(value) {
   return /^(bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|mvn|gradle|dotnet|bundle|rake|rspec|ruby|composer|php|swift|dart|flutter|mix|cmake|ctest|bazel|zig|terraform|clojure|lein|rscript|luac|buf|git|docker|pwsh|powershell|sh|bash|cmd)\b/i.test(value) || /^vendor[\\/]bin[\\/]phpunit\b/i.test(value) || /^(?:\.[\\/])?(?:[A-Za-z0-9_.-]+[\\/])*(?:gradlew(?:\.bat)?|mvnw(?:\.cmd)?|scripts[\\/][A-Za-z0-9_.-]+\.(?:sh|ps1|cmd|bat))\b/i.test(value);
 }
-function inferComponentAreaFromText(text, repoTargets, triggerType) {
-  const repoTargetMatch = chooseRepoTargetProfile(repoTargets ?? [], [text], triggerType);
+function inferComponentAreaFromText(text2, repoTargets, triggerType) {
+  const repoTargetMatch = chooseRepoTargetProfile(repoTargets ?? [], [text2], triggerType);
   if (repoTargetMatch)
     return repoTargetMatch.component_area;
   for (const rule of INSPIRATION_COMPONENT_HINTS) {
-    if (rule.pattern.test(text))
+    if (rule.pattern.test(text2))
       return rule.area;
   }
   return "src";
 }
-function inferObjectiveTypeFromText(text, tags) {
+function inferObjectiveTypeFromText(text2, tags) {
   const tagSet = new Set(tags);
-  if (tagSet.has("flaky_test") || tagSet.has("flake") || /\b(flaky|flake)\b/i.test(text))
+  if (tagSet.has("flaky_test") || tagSet.has("flake") || /\b(flaky|flake)\b/i.test(text2))
     return "flaky_test";
-  if (tagSet.has("lint_fix") || /\b(lint|format)\b/i.test(text))
+  if (tagSet.has("lint_fix") || /\b(lint|format)\b/i.test(text2))
     return "lint_fix";
-  if (tagSet.has("type_fix") || /\b(typecheck|typing|typescript|type error)\b/i.test(text))
+  if (tagSet.has("type_fix") || /\b(typecheck|typing|typescript|type error)\b/i.test(text2))
     return "type_fix";
-  if (tagSet.has("docs") || /\b(doc|readme|onboarding guide)\b/i.test(text))
+  if (tagSet.has("docs") || /\b(doc|readme|onboarding guide)\b/i.test(text2))
     return "docs";
-  if (tagSet.has("small_refactor") || /\b(refactor|cleanup|simplify|hardening)\b/i.test(text)) {
+  if (tagSet.has("small_refactor") || /\b(refactor|cleanup|simplify|hardening)\b/i.test(text2)) {
     return "small_refactor";
   }
-  if (tagSet.has("feature_medium") || /\b(portfolio|planner|bandit|framework|capability)\b/i.test(text)) {
+  if (tagSet.has("feature_medium") || /\b(portfolio|planner|bandit|framework|capability)\b/i.test(text2)) {
     return "feature_medium";
   }
   return "feature_small";
 }
-function inferTriggerTypeFromText(text) {
-  if (/\b(queue|backpressure|throughput|latency|pending|capacity)\b/i.test(text))
+function inferTriggerTypeFromText(text2) {
+  if (/\b(queue|backpressure|throughput|latency|pending|capacity)\b/i.test(text2))
     return "queue_health";
-  if (/\b(lint|format)\b/i.test(text))
+  if (/\b(lint|format)\b/i.test(text2))
     return "lint_failure";
-  if (/\b(typecheck|type error|typing|typescript)\b/i.test(text))
+  if (/\b(typecheck|type error|typing|typescript)\b/i.test(text2))
     return "typecheck_failure";
-  if (/\b(test|flake|flaky|failing test|e2e|smoke|browser|playwright)\b/i.test(text))
+  if (/\b(test|flake|flaky|failing test|e2e|smoke|browser|playwright)\b/i.test(text2))
     return "test_failure";
   return "regret_signal";
 }
-function inferRiskLevelFromText(text, tags) {
-  const joined = `${text} ${tags.join(" ")}`;
+function inferRiskLevelFromText(text2, tags) {
+  const joined = `${text2} ${tags.join(" ")}`;
   if (/\b(auth|permission|security|credential|secret|encryption)\b/i.test(joined))
     return "medium";
   if (/\b(migration|schema rewrite|large rewrite|breaking change)\b/i.test(joined))
     return "high";
   return "low";
 }
-function matchObjectiveIdsFromText(text, fallback) {
-  const textTokens = new Set(visionMatchTokens(text));
+function matchObjectiveIdsFromText(text2, fallback) {
+  const textTokens = new Set(visionMatchTokens(text2));
   const repoMatches = fallback.map((entry) => ({
     id: entry.id,
     overlap: visionMatchTokens(`${entry.title} ${entry.evidence.join(" ")}`).filter((token) => textTokens.has(token)).length
   })).filter((entry) => entry.overlap > 0).sort((a, b) => b.overlap - a.overlap).map((entry) => entry.id);
   if (repoMatches.length > 0)
     return repoMatches.slice(0, 4);
-  const matched = ENGINE_OBJECTIVE_BLUEPRINTS.filter((entry) => entry.keywordPattern.test(text)).map((entry) => entry.id);
+  const matched = ENGINE_OBJECTIVE_BLUEPRINTS.filter((entry) => entry.keywordPattern.test(text2)).map((entry) => entry.id);
   if (matched.length > 0)
     return matched.slice(0, 4);
   return fallback.slice(0, 2).map((entry) => entry.id);
 }
-function matchGapIdsFromText(text, fallback) {
+function matchGapIdsFromText(text2, fallback) {
   const out = [];
   for (const rule of GAP_TEXT_RULES) {
-    if (rule.pattern.test(text))
+    if (rule.pattern.test(text2))
       out.push(rule.gapId);
   }
   if (out.length > 0)
@@ -11195,7 +11440,7 @@ function applySourceCurationToPatterns(patterns, sourceInsights) {
 }
 function buildCandidateShapeFromPattern(params) {
   const pattern = params.pattern;
-  const text = `${pattern.algorithm}
+  const text2 = `${pattern.algorithm}
 ${pattern.whenToUse}
 ${pattern.summary}
 ${pattern.tags.join(" ")}`.toLowerCase();
@@ -11203,12 +11448,12 @@ ${pattern.tags.join(" ")}`.toLowerCase();
   const metadataShape = asObject(metadata.candidate_shape ?? metadata.candidateShape);
   const metadataArea = asAutonomyComponentArea(metadataShape.component_area ?? metadataShape.componentArea ?? metadata.component_area ?? metadata.componentArea) ?? null;
   const triggerTypeRaw = asString2(metadataShape.trigger_type ?? metadataShape.triggerType ?? metadata.trigger_type);
-  const triggerType = isTriggerType(triggerTypeRaw) ? triggerTypeRaw : inferTriggerTypeFromText(text);
-  const componentArea = metadataArea ?? inferComponentAreaFromText(text, params.repoTargets, triggerType);
+  const triggerType = isTriggerType(triggerTypeRaw) ? triggerTypeRaw : inferTriggerTypeFromText(text2);
+  const componentArea = metadataArea ?? inferComponentAreaFromText(text2, params.repoTargets, triggerType);
   const defaults = defaultCandidateShapeForArea(componentArea);
-  const objectiveType = asAutonomyObjectiveType(metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type) ?? inferObjectiveTypeFromText(text, pattern.tags) ?? defaults.objective_type;
+  const objectiveType = asAutonomyObjectiveType(metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type) ?? inferObjectiveTypeFromText(text2, pattern.tags) ?? defaults.objective_type;
   const riskRaw = asString2(metadataShape.risk_level ?? metadataShape.riskLevel ?? metadata.risk_level);
-  const riskLevel = isRiskLevel(riskRaw) ? riskRaw : inferRiskLevelFromText(text, pattern.tags);
+  const riskLevel = isRiskLevel(riskRaw) ? riskRaw : inferRiskLevelFromText(text2, pattern.tags);
   const targetPaths = asStringArray2(metadataShape.target_paths ?? metadataShape.targetPaths ?? metadata.target_paths);
   const writeGlobs = asStringArray2(metadataShape.write_globs ?? metadataShape.writeGlobs ?? metadata.write_globs);
   const validationIdeas = asStringArray2(metadataShape.expected_validation ?? metadataShape.expectedValidation ?? metadata.expected_validation ?? pattern.validationIdeas);
@@ -11240,12 +11485,12 @@ function buildExternalInspirationBlocks(params) {
   const objectiveWeightById = new Map(params.compiledObjectives.map((entry) => [entry.id, entry.weight]));
   const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
   return params.patterns.map((pattern) => {
-    const text = `${pattern.algorithm}
+    const text2 = `${pattern.algorithm}
 ${pattern.whenToUse}
 ${pattern.summary}
 ${pattern.tags.join(" ")}`;
-    const objectiveIds = matchObjectiveIdsFromText(text, params.compiledObjectives);
-    const gapIds = matchGapIdsFromText(text, params.opportunityGaps);
+    const objectiveIds = matchObjectiveIdsFromText(text2, params.compiledObjectives);
+    const gapIds = matchGapIdsFromText(text2, params.opportunityGaps);
     const candidateShape = buildCandidateShapeFromPattern({
       pattern,
       repoRoot: params.repoRoot,
@@ -11552,10 +11797,10 @@ function buildEngineInspirationContext(params) {
   };
 }
 function compactIdeationText(value, maxChars) {
-  const text = asString2(value).trim();
-  if (text.length <= maxChars)
-    return text;
-  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+  const text2 = asString2(value).trim();
+  if (text2.length <= maxChars)
+    return text2;
+  return `${text2.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
 }
 function compactIdeationTextList(values, maxItems, maxChars) {
   return values.slice(0, maxItems).map((value) => compactIdeationText(value, maxChars)).filter(Boolean);
@@ -11983,10 +12228,10 @@ function asBoolean2(value, fallback = false) {
   if (typeof value === "boolean")
     return value;
   if (typeof value === "string") {
-    const text = value.trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(text))
+    const text2 = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(text2))
       return true;
-    if (["0", "false", "no", "off"].includes(text))
+    if (["0", "false", "no", "off"].includes(text2))
       return false;
   }
   return fallback;
@@ -12000,8 +12245,8 @@ function clamp012(value) {
     return 1;
   return value;
 }
-function parseJsonObject(text) {
-  const raw = text.trim();
+function parseJsonObject(text2) {
+  const raw = text2.trim();
   if (!raw)
     return {};
   try {
@@ -12077,20 +12322,20 @@ async function runAutonomyGitCommand(cwd, args, timeoutMs = resolveAutonomyGitCo
   }
 }
 function sanitizeForGitRef(value) {
-  const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
-  return text || "default";
+  const text2 = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
+  return text2 || "default";
 }
 function isSafeGitBranchName(value) {
-  const text = String(value ?? "").trim();
-  if (!text || text.length > 200)
+  const text2 = String(value ?? "").trim();
+  if (!text2 || text2.length > 200)
     return false;
-  if (text.startsWith("-") || text.startsWith("/") || text.endsWith("/"))
+  if (text2.startsWith("-") || text2.startsWith("/") || text2.endsWith("/"))
     return false;
-  if (text.endsWith(".") || text.endsWith(".lock"))
+  if (text2.endsWith(".") || text2.endsWith(".lock"))
     return false;
-  if (text.includes("..") || text.includes("//") || text.includes("@{"))
+  if (text2.includes("..") || text2.includes("//") || text2.includes("@{"))
     return false;
-  return !/[\\\s~^:?*\[\]\x00-\x1F\x7F]/.test(text);
+  return !/[\\\s~^:?*\[\]\x00-\x1F\x7F]/.test(text2);
 }
 function normalizeConfiguredGitBranchName(value, fallback, label = "branch") {
   const candidate = String(value ?? "").trim();
@@ -12169,7 +12414,7 @@ class RemoteBuddyAutonomousEngine {
     this.authToken = opts.authToken;
     this.repoRoot = opts.repo;
     const safeSession = sanitizeForGitRef(this.sessionId).slice(0, 40);
-    this.autonomyRepo = resolve6(this.repoRoot, ".worktrees", `remotebuddy-autonomy-${safeSession}`);
+    this.autonomyRepo = resolve7(this.repoRoot, ".worktrees", `remotebuddy-autonomy-${safeSession}`);
     this.autonomyBranch = `_remotebuddy/autonomy-${safeSession}`;
     this.gitRemote = normalizeConfiguredGitRemoteName(String(opts.config.sourceControlManager.remote || "origin"), "origin");
     this.integrationBranch = normalizeConfiguredGitBranchName(String(opts.config.sourceControlManager.mainBranch || "main_agents"), "main_agents", "integration branch");
@@ -12338,7 +12583,7 @@ class RemoteBuddyAutonomousEngine {
     let raw = "";
     let readWasTruncated = false;
     try {
-      const bounded = readUtf8PrefixSync(resolve6(this.autonomyRepo, VISION_DOC_FNAME), MAX_VISION_READ_BYTES);
+      const bounded = readUtf8PrefixSync(resolve7(this.autonomyRepo, VISION_DOC_FNAME), MAX_VISION_READ_BYTES);
       raw = bounded.text;
       readWasTruncated = bounded.truncated;
     } catch (error) {
@@ -12417,7 +12662,7 @@ class RemoteBuddyAutonomousEngine {
     }
     await this.runGit(this.repoRoot, ["worktree", "prune"]);
     await this.runGit(this.repoRoot, ["branch", "-D", this.autonomyBranch]);
-    const parentDir = resolve6(this.autonomyRepo, "..");
+    const parentDir = resolve7(this.autonomyRepo, "..");
     if (!existsSync4(parentDir))
       mkdirSync(parentDir, { recursive: true });
     const add = await this.runGit(this.repoRoot, [
@@ -12805,7 +13050,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
+          promptTemplateVersion: "repository-agent-v8-admission-aware",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -12875,7 +13120,11 @@ ${JSON.stringify(input.messages ?? [])}`),
         deterministicPolicy: {
           maxCandidates: this.cfg.ideationMaxCandidates,
           minimumConfidence: this.cfg.minConfidence,
-          allowedObjectiveTypes: Object.entries(POLICY).filter(([, rule]) => rule.autonomousAllowed).map(([type]) => type),
+          allowReadAnywhere: this.cfg.allowReadAnywhere,
+          workerExecutionPlatform: this.workerExecutionPlatform,
+          disabledObjectiveTypes: Object.entries(this.cfg.maxDispatchPerHourByType ?? {}).filter(([, limit]) => Number.isFinite(limit) && Math.floor(limit) <= 0).map(([type]) => type),
+          disabledComponents: Object.entries(this.cfg.maxDispatchPerHourByComponent ?? {}).filter(([, limit]) => Number.isFinite(limit) && Math.floor(limit) <= 0).map(([component]) => component),
+          allowedObjectiveTypes: Object.entries(AUTONOMY_CANDIDATE_POLICY).filter(([, rule]) => rule.autonomousAllowed).map(([type]) => type),
           candidateEnums: Object.fromEntries(Object.entries(AUTONOMY_CANDIDATE_ENUMS).map(([field, values]) => [field, [...values]])),
           requiredCandidateFields: [
             "id",
@@ -12937,6 +13186,9 @@ ${JSON.stringify(input.messages ?? [])}`),
       if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {
         throw controller.signal.reason ?? new Error("RepositoryAgent ideation cancelled");
       }
+      if (result.analyzedRepository.identity !== repository.identity || result.analyzedRepository.revision !== repository.revision || result.analyzedRepository.tree !== repository.tree) {
+        throw new Error("RepositoryAgent returned evidence for a different repository snapshot");
+      }
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       if (candidates.length === 0) {
@@ -12954,7 +13206,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
+          promptTemplateVersion: "repository-agent-v8-admission-aware",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -14008,7 +14260,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             candidate.vision_source_bucket = matchedVisionObjective.source_bucket;
             candidate.vision_category = matchedVisionObjective.category;
           }
-          const policy = POLICY[candidate.objective_type];
+          const policy = AUTONOMY_CANDIDATE_POLICY[candidate.objective_type];
           if (!policy || !policy.autonomousAllowed) {
             recordDropReason(`${source}_objective_type_not_allowed`);
             continue;
@@ -14017,7 +14269,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             recordDropReason(`${source}_invalid_risk_level`);
             continue;
           }
-          if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) {
+          if (AUTONOMY_RISK_ORDER[candidate.risk_level] > AUTONOMY_RISK_ORDER[policy.maxRisk]) {
             recordDropReason(`${source}_risk_exceeds_policy`);
             continue;
           }
@@ -14053,11 +14305,20 @@ ${JSON.stringify(input.messages ?? [])}`),
             console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: ${suppressedFailureReason}; selecting another component instead.`);
             continue;
           }
-          if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
+          const verifiedAnalysis = repositoryAgentPhase && source === "llm" ? repositoryAgentResult : null;
+          const internalAdmission = evaluateAutonomyInternalWork(candidate, {
+            allowInternalRepository: allowPushPalsInternalCandidates,
+            currentRepository: verifiedAnalysis?.analyzedRepository,
+            evidenceRepository: verifiedAnalysis?.analyzedRepository,
+            evidence: verifiedAnalysis?.evidence,
+            verifiedTargetPaths: verifiedAnalysis?.evidence.flatMap((entry) => entry.blobHash ? [{ path: entry.path, blobHash: entry.blobHash }] : [])
+          });
+          if (!internalAdmission.ok) {
             recordDropReason(`${source}_pushpals_internal_leak`);
             console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`);
             continue;
           }
+          candidate.problem_statement = internalAdmission.repositoryNativeProblemStatement;
           const missingTargetPaths = findMissingRepoTargetPaths(this.autonomyRepo, candidate.target_paths);
           if (missingTargetPaths.length > 0) {
             recordDropReason(`${source}_target_paths_missing_in_repo`);
@@ -14884,13 +15145,13 @@ Scope:
 // apps/remotebuddy/src/repository_agent.ts
 import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
 import { closeSync as closeSync2, existsSync as existsSync5, openSync as openSync2, readSync as readSync2, realpathSync as realpathSync2, statSync as statSync3 } from "fs";
-import { basename, isAbsolute as isAbsolute4, relative as relative3, resolve as resolve7 } from "path";
+import { basename, isAbsolute as isAbsolute5, relative as relative4, resolve as resolve8 } from "path";
 
 // apps/remotebuddy/src/repository_evidence.ts
-function utf8Prefix(text, maxBytes) {
-  const bytes = Buffer.from(text, "utf8");
+function utf8Prefix(text2, maxBytes) {
+  const bytes = Buffer.from(text2, "utf8");
   if (bytes.length <= maxBytes)
-    return text;
+    return text2;
   let end = Math.max(0, Math.floor(maxBytes));
   while (end > 0 && (bytes[end] & 192) === 128)
     end--;
@@ -14922,13 +15183,13 @@ function allocateEvidenceBytes(sizes, totalBytes, perFileBytes) {
   }
   return allocations;
 }
-function excerptRepositoryText(text, scanTruncated, maxBytes, retrievalTerms) {
+function excerptRepositoryText(text2, scanTruncated, maxBytes, retrievalTerms) {
   const limit = Math.max(0, Math.floor(maxBytes));
-  const lines = text.split(/\r?\n/);
+  const lines = text2.split(/\r?\n/);
   const completeLineCount = scanTruncated ? lines.length - 1 : lines.length;
-  if (Buffer.byteLength(text, "utf8") <= limit) {
+  if (Buffer.byteLength(text2, "utf8") <= limit) {
     return {
-      content: text,
+      content: text2,
       truncated: scanTruncated,
       scanTruncated,
       lineRanges: completeLineCount > 0 ? [{ startLine: 1, endLine: completeLineCount }] : []
@@ -15014,7 +15275,7 @@ ${chunk.text}`;
   return {
     content: ordered.length ? ordered.map(render).join(`
 
-`) : utf8Prefix(text, limit),
+`) : utf8Prefix(text2, limit),
     truncated: true,
     scanTruncated,
     lineRanges
@@ -15022,7 +15283,7 @@ ${chunk.text}`;
 }
 
 // apps/remotebuddy/src/repository_agent.ts
-var PROMPT_VERSION = "repository-agent-v7-bounded-coverage";
+var PROMPT_VERSION = "repository-agent-v8-admission-aware";
 var CACHE_NAMESPACE = "repository_agent_cache";
 var CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 var FACT_NAMESPACE = "repository_facts";
@@ -15212,8 +15473,8 @@ async function settleWithin2(promise, timeoutMs) {
   }
 }
 function compactText2(value, maxChars) {
-  const text = String(value ?? "").replace(/\u0000/g, "").trim();
-  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 14))}...[truncated]`;
+  const text2 = String(value ?? "").replace(/\u0000/g, "").trim();
+  return text2.length <= maxChars ? text2 : `${text2.slice(0, Math.max(0, maxChars - 14))}...[truncated]`;
 }
 function isRecord2(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -15249,7 +15510,7 @@ function comparablePath(value) {
 }
 function normalizeRelativePath(value) {
   const normalized = String(value ?? "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/").trim();
-  if (!normalized || normalized === "." || isAbsolute4(normalized))
+  if (!normalized || normalized === "." || isAbsolute5(normalized))
     return null;
   if (normalized.split("/").some((segment) => segment === ".." || segment === ""))
     return null;
@@ -15259,9 +15520,9 @@ function containedPath(repoRoot, repositoryPath) {
   const normalized = normalizeRelativePath(repositoryPath);
   if (!normalized)
     return null;
-  const absolute = resolve7(repoRoot, normalized);
-  const rel = relative3(repoRoot, absolute);
-  if (!rel || rel.startsWith("..") || isAbsolute4(rel))
+  const absolute = resolve8(repoRoot, normalized);
+  const rel = relative4(repoRoot, absolute);
+  if (!rel || rel.startsWith("..") || isAbsolute5(rel))
     return null;
   return absolute;
 }
@@ -15277,10 +15538,10 @@ function canonicalContainedFile(repoRoot, repositoryPath) {
       return null;
     const canonicalRoot = realpathSync2.native(repoRoot);
     const canonicalFile = realpathSync2.native(absolute);
-    const rel = relative3(canonicalRoot, canonicalFile);
-    if (!rel || rel.startsWith("..") || isAbsolute4(rel))
+    const rel = relative4(canonicalRoot, canonicalFile);
+    if (!rel || rel.startsWith("..") || isAbsolute5(rel))
       return null;
-    const expectedCanonicalFile = resolve7(canonicalRoot, ...normalized.split("/"));
+    const expectedCanonicalFile = resolve8(canonicalRoot, ...normalized.split("/"));
     if (comparablePath(canonicalFile) !== comparablePath(expectedCanonicalFile))
       return null;
     return canonicalFile;
@@ -15493,11 +15754,11 @@ async function readRepositoryTextPrefix(repoRoot, request, path, maxChars, signa
   }
   if (result.stdoutDecodeError)
     return null;
-  const text = result.stdoutTruncated && result.stdout.endsWith("\uFFFD") ? result.stdout.slice(0, -1) : result.stdout;
-  if (text.includes("\x00"))
+  const text2 = result.stdoutTruncated && result.stdout.endsWith("\uFFFD") ? result.stdout.slice(0, -1) : result.stdout;
+  if (text2.includes("\x00"))
     return null;
-  const truncated = result.stdoutTruncated || Buffer.byteLength(text, "utf8") < declaredSize;
-  return { text, truncated };
+  const truncated = result.stdoutTruncated || Buffer.byteLength(text2, "utf8") < declaredSize;
+  return { text: text2, truncated };
 }
 async function appendPacketFiles(repoRoot, request, existingFiles, paths, signal, limits = {}) {
   const files = [...existingFiles];
@@ -15648,8 +15909,8 @@ async function extendEvidencePacket(repoRoot, request, seedPacket, selectedPaths
   }
   return { ...seedPacket, selectedPaths: includedSelectedPaths, files: interleavedFiles };
 }
-function parseJsonObject2(text) {
-  const trimmed = text.trim();
+function parseJsonObject2(text2) {
+  const trimmed = text2.trim();
   const attempts = [trimmed];
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1];
   if (fenced)
@@ -15840,7 +16101,11 @@ function normalizedDeterministicPolicy(request) {
     maxCandidates: clampInt(policy.maxCandidates, 3, 1, 64),
     candidateEnums: AUTONOMY_CANDIDATE_ENUMS,
     minimumConfidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
+    allowReadAnywhere: policy.allowReadAnywhere !== false,
+    workerExecutionPlatform: policy.workerExecutionPlatform === "windows" ? "windows" : "linux_docker",
     allowedObjectiveTypes: list(policy.allowedObjectiveTypes, 16, 128),
+    disabledObjectiveTypes: list(policy.disabledObjectiveTypes, 16, 128),
+    disabledComponents: list(policy.disabledComponents, 256, 1000),
     requiredCandidateFields: list(policy.requiredCandidateFields, 32, 256),
     notes: list(policy.notes, 8, 1000)
   };
@@ -16694,6 +16959,132 @@ class RepositoryAgentWorker {
     }
     return { refs, records: valid };
   }
+  async validationSnapshotFileSystem(repoRoot, request, tracked, targetPaths, signal) {
+    const stages = await runGit(repoRoot, ["ls-files", "--stage", "-z"], {
+      signal,
+      outputLimitBytes: MAX_TRACKED_PATH_BYTES
+    });
+    const trackedPaths = new Set(tracked.paths);
+    const entries = [];
+    for (const row of stages.split("\x00")) {
+      const match = /^(100644|100755) [a-f\d]+ 0\t(.+)$/s.exec(row);
+      if (!match)
+        continue;
+      if (!trackedPaths.has(match[2])) {
+        throw new RepositoryAgentWorkerError("validation_snapshot_unavailable", "Validation tracked inventory is incomplete; bounded discovery cannot establish manifest absence", true);
+      }
+      entries.push({ path: match[2] });
+    }
+    const directories = new Set([""]);
+    for (const target of targetPaths) {
+      const path = normalizeRelativePath(target);
+      if (!path)
+        continue;
+      let directory = trackedPaths.has(path) ? path.slice(0, Math.max(0, path.lastIndexOf("/"))) : path;
+      for (;; ) {
+        directories.add(directory);
+        if (!directory)
+          break;
+        directory = directory.slice(0, Math.max(0, directory.lastIndexOf("/")));
+      }
+    }
+    let filesRead = 0;
+    let bytesRead = 0;
+    for (const entry of entries) {
+      const directory = entry.path.slice(0, Math.max(0, entry.path.lastIndexOf("/")));
+      const limit = validationManifestReadLimit(entry.path);
+      if (limit == null || !directories.has(directory))
+        continue;
+      throwIfAborted(signal);
+      if (++filesRead > 32)
+        throw new RepositoryAgentWorkerError("validation_snapshot_unavailable", "Validation manifests exceed the bounded snapshot budget", true);
+      const content = await readRepositoryTextPrefix(repoRoot, request, entry.path, limit, signal);
+      if (!content || content.truncated || (bytesRead += Buffer.byteLength(content.text, "utf8")) > 2 * 1024 * 1024) {
+        throw new RepositoryAgentWorkerError("validation_snapshot_unavailable", `Cannot establish complete bounded validation manifest evidence for ${entry.path}`, true);
+      }
+      entry.text = content.text;
+      entry.truncated = false;
+    }
+    return createValidationSnapshotFileSystem(repoRoot, entries);
+  }
+  async admitAutonomyCandidates(result, request, tracked, repoRoot, signal) {
+    if (autonomyVisionFingerprint(request) == null || !isRecord2(result.data) || !Array.isArray(result.data.candidates))
+      return result;
+    const policy = normalizedDeterministicPolicy(request);
+    const vision = normalizedAutonomyVision(request);
+    const trackedPaths = new Set(tracked.paths);
+    const allowInternalRepository = [
+      "apps/remotebuddy/src/autonomous_engine.ts",
+      "apps/workerpals/src/workerpals_main.ts",
+      "packages/shared/src/autonomy_policy.ts"
+    ].every((path) => trackedPaths.has(path));
+    const rejected = {};
+    let candidates = result.data.candidates.filter((raw) => {
+      if (!isRecord2(raw))
+        return false;
+      const reason = staticAutonomyCandidateRejection(raw, {
+        trackedPaths: tracked.paths,
+        allowedObjectiveTypes: policy.allowedObjectiveTypes,
+        disabledObjectiveTypes: policy.disabledObjectiveTypes,
+        disabledComponents: policy.disabledComponents,
+        allowReadAnywhere: policy.allowReadAnywhere,
+        minimumConfidence: policy.minimumConfidence,
+        visionSectionNumbers: new Set(vision.sections.map((section) => section.number))
+      }) ?? evaluateAutonomyInternalWork(raw, {
+        allowInternalRepository,
+        currentRepository: request.repository,
+        evidenceRepository: result.analyzedRepository,
+        evidence: result.evidence,
+        verifiedTargetPaths: result.evidence.flatMap((entry) => entry.blobHash ? [{ path: entry.path, blobHash: entry.blobHash }] : [])
+      }).reason;
+      if (!reason)
+        return true;
+      rejected[reason] = (rejected[reason] ?? 0) + 1;
+      return false;
+    });
+    const needsValidation = (raw) => isRecord2(raw) && AUTONOMY_CANDIDATE_POLICY[raw.objective_type].requireValidation;
+    if (candidates.some(needsValidation)) {
+      const fileSystem = await this.validationSnapshotFileSystem(repoRoot, request, tracked, candidates.filter(needsValidation).flatMap((raw) => raw.target_paths), signal).catch((error) => {
+        throwIfAborted(signal);
+        throw new RepositoryAgentWorkerError("validation_snapshot_unavailable", `Bounded validation snapshot unavailable: ${compactText2(error, 1000)}`, true);
+      });
+      throwIfAborted(signal);
+      candidates = candidates.filter((raw) => {
+        if (!needsValidation(raw) || !isRecord2(raw))
+          return true;
+        let nativeValidation;
+        try {
+          nativeValidation = inferRepoValidationIdeas(repoRoot, raw.target_paths, policy.workerExecutionPlatform, false, fileSystem);
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError)
+            throw new RepositoryAgentWorkerError("validation_snapshot_unavailable", "Complete validation snapshot evidence is unavailable", true);
+          throw error;
+        }
+        if (normalizeTargetValidationIdeas(raw.expected_validation, nativeValidation).length > 0)
+          return true;
+        rejected.missing_validation_steps = (rejected.missing_validation_steps ?? 0) + 1;
+        return false;
+      });
+    }
+    if (candidates.length === result.data.candidates.length)
+      return result;
+    this.logger.warn(`[RepositoryAgent] autonomyCandidateAdmission=${JSON.stringify({
+      requestId: result.requestId,
+      cacheHit: result.cache.hit,
+      proposed: result.data.candidates.length,
+      admitted: candidates.length,
+      rejected,
+      outcome: candidates.length === 0 ? "no_structurally_admissible_candidates" : "retain_admitted_candidates"
+    })}`);
+    return {
+      ...result,
+      data: { ...result.data, candidates },
+      ...candidates.length === 0 ? {
+        answer: "No structurally admissible candidates on this evidence page; continue bounded repository discovery.",
+        summary: `Candidate admission rejected ${result.data.candidates.length} proposal(s): ${Object.keys(rejected).join(", ")}. This does not establish repository-wide exhaustion.`
+      } : {}
+    };
+  }
   async cachedResult(requestId, request, key, repoRoot, tracked, signal, deadlineMs) {
     let record = null;
     const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
@@ -16725,7 +17116,7 @@ class RepositoryAgentWorker {
       if (evidence.length === 0) {
         throw new RepositoryAgentWorkerError("invalid_evidence", "Evidence-free Repository Agent results are not eligible for exact-cache reuse", false);
       }
-      const result = sanitizeRepositoryAgentResult({
+      const result = await this.admitAutonomyCandidates(sanitizeRepositoryAgentResult({
         ...cached,
         requestId,
         analyzedRepository: {
@@ -16741,7 +17132,7 @@ class RepositoryAgentWorker {
           ...record.expiresAt ? { expiresAt: record.expiresAt } : {}
         },
         completedAt: new Date().toISOString()
-      }, requestId);
+      }, requestId), request, tracked, repoRoot, signal);
       result.memoryRefs = mergeMemoryRefs(structuralAutonomy ? [] : result.memoryRefs, [
         memoryRefForRecord(record, "analysis_cache")
       ]);
@@ -16768,6 +17159,8 @@ class RepositoryAgentWorker {
       return result;
     } catch (error) {
       throwIfAborted(signal);
+      if (error instanceof RepositoryAgentWorkerError && error.code === "validation_snapshot_unavailable")
+        throw error;
       try {
         await this.memoryWithinDeadline("stale exact cache invalidation", signal, stageDeadlineMs, () => this.memory.invalidate({
           scope: cacheScope(request),
@@ -17079,7 +17472,7 @@ class RepositoryAgentWorker {
       const confidence = Math.max(0, Math.min(1, Number(raw.confidence) || 0));
       await this.recordCapabilitySuccess(request, circuit, signal, deadlineMs);
       return {
-        result: sanitizeRepositoryAgentResult({
+        result: await this.admitAutonomyCandidates(sanitizeRepositoryAgentResult({
           schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
           requestId,
           analyzedRepository: {
@@ -17097,12 +17490,14 @@ class RepositoryAgentWorker {
           cache: { hit: false, key: null },
           memoryRefs: advisoryMemory.refs,
           completedAt: new Date().toISOString()
-        }, requestId),
+        }, requestId), request, tracked, repoRoot, signal),
         inferenceModelId: attributedModelId(generated, this.modelId),
         cacheable: true
       };
     } catch (error) {
       throwIfAborted(signal);
+      if (error instanceof RepositoryAgentWorkerError && error.code === "validation_snapshot_unavailable")
+        throw error;
       await this.recordCapabilityFailure(request, error, circuit, signal, deadlineMs);
       if (error instanceof RepositoryAgentWorkerError && (error.code === "invalid_evidence" || error.code === "invalid_evidence_blob")) {
         throw error;
@@ -17248,8 +17643,8 @@ class RepositoryAgentWorker {
           context: normalizedStructuralContext(request)
         };
       }
-      const repoRoot = resolve7(request.repository.root);
-      if (!isAbsolute4(request.repository.root) || !existsSync5(repoRoot) || !statSync3(repoRoot).isDirectory()) {
+      const repoRoot = resolve8(request.repository.root);
+      if (!isAbsolute5(request.repository.root) || !existsSync5(repoRoot) || !statSync3(repoRoot).isDirectory()) {
         throw new RepositoryAgentWorkerError("invalid_repository", "Repository Agent request did not resolve to an existing absolute repository root", false);
       }
       const before = await resolveRepositorySnapshotWithinDeadline(repoRoot, deadlineMs, controller.signal);
@@ -17460,18 +17855,18 @@ async function forwardWorkerOutput(stream, write, onLine, signal) {
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted)
     abort();
-  const inspect = (text) => {
+  const inspect = (text2) => {
     let offset = 0;
-    while (offset < text.length) {
-      const newline = text.indexOf(`
+    while (offset < text2.length) {
+      const newline = text2.indexOf(`
 `, offset);
-      const end = newline < 0 ? text.length : newline;
+      const end = newline < 0 ? text2.length : newline;
       if (!oversized) {
         if (pending.length + end - offset > MAX_STARTUP_LINE_CHARS) {
           pending = "";
           oversized = true;
         } else {
-          pending += text.slice(offset, end);
+          pending += text2.slice(offset, end);
         }
       }
       if (newline < 0)
@@ -17493,10 +17888,10 @@ async function forwardWorkerOutput(stream, write, onLine, signal) {
       if (signal?.aborted)
         break;
       inspect(decoder.decode(value, { stream: true }));
-      await new Promise((resolve8, reject) => {
-        releaseWrite = resolve8;
+      await new Promise((resolve9, reject) => {
+        releaseWrite = resolve9;
         try {
-          Promise.resolve(write(value)).then(resolve8, reject);
+          Promise.resolve(write(value)).then(resolve9, reject);
         } catch (error) {
           reject(error);
         }
@@ -17647,10 +18042,10 @@ async function cleanupOwnedWorkerContainers(repo, workerId, options = {}) {
   try {
     return await Promise.race([
       cleanup().catch(() => false),
-      new Promise((resolve8) => {
+      new Promise((resolve9) => {
         timer = setTimeout(() => {
           controller.abort();
-          resolve8(false);
+          resolve9(false);
         }, timeoutMs);
       })
     ]);
@@ -17704,23 +18099,23 @@ function parseArgs() {
   }
   return { server: resolved.serverUrl, sessionId, authToken: resolved.authToken };
 }
-function isLikelyChitChat(text) {
-  const t = text.trim().toLowerCase();
+function isLikelyChitChat(text2) {
+  const t = text2.trim().toLowerCase();
   if (!t)
     return true;
   const short = t.length <= 64;
   return short && /^(hi|hello|hey|hi there|hello there|thanks|thank you|ok|okay|cool|nice|yo|sup|what's up|whats up)[!. ]*$/.test(t);
 }
-function isQuestionLike(text) {
-  const t = text.trim().toLowerCase();
+function isQuestionLike(text2) {
+  const t = text2.trim().toLowerCase();
   if (!t)
     return false;
   if (t.includes("?"))
     return true;
   return /^(is|are|can|could|should|would|what|why|how|when|where|which|does|do)\b/.test(t);
 }
-function isExecutionIntent(text, targetPath) {
-  const t = text.trim().toLowerCase();
+function isExecutionIntent(text2, targetPath) {
+  const t = text2.trim().toLowerCase();
   if (!t || isLikelyChitChat(t))
     return false;
   if (targetPath)
@@ -17738,8 +18133,8 @@ function isExecutionIntent(text, targetPath) {
     return false;
   return t.length > 220;
 }
-function isArchitectureIntent(text) {
-  const t = text.trim().toLowerCase();
+function isArchitectureIntent(text2) {
+  const t = text2.trim().toLowerCase();
   if (!t)
     return false;
   const architectureCue = /\b(architecture|repo architecture|repository architecture|system design|high[- ]level|overview|describe the architecture|how .* works|explain .* architecture)\b/.test(t);
@@ -17747,10 +18142,10 @@ function isArchitectureIntent(text) {
   return architectureCue && !codeChangeCue;
 }
 function parseEnabledFlag(raw, defaultValue) {
-  const text = String(raw ?? "").trim().toLowerCase();
-  if (!text)
+  const text2 = String(raw ?? "").trim().toLowerCase();
+  if (!text2)
     return defaultValue;
-  return !["0", "false", "no", "off"].includes(text);
+  return !["0", "false", "no", "off"].includes(text2);
 }
 function parseNonNegativeMs(raw, defaultValue = 0) {
   const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
@@ -17759,7 +18154,7 @@ function parseNonNegativeMs(raw, defaultValue = 0) {
   return Math.floor(parsed);
 }
 function isCodexUnavailableFailureSignal(message, detail) {
-  const text = `${message}
+  const text2 = `${message}
 ${detail}`.toLowerCase();
   return [
     "openai_codex cli is not installed",
@@ -17768,23 +18163,23 @@ ${detail}`.toLowerCase();
     "openai_codex policy violation: codex cli workaround detected",
     "codex cli isn't available",
     "codex cli is mandatory in this backend"
-  ].some((needle) => text.includes(needle));
+  ].some((needle) => text2.includes(needle));
 }
 var CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
 function asAutonomyComponentArea2(value) {
   return normalizeAutonomyComponentArea(value) ?? undefined;
 }
 function normalizeRequestPriority(value) {
-  const text = String(value ?? "").trim().toLowerCase();
-  if (text === "interactive" || text === "background")
-    return text;
+  const text2 = String(value ?? "").trim().toLowerCase();
+  if (text2 === "interactive" || text2 === "background")
+    return text2;
   return "normal";
 }
 function toSingleLine(value, max = 220) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (!text)
+  const text2 = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text2)
     return "";
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+  return text2.length > max ? `${text2.slice(0, max - 3)}...` : text2;
 }
 async function withHardDeadline(operation, timeoutMs, timeoutMessage) {
   const controller = new AbortController;
@@ -17893,10 +18288,10 @@ function resolveTaskExecuteDedupeCooldownMs(_params, dedupeKey) {
 function parseAutonomyRequestMetadata(value) {
   let root = asObject2(value);
   if (!root && typeof value === "string") {
-    const text = value.trim();
-    if (text) {
+    const text2 = value.trim();
+    if (text2) {
       try {
-        root = asObject2(JSON.parse(text));
+        root = asObject2(JSON.parse(text2));
       } catch {
         root = null;
       }
@@ -18051,7 +18446,7 @@ function shouldTreatMissingTargetAsStale(repoRoot, path, requestText) {
     return false;
   if (!pathHintLooksLikeConcreteFile(normalized))
     return false;
-  if (existsSync6(resolve8(repoRoot, normalized)))
+  if (existsSync6(resolve9(repoRoot, normalized)))
     return false;
   if (requestAllowsCreatingMissingPath(requestText))
     return false;
@@ -18235,12 +18630,12 @@ function extractRequiredValidationStepsFromVisionMarkdown(markdown) {
   return out;
 }
 function defaultValidationStepsForRequest(prompt, targetPaths) {
-  const text = prompt.toLowerCase();
+  const text2 = prompt.toLowerCase();
   const concreteTargets = targetPaths.filter((entry) => entry && entry !== ".").slice(0, 4);
-  if (/\b(lint|eslint|tsc|typecheck)\b/.test(text)) {
+  if (/\b(lint|eslint|tsc|typecheck)\b/.test(text2)) {
     return ["bun run lint"];
   }
-  if (/\b(test|tests|pytest|vitest|jest|coverage)\b/.test(text)) {
+  if (/\b(test|tests|pytest|vitest|jest|coverage)\b/.test(text2)) {
     const pythonTarget = concreteTargets.some((target) => target.toLowerCase().endsWith(".py"));
     if (pythonTarget)
       return ["uv run pytest"];
@@ -18347,8 +18742,8 @@ ${detail}`.toLowerCase();
   return combined.includes("tool preflight returned non-json response") || combined.includes("preflight must return one valid json object in a single response");
 }
 function isNoChangeCompletionSummary(summary) {
-  const text = summary.toLowerCase();
-  return text.includes("no targetpath provided") || text.includes("no target path provided") || text.includes("no changes to commit") || text.includes("no file changes detected") || text.includes("no modified files were detected");
+  const text2 = summary.toLowerCase();
+  return text2.includes("no targetpath provided") || text2.includes("no target path provided") || text2.includes("no changes to commit") || text2.includes("no file changes detected") || text2.includes("no modified files were detected");
 }
 function extractClarificationFromCompletionSummary(summary) {
   const normalized = String(summary ?? "").trim();
@@ -18535,7 +18930,7 @@ class RemoteBuddyOrchestrator {
     const embeddedWorkerpalsSourceBundle = String(process.env.PUSHPALS_WORKERPALS_SOURCE_BUNDLE ?? "").trim();
     const embeddedRuntimeLaunchTrampoline = String(process.env.PUSHPALS_RUNTIME_LAUNCH_TRAMPOLINE ?? "").trim();
     const embeddedBunExecutable = String(process.env.PUSHPALS_BUN_BIN ?? "").trim() || process.execPath;
-    const workerpalsEntrypoint = resolve8(this.repo, "apps", "workerpals", "src", "workerpals_main.ts");
+    const workerpalsEntrypoint = resolve9(this.repo, "apps", "workerpals", "src", "workerpals_main.ts");
     if (process.platform === "win32" && embeddedWorkerpalsSourceBundle && existsSync6(embeddedWorkerpalsSourceBundle) && embeddedRuntimeLaunchTrampoline && existsSync6(embeddedRuntimeLaunchTrampoline) && embeddedBunExecutable && existsSync6(embeddedBunExecutable)) {
       this.workerpalsSourceBundlePath = embeddedWorkerpalsSourceBundle;
       this.workerpalsBunExecutable = embeddedBunExecutable;
@@ -18548,7 +18943,7 @@ class RemoteBuddyOrchestrator {
       this.workerpalsBinaryPath = embeddedWorkerpalsBinary;
     } else if (existsSync6(workerpalsEntrypoint)) {
       this.workerpalsEntrypoint = workerpalsEntrypoint;
-      const envPath = resolve8(this.repo, ".env");
+      const envPath = resolve9(this.repo, ".env");
       this.workerpalsEnvFile = existsSync6(envPath) ? envPath : null;
     } else if (this.autoSpawnWorkers) {
       this.autoSpawnWorkers = false;
@@ -18804,9 +19199,9 @@ class RemoteBuddyOrchestrator {
     clearInterval(state.timer);
     this.requestLeaseHeartbeats.delete(requestId);
   }
-  async assistantMessage(sessionId, text, meta = {}) {
+  async assistantMessage(sessionId, text2, meta = {}) {
     try {
-      const ok = await this.comm.assistantMessageToSession(sessionId, text, meta);
+      const ok = await this.comm.assistantMessageToSession(sessionId, text2, meta);
       if (!ok) {
         console.error(`[RemoteBuddy] assistant_message failed for session ${sessionId || "(unknown)"}`);
       }
@@ -19276,8 +19671,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     return context;
   }
-  pushContext(text, sessionId = this.sessionId) {
-    const normalized = String(text ?? "").trim();
+  pushContext(text2, sessionId = this.sessionId) {
+    const normalized = String(text2 ?? "").trim();
     if (!normalized)
       return;
     const capped = normalized.length <= RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS ? normalized : `${normalized.slice(0, RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS - 16)}
@@ -19351,7 +19746,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     return out;
   }
   loadVisionRequiredValidationSteps() {
-    const visionPath = resolve8(this.repo, "vision.md");
+    const visionPath = resolve9(this.repo, "vision.md");
     if (!existsSync6(visionPath))
       return [];
     try {
@@ -19761,8 +20156,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         ]) {
           if (!stream || typeof stream === "number")
             continue;
-          outputPumps.push(forwardWorkerOutput(stream, (chunk) => new Promise((resolve9, reject) => {
-            destination.write(chunk, (error) => error ? reject(error) : resolve9());
+          outputPumps.push(forwardWorkerOutput(stream, (chunk) => new Promise((resolve10, reject) => {
+            destination.write(chunk, (error) => error ? reject(error) : resolve10());
           }), (line) => {
             startupProgress?.observeLine(line);
           }, outputAbort.signal).catch((error) => {

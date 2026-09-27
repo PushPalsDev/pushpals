@@ -15,6 +15,7 @@ import { tmpdir } from "os";
 import { createServer } from "net";
 import { delimiter, dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
+import { installedSmokeWorkerEnv } from "../../scripts/release-installed-cli-smoke.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..", "..");
@@ -808,7 +809,7 @@ describe("packaged CLI end-to-end", () => {
           OPENAI_API_KEY: "cli-e2e-installed-package-key",
           PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
           PUSHPALS_DATA_DIR_OVERRIDE: join(root, "data"),
-          REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false",
+          ...installedSmokeWorkerEnv(false),
           REMOTEBUDDY_AUTONOMY_ENABLED: process.platform === "win32" ? "true" : "false",
         });
 

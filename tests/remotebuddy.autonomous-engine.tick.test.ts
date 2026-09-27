@@ -8,11 +8,22 @@ import {
   RemoteBuddyAutonomousEngine,
   resolveAutonomyGitCommandTimeoutMs,
 } from "../apps/remotebuddy/src/autonomous_engine";
-import { resolveRepositorySnapshot } from "../packages/shared/src";
+import {
+  REPOSITORY_AGENT_SCHEMA_VERSION,
+  resolveRepositorySnapshot,
+  type RepositoryAgentAskOptions,
+  type RepositoryAgentRequest,
+  type RepositoryAgentResult,
+  type RepositoryAgentSubmitInput,
+  type RepositoryAgentWorkerControl,
+} from "../packages/shared/src";
+import { RepositoryAgentWorker } from "../apps/remotebuddy/src/repository_agent";
+import type { LLMGenerateInput } from "../apps/remotebuddy/src/llm";
 import { AutonomyStore } from "../apps/server/src/autonomy";
 import { JobQueue } from "../apps/server/src/jobs";
 import { CompletionQueue } from "../apps/server/src/completions";
 import { RequestQueue } from "../apps/server/src/requests";
+import { SqliteMemoryStore } from "../apps/server/src/memory_store";
 
 type FetchCall = {
   url: string;
@@ -1429,6 +1440,302 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(enqueueCalls).toBe(0);
     expect((engine as any).lastDetail).toBe("disabled_during_repository_agent_ideation");
   });
+
+  test.each([0, 2])(
+    "dispatches a source-grounded naming repair through real worker and server admission after %i rejected evidence pages",
+    async (rejectedPages) => {
+      originalFetch = globalThis.fetch;
+      const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-grounded-dispatch-"));
+      const stateRoot = mkdtempSync(join(tmpdir(), "pushpals-autonomy-grounded-state-"));
+      tempDirs.push(root, stateRoot);
+      mkdirSync(join(root, "src"));
+      writeFileSync(
+        join(root, "vision.md"),
+        "# Vision\n\n## Priorities\n- Make catalog empty-state labels clear to application users.\n",
+      );
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({ name: "catalog-fixture", scripts: { test: "node --test" } }),
+      );
+      writeFileSync(join(root, "README.md"), "# Catalog\n\nBrowse a local catalog.\n");
+      // Enough ordinary product files for several independent six-file evidence pages.
+      for (let index = 0; index < 18; index++) {
+        writeFileSync(
+          join(root, "src", `catalog-${String(index).padStart(2, "0")}.js`),
+          '// Catalog empty-state copy.\nexport const emptyLabel = "WorkerPal workspace unavailable";\n',
+        );
+      }
+      execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+      execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.invalid",
+          "commit",
+          "-m",
+          "catalog fixture",
+        ],
+        { cwd: root, stdio: "ignore" },
+      );
+      const repository = await resolveRepositorySnapshot(root);
+      const dbPath = join(stateRoot, "control.sqlite");
+      const store = new AutonomyStore(dbPath);
+      const requests = new RequestQueue(dbPath);
+      const memory = new SqliteMemoryStore(join(stateRoot, "memory.sqlite"));
+      const workerResults: RepositoryAgentResult[] = [];
+      const coveragePages: number[] = [];
+      const workerWarnings: string[] = [];
+      const objectivePosts: Array<Record<string, any>> = [];
+      const serverDecisions: Array<{ ok: boolean; reason?: string }> = [];
+      let modelCalls = 0;
+      let planningCalls = 0;
+      let enqueuedRequestId = "";
+      let selectedTarget = "";
+      const control: RepositoryAgentWorkerControl = {
+        claim: async () => ({ claim: null, pollAfterMs: 1 }),
+        renewLease: async () => {
+          throw new Error("Direct analysis must not renew a queue lease");
+        },
+        complete: async () => {
+          throw new Error("Direct analysis must not complete a queue claim");
+        },
+        fail: async () => {
+          throw new Error("Direct analysis must not fail a queue claim");
+        },
+      };
+      const repositoryLlm = {
+        async generate(input: LLMGenerateInput) {
+          modelCalls += 1;
+          const payload = JSON.parse(input.messages[0]!.content);
+          const packet = payload.evidencePacket;
+          coveragePages.push(packet.discoveryCoverage.page);
+          const target = (packet.selectedPaths as string[]).find((path) => path.startsWith("src/"));
+          expect(target).toBeDefined();
+          expect(
+            (packet.files as Array<{ path: string }>).some((file) => file.path === target),
+          ).toBe(true);
+          selectedTarget = target!;
+          const invalidInternalProposal = modelCalls <= rejectedPages;
+          const candidate = {
+            id: "catalog-label-repair",
+            title: invalidInternalProposal
+              ? "Add catalog recovery diagnostics"
+              : "Correct the catalog empty-state label",
+            objective_type: "small_refactor",
+            problem_statement: invalidInternalProposal
+              ? "Add WorkerPal orchestration retry diagnostics to catalog recovery behavior."
+              : `${target}:2 contains the user-visible string "WorkerPal workspace unavailable"; replace it with repository-native wording and add a regression.`,
+            trigger_type: "regret_signal",
+            component_area: "src",
+            target_paths: [target!],
+            scope: { read_anywhere: false, write_globs: [target!] },
+            risk_level: "low",
+            expected_validation: ["npm test"],
+            estimated_effort: "small",
+            why_now_signal_ids: [],
+            confidence: 0.95,
+            vision_alignment_reason: "Make catalog empty-state labels clear to application users.",
+            vision_section_refs: [String(payload.request.context.vision.sections[0].number)],
+            feature_hypotheses: ["Clear empty-state copy helps application users recover."],
+          };
+          return {
+            text: JSON.stringify({
+              answer: "Inspect the catalog empty-state label.",
+              summary: "A tracked catalog label needs a bounded repair.",
+              data: { candidates: [candidate] },
+              confidence: 0.95,
+              evidence: [
+                { path: target, startLine: 2, endLine: 2, rationale: "Observed catalog label" },
+              ],
+              recommendations: [],
+              validationProposals: [],
+            }),
+          };
+        },
+      };
+      const repositoryAgent = {
+        async ask(input: RepositoryAgentSubmitInput, options?: RepositoryAgentAskOptions) {
+          const request: RepositoryAgentRequest = {
+            ...input,
+            schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+            caller: { ...input.caller, service: "remotebuddy" },
+          };
+          // Reconstruct the worker each cycle: coverage/cache progress must be durable.
+          const worker = new RepositoryAgentWorker({
+            control,
+            memory,
+            llm: repositoryLlm,
+            logger: {
+              log() {},
+              warn: (message) => workerWarnings.push(String(message)),
+              error() {},
+            },
+          });
+          const result = await worker.analyze(
+            `catalog-analysis-${workerResults.length + 1}`,
+            request,
+            options?.signal,
+          );
+          workerResults.push(result);
+          return result;
+        },
+      };
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+        if (url.pathname === "/autonomy/lock/acquire") {
+          const result = store.acquireDispatchLock(body);
+          return jsonResponse(result.ok ? 200 : 409, result);
+        }
+        if (url.pathname === "/autonomy/lock/renew") {
+          const result = store.renewDispatchLock(body);
+          return jsonResponse(result.ok ? 200 : 409, result);
+        }
+        if (url.pathname === "/autonomy/lock/release") {
+          return jsonResponse(200, store.releaseDispatchLock(body));
+        }
+        if (url.pathname === "/autonomy/snapshot") {
+          return jsonResponse(200, {
+            ok: true,
+            snapshot: store.createSnapshot({
+              sessionId: url.searchParams.get("sessionId")!,
+              runId: url.searchParams.get("runId")!,
+              repoHealthFlags: { is_worktree_dirty: false, is_merge_in_progress: false },
+            }),
+          });
+        }
+        if (url.pathname === "/autonomy/eligibility") {
+          return jsonResponse(200, store.evaluateEligibility(body));
+        }
+        if (url.pathname === "/autonomy/objectives") {
+          objectivePosts.push(body);
+          const result = store.recordObjectiveDecision(body);
+          serverDecisions.push(result);
+          return jsonResponse(result.ok ? 200 : 400, result);
+        }
+        if (url.pathname === "/requests/enqueue") {
+          const autonomy = body.metadata.autonomy;
+          const reservation = store.validateObjectiveReservation({
+            objectiveId: autonomy.objectiveId,
+            sessionId: body.sessionId,
+            runId: autonomy.runId,
+            snapshotId: autonomy.snapshotId,
+          });
+          if (!reservation.ok) return jsonResponse(409, reservation);
+          const result = requests.enqueue(body);
+          enqueuedRequestId = result.requestId ?? "";
+          return jsonResponse(result.ok ? 201 : 400, result);
+        }
+        const confirmation = url.pathname.match(/^\/requests\/([^/]+)\/dispatch\/confirm$/);
+        if (confirmation) {
+          const result = requests.confirmDispatch(confirmation[1]!, body.dispatchConfirmationToken);
+          if (result.ok) {
+            const request = requests.getRequest(confirmation[1]!)!;
+            const metadata = JSON.parse(request.metadataJson!);
+            expect(store.markObjectiveDispatched(metadata.autonomy.objectiveId, request.id)).toBe(
+              true,
+            );
+          }
+          return jsonResponse(result.ok ? 200 : 409, result);
+        }
+        throw new Error(`Unexpected composed autonomy request: ${url.pathname}`);
+      }) as typeof globalThis.fetch;
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://composed-autonomy.invalid",
+        sessionId: "catalog-session",
+        repo: root,
+        config: makeConfig(),
+        repositoryAgent: repositoryAgent as any,
+        llm: {
+          async generate(input: LLMGenerateInput) {
+            const payload = JSON.parse(input.messages[0]!.content);
+            if (payload.candidate) {
+              planningCalls += 1;
+              // Preserve engine-rendered evidence all the way through server instruction gates.
+              return { text: JSON.stringify({ instruction: payload.candidate.problem_statement }) };
+            }
+            return {
+              text: JSON.stringify({ scores: [{ id: "catalog-label-repair", llm_score: 0.99 }] }),
+            };
+          },
+        },
+        comm: { async emit() {} } as any,
+      });
+      (engine as any).autonomyRepo = root;
+      (engine as any).ensureAutonomyRepoReady = async () => true;
+      (engine as any).fetchWorkerLoadSnapshot = async () => null;
+      (engine as any).loadCommitHistoryHints = async () => [];
+      (engine as any).ingestAutoInspirationPatterns = async () => undefined;
+      (engine as any).fetchInspirationPatterns = async () => [];
+      (engine as any).fetchInspirationSourceInsights = async () => [];
+      try {
+        for (let page = 0; page <= rejectedPages; page++) {
+          await engine.tick();
+          if (page < rejectedPages) {
+            expect((engine as any).lastDetail).toBe("no_eligible_candidates");
+            expect(workerResults[page]!.data).toEqual({ candidates: [] });
+            expect(requests.countByStatus().pending).toBe(0);
+            expect(planningCalls).toBe(0);
+            const records = await memory.search({
+              scope: { namespace: "repository_agent_cache", repositoryId: repository.identity },
+              kinds: ["repository_autonomy_evidence_coverage"],
+              maxItems: 8,
+              maxChars: 100_000,
+            });
+            expect(records).toHaveLength(1);
+            expect((records[0]!.value as Record<string, unknown>).nextPage).toBe(page + 1);
+          }
+        }
+        expect(modelCalls).toBe(rejectedPages + 1);
+        expect(coveragePages).toEqual(
+          Array.from({ length: rejectedPages + 1 }, (_, index) => index + 1),
+        );
+        expect(workerResults.every((result) => !result.cache.hit)).toBe(true);
+        expect(JSON.stringify(workerResults.at(-1)!.data)).toContain(
+          "WorkerPal workspace unavailable",
+        );
+        expect(planningCalls).toBe(1);
+        expect((engine as any).lastOutcome).toBe("success");
+        expect(serverDecisions.every((result) => result.ok)).toBe(true);
+        const reservation = objectivePosts.find((body) => body.objective);
+        expect(reservation?.objective.instruction).toContain(`${selectedTarget}:2`);
+        expect(reservation?.objective.instruction).toContain(
+          "[existing source literal; see cited location]",
+        );
+        expect(reservation?.objective.instruction).not.toMatch(/workerpal|pushpals|remotebuddy/i);
+        const request = requests.getRequest(enqueuedRequestId);
+        expect(request?.dispatchConfirmedAt).toBeTruthy();
+        expect(request?.prompt).toBe(reservation?.objective.instruction);
+        expect(requests.countByStatus().pending).toBe(1);
+        const objective = (store as any).db
+          .prepare("SELECT status, request_id FROM autonomy_objectives WHERE id = ?")
+          .get(reservation?.objective.id);
+        expect(objective).toMatchObject({ status: "dispatched", request_id: enqueuedRequestId });
+        const persistedCandidates = (store as any).db
+          .prepare("SELECT gate_decision, gate_reasons_json FROM autonomy_candidates")
+          .all();
+        expect(persistedCandidates).toHaveLength(1);
+        expect(persistedCandidates[0].gate_decision).not.toBe("rejected");
+        expect(JSON.parse(persistedCandidates[0].gate_reasons_json)).toEqual([]);
+        expect(
+          workerWarnings.some((warning) =>
+            /invalid_autonomy_candidates|capability circuit/i.test(warning),
+          ),
+        ).toBe(false);
+      } finally {
+        engine.stop();
+        requests.close();
+        store.close();
+        await memory.close();
+      }
+    },
+    30_000,
+  );
 
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {
     originalFetch = globalThis.fetch;

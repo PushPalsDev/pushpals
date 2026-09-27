@@ -37,8 +37,21 @@ import {
   AUTONOMY_CANDIDATES_DATA_SCHEMA,
   autonomyCandidateContractErrors,
 } from "./autonomy_candidate_contract.js";
+import { evaluateAutonomyInternalWork } from "./autonomy_candidate_admission.js";
+import {
+  AUTONOMY_CANDIDATE_POLICY,
+  staticAutonomyCandidateRejection,
+} from "./autonomy_candidate_policy.js";
+// Reuse the exact host-side validator used at dispatch; no duplicate ecosystem
+// heuristics or model-supplied commands may decide whether a cached plan is runnable.
+import { inferRepoValidationIdeas, normalizeTargetValidationIdeas } from "./autonomous_engine.js";
+import {
+  createValidationSnapshotFileSystem,
+  validationManifestReadLimit,
+  ValidationSnapshotUnavailableError,
+} from "./autonomy_validation_filesystem.js";
 
-const PROMPT_VERSION = "repository-agent-v7-bounded-coverage";
+const PROMPT_VERSION = "repository-agent-v8-admission-aware";
 const CACHE_NAMESPACE = "repository_agent_cache";
 const CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 const FACT_NAMESPACE = "repository_facts";
@@ -1218,7 +1231,14 @@ function normalizedDeterministicPolicy(request: RepositoryAgentRequest) {
     maxCandidates: clampInt(policy.maxCandidates, 3, 1, 64),
     candidateEnums: AUTONOMY_CANDIDATE_ENUMS,
     minimumConfidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
+    allowReadAnywhere: policy.allowReadAnywhere !== false,
+    workerExecutionPlatform:
+      policy.workerExecutionPlatform === "windows"
+        ? ("windows" as const)
+        : ("linux_docker" as const),
     allowedObjectiveTypes: list(policy.allowedObjectiveTypes, 16, 128),
+    disabledObjectiveTypes: list(policy.disabledObjectiveTypes, 16, 128),
+    disabledComponents: list(policy.disabledComponents, 256, 1_000),
     requiredCandidateFields: list(policy.requiredCandidateFields, 32, 256),
     notes: list(policy.notes, 8, 1_000),
   };
@@ -2405,6 +2425,205 @@ export class RepositoryAgentWorker {
     return { refs, records: valid };
   }
 
+  private async validationSnapshotFileSystem(
+    repoRoot: string,
+    request: RepositoryAgentRequest,
+    tracked: TrackedRepository,
+    targetPaths: string[],
+    signal: AbortSignal,
+  ) {
+    const stages = await runGit(repoRoot, ["ls-files", "--stage", "-z"], {
+      signal,
+      outputLimitBytes: MAX_TRACKED_PATH_BYTES,
+    });
+    const trackedPaths = new Set(tracked.paths);
+    const entries: Array<{ path: string; text?: string; truncated?: boolean }> = [];
+    for (const row of stages.split("\0")) {
+      const match = /^(100644|100755) [a-f\d]+ 0\t(.+)$/s.exec(row);
+      if (!match) continue;
+      if (!trackedPaths.has(match[2]!)) {
+        throw new RepositoryAgentWorkerError(
+          "validation_snapshot_unavailable",
+          "Validation tracked inventory is incomplete; bounded discovery cannot establish manifest absence",
+          true,
+        );
+      }
+      entries.push({ path: match[2]! });
+    }
+    // Only manifests in target ancestry need content; other regular entries
+    // supply names/markers, never access to untracked files, links or devices.
+    const directories = new Set([""]);
+    for (const target of targetPaths) {
+      const path = normalizeRelativePath(target);
+      if (!path) continue;
+      let directory = trackedPaths.has(path)
+        ? path.slice(0, Math.max(0, path.lastIndexOf("/")))
+        : path;
+      for (;;) {
+        directories.add(directory);
+        if (!directory) break;
+        directory = directory.slice(0, Math.max(0, directory.lastIndexOf("/")));
+      }
+    }
+    let filesRead = 0;
+    let bytesRead = 0;
+    for (const entry of entries) {
+      const directory = entry.path.slice(0, Math.max(0, entry.path.lastIndexOf("/")));
+      const limit = validationManifestReadLimit(entry.path);
+      if (limit == null || !directories.has(directory)) continue;
+      throwIfAborted(signal);
+      if (++filesRead > 32)
+        throw new RepositoryAgentWorkerError(
+          "validation_snapshot_unavailable",
+          "Validation manifests exceed the bounded snapshot budget",
+          true,
+        );
+      const content = await readRepositoryTextPrefix(repoRoot, request, entry.path, limit, signal);
+      if (
+        !content ||
+        content.truncated ||
+        (bytesRead += Buffer.byteLength(content.text, "utf8")) > 2 * 1024 * 1024
+      ) {
+        throw new RepositoryAgentWorkerError(
+          "validation_snapshot_unavailable",
+          `Cannot establish complete bounded validation manifest evidence for ${entry.path}`,
+          true,
+        );
+      }
+      entry.text = content.text;
+      entry.truncated = false;
+    }
+    return createValidationSnapshotFileSystem(repoRoot, entries);
+  }
+
+  private async admitAutonomyCandidates(
+    result: RepositoryAgentResult,
+    request: RepositoryAgentRequest,
+    tracked: TrackedRepository,
+    repoRoot: string,
+    signal: AbortSignal,
+  ): Promise<RepositoryAgentResult> {
+    if (
+      autonomyVisionFingerprint(request) == null ||
+      !isRecord(result.data) ||
+      !Array.isArray(result.data.candidates)
+    )
+      return result;
+    const policy = normalizedDeterministicPolicy(request);
+    const vision = normalizedAutonomyVision(request);
+    const trackedPaths = new Set(tracked.paths);
+    const allowInternalRepository = [
+      "apps/remotebuddy/src/autonomous_engine.ts",
+      "apps/workerpals/src/workerpals_main.ts",
+      "packages/shared/src/autonomy_policy.ts",
+    ].every((path) => trackedPaths.has(path));
+    const rejected: Record<string, number> = {};
+    let candidates = result.data.candidates.filter((raw) => {
+      if (!isRecord(raw)) return false; // The wire contract is checked first.
+      const reason =
+        staticAutonomyCandidateRejection(raw, {
+          trackedPaths: tracked.paths,
+          allowedObjectiveTypes: policy.allowedObjectiveTypes,
+          disabledObjectiveTypes: policy.disabledObjectiveTypes,
+          disabledComponents: policy.disabledComponents,
+          allowReadAnywhere: policy.allowReadAnywhere,
+          minimumConfidence: policy.minimumConfidence,
+          visionSectionNumbers: new Set(vision.sections.map((section) => section.number)),
+        }) ??
+        evaluateAutonomyInternalWork(raw, {
+          allowInternalRepository,
+          currentRepository: request.repository,
+          evidenceRepository: result.analyzedRepository,
+          evidence: result.evidence,
+          verifiedTargetPaths: result.evidence.flatMap((entry) =>
+            entry.blobHash ? [{ path: entry.path, blobHash: entry.blobHash }] : [],
+          ),
+        }).reason;
+      if (!reason) return true;
+      rejected[reason] = (rejected[reason] ?? 0) + 1;
+      return false;
+    });
+    const needsValidation = (raw: unknown) =>
+      isRecord(raw) &&
+      AUTONOMY_CANDIDATE_POLICY[raw.objective_type as keyof typeof AUTONOMY_CANDIDATE_POLICY]
+        .requireValidation;
+    if (candidates.some(needsValidation)) {
+      const fileSystem = await this.validationSnapshotFileSystem(
+        repoRoot,
+        request,
+        tracked,
+        candidates
+          .filter(needsValidation)
+          .flatMap((raw) => (raw as Record<string, unknown>).target_paths as string[]),
+        signal,
+      ).catch((error) => {
+        throwIfAborted(signal);
+        throw new RepositoryAgentWorkerError(
+          "validation_snapshot_unavailable",
+          `Bounded validation snapshot unavailable: ${compactText(error, 1_000)}`,
+          true,
+        );
+      });
+      throwIfAborted(signal);
+      candidates = candidates.filter((raw) => {
+        if (!needsValidation(raw) || !isRecord(raw)) return true;
+        let nativeValidation: string[];
+        try {
+          nativeValidation = inferRepoValidationIdeas(
+            repoRoot,
+            raw.target_paths as string[],
+            policy.workerExecutionPlatform,
+            false,
+            fileSystem,
+          );
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError)
+            throw new RepositoryAgentWorkerError(
+              "validation_snapshot_unavailable",
+              "Complete validation snapshot evidence is unavailable",
+              true,
+            );
+          throw error;
+        }
+        if (
+          normalizeTargetValidationIdeas(raw.expected_validation as string[], nativeValidation)
+            .length > 0
+        )
+          return true;
+        rejected.missing_validation_steps = (rejected.missing_validation_steps ?? 0) + 1;
+        return false;
+      });
+    }
+    if (candidates.length === result.data.candidates.length) return result;
+    this.logger.warn(
+      `[RepositoryAgent] autonomyCandidateAdmission=${JSON.stringify({
+        requestId: result.requestId,
+        cacheHit: result.cache.hit,
+        proposed: result.data.candidates.length,
+        admitted: candidates.length,
+        rejected,
+        outcome:
+          candidates.length === 0
+            ? "no_structurally_admissible_candidates"
+            : "retain_admitted_candidates",
+      })}`,
+    );
+    // Persist the effective result, not an unusable positive that downstream
+    // admission will reject every cycle. Verified empty results advance the
+    // existing bounded, CAS-fenced cursor; transient eligibility is untouched.
+    return {
+      ...result,
+      data: { ...result.data, candidates },
+      ...(candidates.length === 0
+        ? {
+            answer:
+              "No structurally admissible candidates on this evidence page; continue bounded repository discovery.",
+            summary: `Candidate admission rejected ${result.data.candidates.length} proposal(s): ${Object.keys(rejected).join(", ")}. This does not establish repository-wide exhaustion.`,
+          }
+        : {}),
+    };
+  }
+
   private async cachedResult(
     requestId: string,
     request: RepositoryAgentRequest,
@@ -2464,25 +2683,31 @@ export class RepositoryAgentWorker {
           false,
         );
       }
-      const result = sanitizeRepositoryAgentResult(
-        {
-          ...cached,
+      const result = await this.admitAutonomyCandidates(
+        sanitizeRepositoryAgentResult(
+          {
+            ...cached,
+            requestId,
+            analyzedRepository: {
+              identity: request.repository.identity,
+              revision: request.repository.revision,
+              tree: request.repository.tree,
+            },
+            evidence,
+            cache: {
+              hit: true,
+              key,
+              storedAt: record.createdAt,
+              ...(record.expiresAt ? { expiresAt: record.expiresAt } : {}),
+            },
+            completedAt: new Date().toISOString(),
+          },
           requestId,
-          analyzedRepository: {
-            identity: request.repository.identity,
-            revision: request.repository.revision,
-            tree: request.repository.tree,
-          },
-          evidence,
-          cache: {
-            hit: true,
-            key,
-            storedAt: record.createdAt,
-            ...(record.expiresAt ? { expiresAt: record.expiresAt } : {}),
-          },
-          completedAt: new Date().toISOString(),
-        },
-        requestId,
+        ),
+        request,
+        tracked,
+        repoRoot,
+        signal,
       );
       result.memoryRefs = mergeMemoryRefs(structuralAutonomy ? [] : result.memoryRefs, [
         memoryRefForRecord(record, "analysis_cache"),
@@ -2518,6 +2743,11 @@ export class RepositoryAgentWorker {
       return result;
     } catch (error) {
       throwIfAborted(signal);
+      if (
+        error instanceof RepositoryAgentWorkerError &&
+        error.code === "validation_snapshot_unavailable"
+      )
+        throw error;
       try {
         await this.memoryWithinDeadline(
           "stale exact cache invalidation",
@@ -3034,33 +3264,44 @@ export class RepositoryAgentWorker {
       const confidence = Math.max(0, Math.min(1, Number(raw.confidence) || 0));
       await this.recordCapabilitySuccess(request, circuit, signal, deadlineMs);
       return {
-        result: sanitizeRepositoryAgentResult(
-          {
-            schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
-            requestId,
-            analyzedRepository: {
-              identity: request.repository.identity,
-              revision: request.repository.revision,
-              tree: request.repository.tree,
+        result: await this.admitAutonomyCandidates(
+          sanitizeRepositoryAgentResult(
+            {
+              schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+              requestId,
+              analyzedRepository: {
+                identity: request.repository.identity,
+                revision: request.repository.revision,
+                tree: request.repository.tree,
+              },
+              answer: raw.answer,
+              summary: raw.summary,
+              ...(raw.data === undefined ? {} : { data: raw.data as RepositoryAgentJsonValue }),
+              confidence: evidence.length === 0 ? Math.min(confidence, 0.25) : confidence,
+              evidence,
+              recommendations: normalizedRecommendations(raw.recommendations, tracked),
+              validationProposals: normalizedValidationProposals(repoRoot, raw.validationProposals),
+              cache: { hit: false, key: null },
+              memoryRefs: advisoryMemory.refs,
+              completedAt: new Date().toISOString(),
             },
-            answer: raw.answer,
-            summary: raw.summary,
-            ...(raw.data === undefined ? {} : { data: raw.data as RepositoryAgentJsonValue }),
-            confidence: evidence.length === 0 ? Math.min(confidence, 0.25) : confidence,
-            evidence,
-            recommendations: normalizedRecommendations(raw.recommendations, tracked),
-            validationProposals: normalizedValidationProposals(repoRoot, raw.validationProposals),
-            cache: { hit: false, key: null },
-            memoryRefs: advisoryMemory.refs,
-            completedAt: new Date().toISOString(),
-          },
-          requestId,
+            requestId,
+          ),
+          request,
+          tracked,
+          repoRoot,
+          signal,
         ),
         inferenceModelId: attributedModelId(generated, this.modelId),
         cacheable: true,
       };
     } catch (error) {
       throwIfAborted(signal);
+      if (
+        error instanceof RepositoryAgentWorkerError &&
+        error.code === "validation_snapshot_unavailable"
+      )
+        throw error;
       await this.recordCapabilityFailure(request, error, circuit, signal, deadlineMs);
       if (
         error instanceof RepositoryAgentWorkerError &&

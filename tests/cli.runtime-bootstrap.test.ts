@@ -33,6 +33,7 @@ import {
   createEmbeddedRuntimeHealthChangeReporter,
   cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
+  completeCliStateClear,
   describeWorkerExecutionReadiness,
   buildEmbeddedRuntimeEnv,
   buildEmbeddedRuntimeServiceEnv,
@@ -49,6 +50,7 @@ import {
   formatEmbeddedServiceLaunchDelayWarning,
   formatRuntimeStartupTimingSummary,
   formatWorkerExecutionReadinessLines,
+  formatWorkerpalWarmCleanupNotice,
   formatTimestampedCliLine,
   formatSessionEventLine,
   hasRemoteBuddyRuntimeOutput,
@@ -3503,6 +3505,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
+      outcome: "absent",
       detail: "no lingering WorkerPal warm containers found",
       removed: 0,
     });
@@ -3522,7 +3525,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
-  test("cleanupLingeringWorkerpalWarmContainers treats unavailable Docker as a no-op", async () => {
+  test("cleanupLingeringWorkerpalWarmContainers reports unavailable Docker as skipped, not absent", async () => {
     const result = await cleanupLingeringWorkerpalWarmContainers({
       repoRoot: "/repo/example",
       env: {
@@ -3537,12 +3540,13 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       }),
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("skipped");
     expect(result.removed).toBe(0);
     expect(result.detail).toContain("docker unavailable; skipped WorkerPal warm-container cleanup");
   });
 
-  test("cleanupLingeringWorkerpalWarmContainers treats Docker inspect timeouts as a no-op", async () => {
+  test("cleanupLingeringWorkerpalWarmContainers reports inspect timeout as unconfirmed", async () => {
     const result = await cleanupLingeringWorkerpalWarmContainers({
       repoRoot: "/repo/example",
       env: {
@@ -3556,14 +3560,15 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       }),
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("timed_out");
     expect(result.removed).toBe(0);
     expect(result.detail).toContain(
       "docker cleanup timed out; skipped WorkerPal warm-container cleanup",
     );
   });
 
-  test("cleanupLingeringWorkerpalWarmContainers treats Docker remove timeouts as a no-op", async () => {
+  test("cleanupLingeringWorkerpalWarmContainers reports remove timeout as unconfirmed", async () => {
     let phase = 0;
     const result = await cleanupLingeringWorkerpalWarmContainers({
       repoRoot: "/repo/example",
@@ -3584,7 +3589,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("timed_out");
     expect(result.removed).toBe(0);
     expect(result.detail).toContain(
       "docker cleanup timed out; skipped WorkerPal warm-container cleanup",
@@ -3611,6 +3617,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
+      outcome: "removed",
       detail: "removed 2 lingering WorkerPal warm container(s)",
       removed: 2,
     });
@@ -3650,6 +3657,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
+      outcome: "absent",
       detail: "no local WorkerPal sandbox image configured",
       removed: false,
       imageName: "",
@@ -3678,6 +3686,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
+      outcome: "absent",
       detail: "no local WorkerPal sandbox image found for pushpals-worker-sandbox:latest",
       removed: false,
       imageName: "pushpals-worker-sandbox:latest",
@@ -3690,7 +3699,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
-  test("cleanupLocalWorkerpalSandboxImage treats unavailable Docker as a no-op", async () => {
+  test("cleanupLocalWorkerpalSandboxImage reports unavailable Docker as skipped, not absent", async () => {
     const result = await cleanupLocalWorkerpalSandboxImage({
       repoRoot: "/repo/example",
       env: {
@@ -3705,12 +3714,13 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       }),
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("skipped");
     expect(result.removed).toBe(false);
     expect(result.detail).toContain("docker unavailable; skipped WorkerPal sandbox image cleanup");
   });
 
-  test("cleanupLocalWorkerpalSandboxImage treats Docker timeouts as a no-op", async () => {
+  test("cleanupLocalWorkerpalSandboxImage reports timeout as unconfirmed", async () => {
     const result = await cleanupLocalWorkerpalSandboxImage({
       repoRoot: "/repo/example",
       env: {
@@ -3725,7 +3735,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       }),
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("timed_out");
     expect(result.removed).toBe(false);
     expect(result.detail).toContain(
       "docker cleanup timed out; skipped WorkerPal sandbox image cleanup",
@@ -3751,7 +3762,45 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toBe(true);
     expect(isDockerUnavailableDetail('Executable not found in $PATH: "docker"')).toBe(true);
     expect(isDockerUnavailableDetail("spawn docker ENOENT")).toBe(true);
+    expect(
+      isDockerUnavailableDetail(
+        "ENOENT: no such file or directory, posix_spawn '/tmp/missing/docker'",
+      ),
+    ).toBe(true);
+    expect(isDockerUnavailableDetail("spawn C:\\missing\\docker.exe ENOENT")).toBe(true);
     expect(isDockerUnavailableDetail("Error response from daemon: No such image")).toBe(false);
+  });
+
+  test("an image-absence stderr cannot turn a timed-out cleanup into confirmed success", async () => {
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {},
+      dockerImage: "example:latest",
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        exitCode: 124,
+        stdout: "",
+        stderr:
+          "timed out after 15000ms | Error response from daemon: No such image: example:latest",
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, outcome: "timed_out", removed: false });
+  });
+
+  test("missing Docker executable is unconfirmed image cleanup, not an absent image", async () => {
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {},
+      dockerImage: "example:latest",
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr: 'Executable not found in $PATH: "docker"',
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, outcome: "skipped", removed: false });
+    expect(result.detail).toContain("docker unavailable");
   });
 
   test("cleanupLocalWorkerpalSandboxImage removes the configured sandbox image", async () => {
@@ -3775,6 +3824,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
+      outcome: "removed",
       detail: "removed local WorkerPal sandbox image pushpals-worker-sandbox:latest",
       removed: true,
       imageName: "pushpals-worker-sandbox:latest",
@@ -3784,6 +3834,172 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         command: ["docker", "image", "rm", "-f", "pushpals-worker-sandbox:latest"],
         cwd: "/repo/example",
       },
+    ]);
+  });
+
+  test("Docker cleanup retains bounded default and configured command deadlines", async () => {
+    const warmDeadlines: Array<number | undefined> = [];
+    const imageDeadlines: Array<number | undefined> = [];
+    for (const commandTimeoutMs of [undefined, 321]) {
+      let calls = 0;
+      await cleanupLingeringWorkerpalWarmContainers({
+        repoRoot: "/repo/example",
+        env: {},
+        commandTimeoutMs,
+        runCommandWithEnvFn: async (_command, _cwd, _env, timeoutMs) => {
+          warmDeadlines.push(timeoutMs);
+          calls += 1;
+          return { ok: true, stdout: calls === 1 ? "abc123\n" : "", stderr: "", exitCode: 0 };
+        },
+      });
+      await cleanupLocalWorkerpalSandboxImage({
+        repoRoot: "/repo/example",
+        env: {},
+        dockerImage: "fixture:latest",
+        commandTimeoutMs,
+        runCommandWithEnvFn: async (_command, _cwd, _env, timeoutMs) => {
+          imageDeadlines.push(timeoutMs);
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        },
+      });
+    }
+    expect(warmDeadlines).toEqual([5_000, 5_000, 321, 321]);
+    expect(imageDeadlines).toEqual([15_000, 321]);
+  });
+
+  test.each(["inspect", "remove"] as const)(
+    "warm-container cleanup preserves genuine %s failures and startup only warns",
+    async (failurePhase) => {
+      let calls = 0;
+      const result = await cleanupLingeringWorkerpalWarmContainers({
+        repoRoot: "/repo/example",
+        env: {},
+        runCommandWithEnvFn: async () => {
+          calls += 1;
+          return calls === 1 && failurePhase === "remove"
+            ? { ok: true, stdout: "abc123\n", stderr: "", exitCode: 0 }
+            : { ok: false, stdout: "", stderr: "permission denied", exitCode: 1 };
+        },
+      });
+      expect(result).toMatchObject({ ok: false, outcome: "failed", removed: 0 });
+      const notice = formatWorkerpalWarmCleanupNotice(result, "startup preflight");
+      expect(notice?.level).toBe("warn");
+      expect(notice?.line).toContain("permission denied");
+    },
+  );
+
+  test("sandbox image cleanup preserves genuine failures", async () => {
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {},
+      dockerImage: "fixture:latest",
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        stdout: "",
+        stderr: "permission denied",
+        exitCode: 1,
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, outcome: "failed", removed: false });
+    expect(result.detail).toContain("permission denied");
+  });
+
+  test.each([
+    { detail: "timed out after 5000ms", outcome: "timed_out" },
+    { detail: "Cannot connect to the Docker daemon", outcome: "skipped" },
+  ] as const)(
+    "unconfirmed Docker cleanup warns at startup and exits clear incomplete after local deletion ($outcome)",
+    async ({ detail, outcome }) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-clear-unconfirmed-docker-"));
+      const dataDir = join(root, "data");
+      mkdirSync(dataDir);
+      writeFileSync(join(dataDir, "state.json"), "{}", "utf8");
+      try {
+        const result = await cleanupLingeringWorkerpalWarmContainers({
+          repoRoot: root,
+          env: {},
+          runCommandWithEnvFn: async () => ({
+            ok: false,
+            stdout: "",
+            stderr: detail,
+            exitCode: null,
+          }),
+        });
+        expect(result).toMatchObject({ ok: false, outcome, removed: 0 });
+        const notice = formatWorkerpalWarmCleanupNotice(result, "startup preflight");
+        expect(notice?.level).toBe("warn");
+        expect(notice?.line).toContain(`startup preflight, ${outcome}`);
+        expect(notice?.line).not.toContain("Nothing to clear");
+
+        const lines: Array<{ level: string; line: string }> = [];
+        const exitCode = await completeCliStateClear(
+          [{ label: "runtime data", path: dataDir }],
+          [
+            {
+              label: "WorkerPal warm containers",
+              path: root,
+              detail: result.detail,
+              unconfirmed: true,
+            },
+          ],
+          (level, line) => lines.push({ level, line }),
+        );
+        expect(existsSync(dataDir)).toBe(false);
+        expect(exitCode).toBe(1);
+        expect(lines.some(({ line }) => line.includes("Cleared runtime data:"))).toBe(true);
+        expect(
+          lines.some(
+            ({ level, line }) =>
+              level === "warn" &&
+              line.includes("Cleanup unconfirmed for WorkerPal warm containers"),
+          ),
+        ).toBe(true);
+        expect(lines.at(-1)).toEqual({
+          level: "error",
+          line: "[pushpals] Clear incomplete: requested Docker cleanup could not be confirmed.",
+        });
+        expect(lines.some(({ line }) => line.includes("Nothing to clear for WorkerPal"))).toBe(
+          false,
+        );
+        expect(lines.some(({ line }) => line === "[pushpals] Clear completed.")).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("confirmed Docker cleanup preserves quiet absent startup and normal clear success", async () => {
+    expect(
+      formatWorkerpalWarmCleanupNotice(
+        { ok: true, outcome: "absent", detail: "no lingering containers", removed: 0 },
+        "startup preflight",
+      ),
+    ).toBeNull();
+    expect(
+      formatWorkerpalWarmCleanupNotice(
+        { ok: true, outcome: "removed", detail: "removed 2 containers", removed: 2 },
+        "startup preflight",
+      ),
+    ).toEqual({ level: "log", line: "[pushpals] removed 2 containers (startup preflight)." });
+    const lines: string[] = [];
+    expect(await completeCliStateClear([], [], (_level, line) => lines.push(line))).toBe(0);
+    expect(lines).toEqual(["[pushpals] Clear completed."]);
+  });
+
+  test("clear preserves failure reporting for ordinary local-state errors", async () => {
+    const lines: Array<{ level: string; line: string }> = [];
+    const exitCode = await completeCliStateClear(
+      [],
+      [{ label: "runtime data", path: "/fixture/data", detail: "permission denied" }],
+      (level, line) => lines.push({ level, line }),
+    );
+    expect(exitCode).toBe(1);
+    expect(lines).toEqual([
+      {
+        level: "error",
+        line: "[pushpals] Failed to clear runtime data: /fixture/data (permission denied)",
+      },
+      { level: "error", line: "[pushpals] Clear completed with errors." },
     ]);
   });
 

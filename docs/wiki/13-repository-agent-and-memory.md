@@ -212,6 +212,61 @@ The compare-and-set `expectedRevision` option prevents lost updates. A staged wr
 
 RepositoryAgent cache keys include schema version, repository identity, content tree, purpose, assigned model, and prompt version. Ordinary questions additionally include their exact revision and question/context so an empty commit or changed history cannot reuse a history-sensitive answer. RemoteBuddy autonomy-priority requests instead use the `vision.md` fingerprint, normalized deterministic candidate policy, and stable operation/question protocol, deliberately excluding revision-specific Git history, recalled observations, volatile runtime snapshots, open-objective lists, and signal ordering. A same-tree autonomy hit revalidates each cited blob and rebinds it to the current revision before use; downstream deterministic eligibility still filters a reused candidate against current objectives and cooldowns. Only clean snapshots with a cache-permitting freshness policy are eligible. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
 
+The current source uses prompt/cache version `repository-agent-v8-admission-aware`.
+This separates admission-aware analysis and coverage records from earlier cache
+entries; it does not rewrite or clear a running installation's memory. The worker
+applies snapshot-stable candidate admission after evidence verification and before
+caching fresh autonomy results, and reapplies it to validated cache hits. A raw
+nonempty answer is therefore not automatically a reusable positive answer.
+
+Static admission checks objective policy, risk, scope, configured confidence floor, tracked targets, vision
+references, inferable validation, and the boundary between user-repository work
+and PushPals orchestration. Rejected candidates are removed from the effective
+result. If none remain, a grounded result follows the existing bounded empty-page
+advancement path rather than pinning discovery on a positive answer that dispatch
+will always reject. An `autonomyCandidateAdmission` log records proposed/admitted
+counts and rejection reasons. Reading an autonomy cache entry is not evidence of
+successful work and does not reinforce its usefulness; authoritative downstream
+outcomes remain the source of that feedback.
+
+Validation inference uses the same rules as dispatch against an immutable,
+bounded view of tracked regular files and Git-verified manifest contents. It does
+not follow symlinks or read ignored/untracked host manifests. Incomplete manifest
+inspection is a retryable error, not evidence that validation is unavailable;
+it cannot advance coverage or cache a false negative.
+
+Current capacity, open work, cooldowns, ranking scores, and other transient
+eligibility checks remain downstream. They must not turn a temporarily ineligible
+proposal into permanently cached structural absence. Implementation:
+[`repository_agent.ts`](../../apps/remotebuddy/src/repository_agent.ts),
+[`autonomy_candidate_policy.ts`](../../apps/remotebuddy/src/autonomy_candidate_policy.ts),
+and [`autonomous_engine.ts`](../../apps/remotebuddy/src/autonomous_engine.ts).
+
+### Source-verified naming repairs
+
+An internal orchestration name quoted from an existing user-repository literal
+can be evidence of a naming defect rather than a request to implement PushPals
+internals. This is a narrow, host-verified exception, not a word-filter bypass:
+
+- The proposal must describe a naming/text repair and attribute the quoted
+  observation to an exact target source path.
+- Repository identity, revision, tree, target blob, and evidence coordinates
+  must agree. The literal must occur in the host-verified cited excerpt; a model
+  ownership hint or quotation alone is insufficient.
+- Other public candidate fields still pass the internal-work guard. Genuine
+  orchestration proposals and instructions to introduce internal terminology
+  remain rejected.
+- RepositoryAgent retains the original quotation and evidence. Before dispatch,
+  the engine renders only the admitted observation quotation as an existing
+  source-literal reference, retaining its source location. Server and planner
+  guards therefore remain enabled without a blanket internal-word exemption.
+
+The shared decision lives in
+[`autonomy_candidate_admission.ts`](../../apps/remotebuddy/src/autonomy_candidate_admission.ts)
+and is used by both the worker and engine. It is generic across repositories:
+there are no external-product path or candidate-name exceptions, and analysis
+does not edit the user's repository.
+
 ### Bounded autonomous evidence coverage
 
 Clean autonomy-priority analysis uses a bounded, persistent discovery cursor in
@@ -229,8 +284,10 @@ validated, evidence-backed empty result advances the cursor once using
 compare-and-set, bounded memory I/O, and the existing deadline commit fence.
 Concurrent completions cannot skip a page. Cache-only calls, dirty worktrees,
 cancellation, provider failures, and evidence-only fallback do not advance it.
-Positive answers remain reusable; an empty cache hit can recover a previously
-failed cursor write. Cursor expiry or changed keyed context starts a new sweep.
+Structurally admissible positive answers remain reusable; an effective empty
+cache hit, including one whose proposals fail static admission, can recover a
+previously failed cursor write. Cursor expiry or changed keyed context starts a
+new sweep.
 
 The `evidenceCoverage` log records request identity, page/count/limit, cache use,
 and advancement. Reaching the discovery cap reports bounded coverage exhaustion
@@ -279,6 +336,11 @@ When a RepositoryAgent call appears stuck or wrong:
 5. Inspect result evidence, blob hashes, cache hit/key, and memory references.
 6. Check whether the caller timed out while the durable request later completed.
 7. Confirm the consumer still ran its deterministic gates.
+8. If analyses complete but no jobs appear, compare raw and admitted candidate
+   counts, `autonomyCandidateAdmission` reasons, downstream drop reasons, and
+   `evidenceCoverage` page/cache/advancement fields. Repeated positive cache hits
+   with zero admitted candidates are not useful progress or evidence of
+   repository-wide exhaustion.
 
 For memory issues:
 
@@ -298,7 +360,9 @@ For memory issues:
 - `tests/memory-store-conformance.test.ts` - one behavioral contract run against in-memory and SQLite implementations.
 - `tests/shared.memory.test.ts` and `tests/server.memory-store.test.ts` - scope, evidence, expiry, compare-and-set, reinforcement observations, and restart persistence.
 - `tests/remotebuddy.llm-repository-context.test.ts` - neutral Codex workspace and disabled instruction/tool surfaces.
-- `tests/remotebuddy.repository-agent.test.ts` - deterministic retrieval, structural caching, persistent circuit/half-open recovery, partial evidence memory, dirty-snapshot policy, deadlines, and shutdown.
+- `tests/remotebuddy.repository-agent.test.ts` - deterministic retrieval, structural caching, fresh/cached static admission, bounded progression after rejected proposals, persistent circuit/half-open recovery, partial evidence memory, dirty-snapshot policy, deadlines, and shutdown.
+- `tests/remotebuddy.autonomy-candidate-admission.test.ts` - source-verified naming repairs, provenance/range checks, safe rendering, and rejection of genuine internal-work proposals.
+- `tests/remotebuddy.autonomous-engine.tick.test.ts` - downstream eligibility and composed worker-to-engine-to-Server admission without product-specific fixtures.
 
 ## Tradeoffs
 

@@ -35,6 +35,8 @@ const phases: HarnessPhase[] = [
       "tests/server.memory-repository-agent-routes.test.ts",
       "tests/remotebuddy.repository-agent.test.ts",
       "tests/remotebuddy.repository-evidence.test.ts",
+      "tests/remotebuddy.autonomy-candidate-admission.test.ts",
+      "tests/remotebuddy.autonomy-validation-filesystem.test.ts",
       "tests/remotebuddy.llm-repository-context.test.ts",
       "tests/remotebuddy.autonomous-engine.tick.test.ts",
       "tests/remotebuddy.autonomous-engine-ideas.test.ts",

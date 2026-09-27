@@ -13,6 +13,7 @@ import { join } from "path";
 import {
   assertCliVersionCommand,
   expectedCliVersionFromReleaseInput,
+  installedSmokeWorkerEnv,
   runtimeCandidateBinaryNames,
   seedCandidateRuntimeBinaries,
 } from "../scripts/release-installed-cli-smoke.ts";
@@ -53,6 +54,30 @@ function isEffectivelyAlive(pid: number): boolean {
 }
 
 describe("published Windows CLI runtime soak contract", () => {
+  test("no-worker smokes explicitly disable Docker cleanup, including inherited platform overrides", () => {
+    const env = {
+      REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "true",
+      WORKERPALS_EXECUTION_PLATFORM: "linux_docker",
+      PUSHPALS_WORKERPALS_EXECUTION_PLATFORM: "linux_docker",
+      REMOTEBUDDY_WORKERPAL_DOCKER: "true",
+      REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER: "true",
+      WORKERPALS_REQUIRE_DOCKER: "true",
+      ...installedSmokeWorkerEnv(false),
+    };
+    expect(env).toEqual({
+      REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false",
+      WORKERPALS_EXECUTION_PLATFORM: "auto",
+      PUSHPALS_WORKERPALS_EXECUTION_PLATFORM: "auto",
+      REMOTEBUDDY_WORKERPAL_DOCKER: "false",
+      REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER: "false",
+      WORKERPALS_REQUIRE_DOCKER: "false",
+    });
+  });
+
+  test("worker-enabled smokes retain their configured Docker and spawning requirements", () => {
+    expect(installedSmokeWorkerEnv(true)).toEqual({});
+  });
+
   test("derives and verifies the exact installed CLI release version", () => {
     expect(expectedCliVersionFromReleaseInput("@pushpalsdev/cli@1.2.42", null)).toBe("1.2.42");
     expect(

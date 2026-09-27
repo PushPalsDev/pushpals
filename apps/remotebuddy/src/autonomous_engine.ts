@@ -34,6 +34,19 @@ import type { PushPalsConfig } from "shared";
 import type { LLMClient } from "./llm.js";
 import { AUTONOMY_CANDIDATE_ENUMS } from "./autonomy_candidate_contract.js";
 import {
+  AUTONOMY_CANDIDATE_POLICY as POLICY,
+  AUTONOMY_RISK_ORDER as RISK_ORDER,
+} from "./autonomy_candidate_policy.js";
+import {
+  containsPushPalsInternalUserRepoText,
+  evaluateAutonomyInternalWork,
+} from "./autonomy_candidate_admission.js";
+import {
+  ValidationSnapshotUnavailableError,
+  type RepoValidationFileSystem,
+} from "./autonomy_validation_filesystem.js";
+export { containsPushPalsInternalUserRepoText } from "./autonomy_candidate_admission.js";
+import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
@@ -267,71 +280,6 @@ type IdeationTimeoutRecovery = {
   timeoutMs: number;
 };
 
-type PolicyRule = {
-  maxRisk: "low" | "medium" | "high";
-  maxBreadth: "narrow" | "medium" | "broad";
-  autonomousAllowed: boolean;
-  requireValidation: boolean;
-};
-
-const POLICY: Record<AutonomyObjectiveType, PolicyRule> = {
-  flaky_test: {
-    maxRisk: "low",
-    maxBreadth: "narrow",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  lint_fix: {
-    maxRisk: "low",
-    maxBreadth: "narrow",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  type_fix: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  small_refactor: {
-    maxRisk: "medium",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  feature_small: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  feature_medium: {
-    maxRisk: "medium",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: true,
-  },
-  feature_large: {
-    maxRisk: "high",
-    maxBreadth: "broad",
-    autonomousAllowed: false,
-    requireValidation: true,
-  },
-  docs: {
-    maxRisk: "low",
-    maxBreadth: "medium",
-    autonomousAllowed: true,
-    requireValidation: false,
-  },
-  dep_bump: {
-    maxRisk: "medium",
-    maxBreadth: "narrow",
-    autonomousAllowed: false,
-    requireValidation: true,
-  },
-};
-
-const RISK_ORDER: Record<"low" | "medium" | "high", number> = { low: 0, medium: 1, high: 2 };
 const IDEATION_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_ideation_system_prompt.md",
 ).trim();
@@ -1830,54 +1778,6 @@ function isPushPalsRepository(repoRoot: string): boolean {
     existsSync(resolve(repoRoot, "apps", "workerpals", "src", "workerpals_main.ts")) &&
     existsSync(resolve(repoRoot, "packages", "shared", "src", "autonomy_policy.ts"))
   );
-}
-
-function isPushPalsInternalUserRepoPath(path: string): boolean {
-  const normalized = asString(path).replace(/\\/g, "/").toLowerCase();
-  if (!normalized) return false;
-  return /(^|\/)(?:pushpals|workerpals?|remotebuddy)(?:\/|$)/.test(normalized);
-}
-
-const PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS = [
-  /\b(workerpal|workerpals|remotebuddy|pushpals)\b/i,
-  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
-  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
-  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
-  /\bautonomy[-_\s]?internal\b/i,
-];
-
-export function containsPushPalsInternalUserRepoText(text: string): boolean {
-  return PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function candidateLeaksPushPalsInternals(
-  candidate: Pick<
-    AutonomyCandidate,
-    | "title"
-    | "problem_statement"
-    | "vision_alignment_reason"
-    | "feature_hypotheses"
-    | "target_paths"
-    | "component_area"
-  >,
-): boolean {
-  // A repository may legitimately own similarly named product code. Existing
-  // tracked paths are repo evidence, not an internal leak signal by themselves.
-  if (
-    [candidate.component_area, ...candidate.target_paths].some((path) =>
-      isPushPalsInternalUserRepoPath(path),
-    )
-  ) {
-    return false;
-  }
-  const publicText = [
-    candidate.title,
-    candidate.problem_statement,
-    candidate.vision_alignment_reason,
-    ...candidate.feature_hypotheses,
-    ...candidate.target_paths,
-  ].join("\n");
-  return containsPushPalsInternalUserRepoText(publicText);
 }
 
 function buildRepoNativeFallbackInstruction(candidate: AutonomyCandidate): string {
@@ -3611,7 +3511,38 @@ function shellPathArgument(value: string): string {
   return optionSafeValue.includes(" ") ? `"${optionSafeValue}"` : optionSafeValue;
 }
 
-function validationSearchDirectories(repoRoot: string, targetPaths: string[]): string[] {
+const DEFAULT_VALIDATION_FILE_SYSTEM: RepoValidationFileSystem = {
+  exists: existsSync,
+  isDirectory: (path) => statSync(path).isDirectory(),
+  fileNames: (directory) =>
+    readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name),
+  readText: readUtf8PrefixSync,
+};
+
+function readValidationJsonObject(
+  path: string,
+  fileSystem: RepoValidationFileSystem,
+): Record<string, unknown> | null {
+  try {
+    const bounded = fileSystem.readText(path, MAX_REPO_MANIFEST_BYTES);
+    if (bounded.truncated) return null;
+    const parsed: unknown = JSON.parse(bounded.text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError) throw error;
+    return null;
+  }
+}
+
+function validationSearchDirectories(
+  repoRoot: string,
+  targetPaths: string[],
+  fileSystem: RepoValidationFileSystem,
+): string[] {
   const directories: string[] = [];
   const seen = new Set<string>();
   const add = (directory: string): void => {
@@ -3624,8 +3555,9 @@ function validationSearchDirectories(repoRoot: string, targetPaths: string[]): s
     if (!normalized) continue;
     let directory = pathDirname(normalized);
     try {
-      if (statSync(resolve(repoRoot, normalized)).isDirectory()) directory = normalized;
-    } catch {
+      if (fileSystem.isDirectory(resolve(repoRoot, normalized))) directory = normalized;
+    } catch (error) {
+      if (error instanceof ValidationSnapshotUnavailableError) throw error;
       // Candidate paths are hints; walk their lexical parents when not yet present.
     }
     while (directory) {
@@ -3641,9 +3573,10 @@ function inferPackageValidationCommand(
   packageJsonPath: string,
   packageDirectory: string,
   repoRoot: string,
+  fileSystem: RepoValidationFileSystem,
 ): string | null {
   try {
-    const packageJson = readBoundedJsonObject(packageJsonPath) as {
+    const packageJson = readValidationJsonObject(packageJsonPath, fileSystem) as {
       packageManager?: unknown;
       scripts?: Record<string, unknown>;
     } | null;
@@ -3651,7 +3584,7 @@ function inferPackageValidationCommand(
     const scripts = packageJson.scripts ?? {};
     type PackageManager = "bun" | "pnpm" | "yarn" | "npm";
     const readDeclaredManager = (directory: string): PackageManager | null => {
-      const manifest = readBoundedJsonObject(resolve(directory, "package.json"));
+      const manifest = readValidationJsonObject(resolve(directory, "package.json"), fileSystem);
       const declared = asString(manifest?.packageManager).split("@")[0]?.toLowerCase();
       return ["bun", "pnpm", "yarn", "npm"].includes(declared)
         ? (declared as PackageManager)
@@ -3659,13 +3592,14 @@ function inferPackageValidationCommand(
     };
     const managerFromDirectory = (directory: string): PackageManager | null =>
       readDeclaredManager(directory) ??
-      (existsSync(resolve(directory, "bun.lock")) || existsSync(resolve(directory, "bun.lockb"))
+      (fileSystem.exists(resolve(directory, "bun.lock")) ||
+      fileSystem.exists(resolve(directory, "bun.lockb"))
         ? "bun"
-        : existsSync(resolve(directory, "pnpm-lock.yaml"))
+        : fileSystem.exists(resolve(directory, "pnpm-lock.yaml"))
           ? "pnpm"
-          : existsSync(resolve(directory, "yarn.lock"))
+          : fileSystem.exists(resolve(directory, "yarn.lock"))
             ? "yarn"
-            : existsSync(resolve(directory, "package-lock.json"))
+            : fileSystem.exists(resolve(directory, "package-lock.json"))
               ? "npm"
               : null);
     const absoluteRepoRoot = resolve(repoRoot);
@@ -3698,7 +3632,12 @@ function inferPackageValidationCommand(
             : directoryArg
               ? `npm --prefix ${directoryArg} run`
               : "npm run";
-    const preferredScripts = isPushPalsRepository(repoRoot)
+    const ownsPushPalsRuntime = [
+      "apps/remotebuddy/src/autonomous_engine.ts",
+      "apps/workerpals/src/workerpals_main.ts",
+      "packages/shared/src/autonomy_policy.ts",
+    ].every((path) => fileSystem.exists(resolve(repoRoot, path)));
+    const preferredScripts = ownsPushPalsRuntime
       ? ["test:root", "test", "check", "lint"]
       : ["test", "check", "lint"];
     for (const name of preferredScripts) {
@@ -3712,7 +3651,8 @@ function inferPackageValidationCommand(
       }
       return `${prefix} ${name}`;
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError) throw error;
     // Ignore an unreadable package manifest and try another repo-native manifest.
   }
   return null;
@@ -3783,6 +3723,7 @@ function findManifestOwnedValidation(
   repoRoot: string,
   directories: string[],
   targetPaths: string[],
+  fileSystem: RepoValidationFileSystem,
 ): ManifestOwnedValidation | null {
   const wantsProto = targetPaths.some((targetPath) => pathExtname(targetPath) === ".proto");
   const bazelWorkspaceNames = ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"];
@@ -3790,7 +3731,8 @@ function findManifestOwnedValidation(
     const startIndex = Math.max(0, directories.indexOf(directory));
     for (const ancestor of directories.slice(startIndex)) {
       const root = ancestor ? resolve(repoRoot, ancestor) : repoRoot;
-      if (bazelWorkspaceNames.some((name) => existsSync(resolve(root, name)))) return ancestor;
+      if (bazelWorkspaceNames.some((name) => fileSystem.exists(resolve(root, name))))
+        return ancestor;
     }
     return null;
   };
@@ -3798,23 +3740,30 @@ function findManifestOwnedValidation(
     const root = directory ? resolve(repoRoot, directory) : repoRoot;
     if (
       wantsProto &&
-      (existsSync(resolve(root, "buf.yaml")) || existsSync(resolve(root, "buf.work.yaml")))
+      (fileSystem.exists(resolve(root, "buf.yaml")) ||
+        fileSystem.exists(resolve(root, "buf.work.yaml")))
     ) {
       return { ecosystem: "proto", directory };
     }
-    if (existsSync(resolve(root, "BUILD")) || existsSync(resolve(root, "BUILD.bazel"))) {
+    if (
+      fileSystem.exists(resolve(root, "BUILD")) ||
+      fileSystem.exists(resolve(root, "BUILD.bazel"))
+    ) {
       const workspaceDirectory = workspaceDirectoryFor(directory);
       if (workspaceDirectory != null) {
         return { ecosystem: "bazel", directory: workspaceDirectory };
       }
     }
-    if (existsSync(resolve(root, "CMakeLists.txt"))) {
+    if (fileSystem.exists(resolve(root, "CMakeLists.txt"))) {
       return { ecosystem: "native", directory };
     }
-    if (existsSync(resolve(root, "buf.yaml")) || existsSync(resolve(root, "buf.work.yaml"))) {
+    if (
+      fileSystem.exists(resolve(root, "buf.yaml")) ||
+      fileSystem.exists(resolve(root, "buf.work.yaml"))
+    ) {
       return { ecosystem: "proto", directory };
     }
-    if (existsSync(resolve(root, "Makefile"))) {
+    if (fileSystem.exists(resolve(root, "Makefile"))) {
       return { ecosystem: "make", directory };
     }
   }
@@ -3858,6 +3807,7 @@ function inferPythonValidationCommand(params: {
   manifestRoot: string;
   directory: string;
   targetPaths: string[];
+  fileSystem: RepoValidationFileSystem;
 }): string | null {
   const manifestNames = [
     "pyproject.toml",
@@ -3870,7 +3820,7 @@ function inferPythonValidationCommand(params: {
   const pythonTarget = params.targetPaths
     .map(normalizeValidationTargetPath)
     .find((targetPath) => pathExtname(targetPath) === ".py");
-  if (!manifestNames.some((name) => existsSync(resolve(params.manifestRoot, name)))) {
+  if (!manifestNames.some((name) => params.fileSystem.exists(resolve(params.manifestRoot, name)))) {
     return null;
   }
   const directoryArg = params.directory ? shellPathArgument(params.directory) : "";
@@ -3884,19 +3834,20 @@ function inferPythonValidationCommand(params: {
   let evidence = "";
   for (const name of evidenceFiles) {
     try {
-      evidence += `\n${readUtf8PrefixSync(resolve(params.manifestRoot, name), 200_000).text}`;
-    } catch {
+      evidence += `\n${params.fileSystem.readText(resolve(params.manifestRoot, name), 200_000).text}`;
+    } catch (error) {
+      if (error instanceof ValidationSnapshotUnavailableError) throw error;
       // Optional evidence file.
     }
   }
   const hasPytestEvidence =
     /\bpytest\b/i.test(evidence) ||
-    existsSync(resolve(params.manifestRoot, "pytest.ini")) ||
-    existsSync(resolve(params.manifestRoot, "conftest.py"));
+    params.fileSystem.exists(resolve(params.manifestRoot, "pytest.ini")) ||
+    params.fileSystem.exists(resolve(params.manifestRoot, "conftest.py"));
   if (hasPytestEvidence) {
     return directoryArg ? `python -m pytest ${directoryArg}` : "python -m pytest";
   }
-  if (existsSync(resolve(params.manifestRoot, "manage.py"))) {
+  if (params.fileSystem.exists(resolve(params.manifestRoot, "manage.py"))) {
     const managePath = params.directory ? `${params.directory}/manage.py` : "manage.py";
     const manageArg = shellPathArgument(managePath);
     return manageArg ? `python ${manageArg} test` : null;
@@ -3905,13 +3856,18 @@ function inferPythonValidationCommand(params: {
   return compileTarget ? `python -m compileall ${compileTarget}` : null;
 }
 
-function inferMakeValidationCommand(manifestRoot: string, directory: string): string | null {
+function inferMakeValidationCommand(
+  manifestRoot: string,
+  directory: string,
+  fileSystem: RepoValidationFileSystem,
+): string | null {
   const makefilePath = resolve(manifestRoot, "Makefile");
-  if (!existsSync(makefilePath)) return null;
+  if (!fileSystem.exists(makefilePath)) return null;
   let makefile = "";
   try {
-    makefile = readUtf8PrefixSync(makefilePath, 300_000).text;
-  } catch {
+    makefile = fileSystem.readText(makefilePath, 300_000).text;
+  } catch (error) {
+    if (error instanceof ValidationSnapshotUnavailableError) throw error;
     return null;
   }
   const targets = [...makefile.matchAll(/^([A-Za-z0-9_.-]+)\s*:(?!=)/gm)].map((match) => match[1]);
@@ -3939,12 +3895,13 @@ export function inferRepoValidationIdeas(
   targetPaths: string[] = [],
   executionPlatform: PushPalsConfig["workerpals"]["executionPlatform"] = "linux_docker",
   workerpalDocker = false,
+  fileSystem: RepoValidationFileSystem = DEFAULT_VALIDATION_FILE_SYSTEM,
 ): string[] {
   const safeTargetPaths = targetPaths.map(normalizeValidationTargetPath).filter(Boolean);
   if (!repoRoot) {
     return supportsDiffCheckOnlyValidation(safeTargetPaths) ? ["git diff --check"] : [];
   }
-  const directories = validationSearchDirectories(repoRoot, safeTargetPaths);
+  const directories = validationSearchDirectories(repoRoot, safeTargetPaths, fileSystem);
   const effectivePlatform = resolveWorkerValidationExecutionPlatform(
     executionPlatform,
     workerpalDocker,
@@ -3970,11 +3927,12 @@ export function inferRepoValidationIdeas(
     const directoryArg = directory ? shellPathArgument(directory) : "";
     if (directory && !directoryArg) return null;
     if (ecosystem === "package") {
-      if (!existsSync(resolve(manifestRoot, "package.json"))) return null;
+      if (!fileSystem.exists(resolve(manifestRoot, "package.json"))) return null;
       return inferPackageValidationCommand(
         resolve(manifestRoot, "package.json"),
         directory,
         repoRoot,
+        fileSystem,
       );
     }
     if (ecosystem === "python") {
@@ -3982,9 +3940,10 @@ export function inferRepoValidationIdeas(
         manifestRoot,
         directory,
         targetPaths: safeTargetPaths,
+        fileSystem,
       });
     }
-    if (ecosystem === "rust" && existsSync(resolve(manifestRoot, "Cargo.toml"))) {
+    if (ecosystem === "rust" && fileSystem.exists(resolve(manifestRoot, "Cargo.toml"))) {
       const manifestArg = shellPathArgument(directory ? `${directory}/Cargo.toml` : "Cargo.toml");
       return manifestArg
         ? directory
@@ -3992,16 +3951,16 @@ export function inferRepoValidationIdeas(
           : "cargo test"
         : null;
     }
-    if (ecosystem === "go" && existsSync(resolve(manifestRoot, "go.mod"))) {
+    if (ecosystem === "go" && fileSystem.exists(resolve(manifestRoot, "go.mod"))) {
       return directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./...";
     }
     if (
       ecosystem === "jvm" &&
-      (existsSync(resolve(manifestRoot, "pom.xml")) ||
-        existsSync(resolve(manifestRoot, "build.gradle")) ||
-        existsSync(resolve(manifestRoot, "build.gradle.kts")))
+      (fileSystem.exists(resolve(manifestRoot, "pom.xml")) ||
+        fileSystem.exists(resolve(manifestRoot, "build.gradle")) ||
+        fileSystem.exists(resolve(manifestRoot, "build.gradle.kts")))
     ) {
-      const isMaven = existsSync(resolve(manifestRoot, "pom.xml"));
+      const isMaven = fileSystem.exists(resolve(manifestRoot, "pom.xml"));
       const unixWrapperName = isMaven ? "mvnw" : "gradlew";
       const windowsWrapperName = isMaven ? "mvnw.cmd" : "gradlew.bat";
       const unixWrapperPath = `./${directory ? `${directory}/` : ""}${unixWrapperName}`;
@@ -4015,12 +3974,15 @@ export function inferRepoValidationIdeas(
           : "";
       if (
         effectivePlatform === "windows" &&
-        existsSync(resolve(manifestRoot, windowsWrapperName))
+        fileSystem.exists(resolve(manifestRoot, windowsWrapperName))
       ) {
         const wrapperArg = shellPathArgument(windowsWrapperPath);
         return wrapperArg ? `cmd /c ${wrapperArg}${projectFlag} test` : null;
       }
-      if (effectivePlatform !== "windows" && existsSync(resolve(manifestRoot, unixWrapperName))) {
+      if (
+        effectivePlatform !== "windows" &&
+        fileSystem.exists(resolve(manifestRoot, unixWrapperName))
+      ) {
         const wrapperArg = shellPathArgument(unixWrapperPath);
         if (!wrapperArg) return null;
         return wrapperArg.includes('"')
@@ -4031,32 +3993,34 @@ export function inferRepoValidationIdeas(
     }
     if (ecosystem === "dotnet") {
       try {
-        const dotnetProject = readdirSync(manifestRoot, { withFileTypes: true })
-          .filter((entry) => entry.isFile() && /\.(?:sln|csproj|fsproj)$/i.test(entry.name))
-          .map((entry) => entry.name)
+        const dotnetProject = fileSystem
+          .fileNames(manifestRoot)
+          .filter((name) => /\.(?:sln|csproj|fsproj)$/i.test(name))
           .sort()[0];
         if (!dotnetProject) return null;
         const projectArg = shellPathArgument(
           directory ? `${directory}/${dotnetProject}` : dotnetProject,
         );
         return projectArg ? `dotnet test ${projectArg}` : null;
-      } catch {
+      } catch (error) {
+        if (error instanceof ValidationSnapshotUnavailableError) throw error;
         return null;
       }
     }
     if (ecosystem === "ruby") {
-      const hasGemfile = existsSync(resolve(manifestRoot, "Gemfile"));
+      const hasGemfile = fileSystem.exists(resolve(manifestRoot, "Gemfile"));
       if (
-        existsSync(resolve(manifestRoot, ".rspec")) ||
-        existsSync(resolve(manifestRoot, "spec"))
+        fileSystem.exists(resolve(manifestRoot, ".rspec")) ||
+        fileSystem.exists(resolve(manifestRoot, "spec"))
       ) {
         return commandInDirectory(directory, hasGemfile ? "bundle exec rspec" : "rspec");
       }
-      if (existsSync(resolve(manifestRoot, "Rakefile"))) {
+      if (fileSystem.exists(resolve(manifestRoot, "Rakefile"))) {
         let rakefile = "";
         try {
-          rakefile = readUtf8PrefixSync(resolve(manifestRoot, "Rakefile"), 200_000).text;
-        } catch {
+          rakefile = fileSystem.readText(resolve(manifestRoot, "Rakefile"), 200_000).text;
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError) throw error;
           rakefile = "";
         }
         if (/\b(?:task\s+[:'\"]?test|Rake::TestTask)\b/i.test(rakefile)) {
@@ -4067,8 +4031,8 @@ export function inferRepoValidationIdeas(
     }
     if (ecosystem === "php") {
       const composerPath = resolve(manifestRoot, "composer.json");
-      if (existsSync(composerPath)) {
-        const composer = readBoundedJsonObject(composerPath) as {
+      if (fileSystem.exists(composerPath)) {
+        const composer = readValidationJsonObject(composerPath, fileSystem) as {
           scripts?: Record<string, unknown>;
         } | null;
         if (composer?.scripts && composer.scripts.test != null) {
@@ -4076,10 +4040,10 @@ export function inferRepoValidationIdeas(
         }
       }
       if (
-        existsSync(resolve(manifestRoot, "phpunit.xml")) ||
-        existsSync(resolve(manifestRoot, "phpunit.xml.dist"))
+        fileSystem.exists(resolve(manifestRoot, "phpunit.xml")) ||
+        fileSystem.exists(resolve(manifestRoot, "phpunit.xml.dist"))
       ) {
-        if (existsSync(composerPath)) {
+        if (fileSystem.exists(composerPath)) {
           return directoryArg
             ? `composer --working-dir ${directoryArg} exec -- phpunit`
             : "composer exec -- phpunit";
@@ -4091,14 +4055,15 @@ export function inferRepoValidationIdeas(
       }
       return null;
     }
-    if (ecosystem === "swift" && existsSync(resolve(manifestRoot, "Package.swift"))) {
+    if (ecosystem === "swift" && fileSystem.exists(resolve(manifestRoot, "Package.swift"))) {
       return directoryArg ? `swift test --package-path ${directoryArg}` : "swift test";
     }
-    if (ecosystem === "dart" && existsSync(resolve(manifestRoot, "pubspec.yaml"))) {
+    if (ecosystem === "dart" && fileSystem.exists(resolve(manifestRoot, "pubspec.yaml"))) {
       let pubspec = "";
       try {
-        pubspec = readUtf8PrefixSync(resolve(manifestRoot, "pubspec.yaml"), 200_000).text;
-      } catch {
+        pubspec = fileSystem.readText(resolve(manifestRoot, "pubspec.yaml"), 200_000).text;
+      } catch (error) {
+        if (error instanceof ValidationSnapshotUnavailableError) throw error;
         pubspec = "";
       }
       if (/\bsdk:\s*flutter\b|^flutter:/im.test(pubspec)) {
@@ -4106,10 +4071,10 @@ export function inferRepoValidationIdeas(
       }
       return directoryArg ? `dart --directory ${directoryArg} test` : "dart test";
     }
-    if (ecosystem === "elixir" && existsSync(resolve(manifestRoot, "mix.exs"))) {
+    if (ecosystem === "elixir" && fileSystem.exists(resolve(manifestRoot, "mix.exs"))) {
       return directoryArg ? `mix --cd ${directoryArg} test` : "mix test";
     }
-    if (ecosystem === "native" && existsSync(resolve(manifestRoot, "CMakeLists.txt"))) {
+    if (ecosystem === "native" && fileSystem.exists(resolve(manifestRoot, "CMakeLists.txt"))) {
       const sourceArg = directoryArg || ".";
       const buildPath = shellPathArgument(directory ? `${directory}/build` : "build");
       return buildPath
@@ -4123,20 +4088,20 @@ export function inferRepoValidationIdeas(
     if (
       ecosystem === "bazel" &&
       ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) =>
-        existsSync(resolve(manifestRoot, name)),
+        fileSystem.exists(resolve(manifestRoot, name)),
       )
     ) {
-      const buildDirectory = validationSearchDirectories(repoRoot, safeTargetPaths).find(
-        (candidateDirectory) => {
-          const candidateRoot = candidateDirectory
-            ? resolve(repoRoot, candidateDirectory)
-            : repoRoot;
-          return (
-            existsSync(resolve(candidateRoot, "BUILD")) ||
-            existsSync(resolve(candidateRoot, "BUILD.bazel"))
-          );
-        },
-      );
+      const buildDirectory = validationSearchDirectories(
+        repoRoot,
+        safeTargetPaths,
+        fileSystem,
+      ).find((candidateDirectory) => {
+        const candidateRoot = candidateDirectory ? resolve(repoRoot, candidateDirectory) : repoRoot;
+        return (
+          fileSystem.exists(resolve(candidateRoot, "BUILD")) ||
+          fileSystem.exists(resolve(candidateRoot, "BUILD.bazel"))
+        );
+      });
       const packagePath =
         buildDirectory != null && directory
           ? relative(resolve(repoRoot, directory), resolve(repoRoot, buildDirectory)).replace(
@@ -4151,7 +4116,7 @@ export function inferRepoValidationIdeas(
           : "//...";
       return commandInDirectory(directory, `bazel test ${target}`);
     }
-    if (ecosystem === "zig" && existsSync(resolve(manifestRoot, "build.zig"))) {
+    if (ecosystem === "zig" && fileSystem.exists(resolve(manifestRoot, "build.zig"))) {
       return directoryArg
         ? `zig build --build-file ${directoryArg}/build.zig test`
         : "zig build test";
@@ -4165,14 +4130,15 @@ export function inferRepoValidationIdeas(
       return formatTarget ? `terraform fmt -check ${formatTarget}` : null;
     }
     if (ecosystem === "clojure") {
-      if (existsSync(resolve(manifestRoot, "project.clj"))) {
+      if (fileSystem.exists(resolve(manifestRoot, "project.clj"))) {
         return commandInDirectory(directory, "lein test");
       }
-      if (existsSync(resolve(manifestRoot, "deps.edn"))) {
+      if (fileSystem.exists(resolve(manifestRoot, "deps.edn"))) {
         let deps = "";
         try {
-          deps = readUtf8PrefixSync(resolve(manifestRoot, "deps.edn"), 200_000).text;
-        } catch {
+          deps = fileSystem.readText(resolve(manifestRoot, "deps.edn"), 200_000).text;
+        } catch (error) {
+          if (error instanceof ValidationSnapshotUnavailableError) throw error;
           deps = "";
         }
         if (/:test\b/.test(deps)) return commandInDirectory(directory, "clojure -X:test");
@@ -4196,18 +4162,24 @@ export function inferRepoValidationIdeas(
     }
     if (ecosystem === "proto") {
       if (
-        existsSync(resolve(manifestRoot, "buf.yaml")) ||
-        existsSync(resolve(manifestRoot, "buf.work.yaml"))
+        fileSystem.exists(resolve(manifestRoot, "buf.yaml")) ||
+        fileSystem.exists(resolve(manifestRoot, "buf.work.yaml"))
       ) {
         return commandInDirectory(directory, "buf lint");
       }
       return null;
     }
-    if (ecosystem === "make") return inferMakeValidationCommand(manifestRoot, directory);
+    if (ecosystem === "make")
+      return inferMakeValidationCommand(manifestRoot, directory, fileSystem);
     return null;
   };
 
-  const manifestOwned = findManifestOwnedValidation(repoRoot, directories, safeTargetPaths);
+  const manifestOwned = findManifestOwnedValidation(
+    repoRoot,
+    directories,
+    safeTargetPaths,
+    fileSystem,
+  );
   const preferred = manifestOwned?.ecosystem ?? preferredValidationEcosystem(safeTargetPaths);
   if (preferred) {
     const preferredDirectories = manifestOwned
@@ -7298,7 +7270,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
+          promptTemplateVersion: "repository-agent-v8-admission-aware",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7377,6 +7349,16 @@ export class RemoteBuddyAutonomousEngine {
         deterministicPolicy: {
           maxCandidates: this.cfg.ideationMaxCandidates,
           minimumConfidence: this.cfg.minConfidence,
+          allowReadAnywhere: this.cfg.allowReadAnywhere,
+          workerExecutionPlatform: this.workerExecutionPlatform,
+          // Explicit zero-capacity configuration is stable policy; consumed
+          // hourly budgets and evaluator constraints remain live server gates.
+          disabledObjectiveTypes: Object.entries(this.cfg.maxDispatchPerHourByType ?? {})
+            .filter(([, limit]) => Number.isFinite(limit) && Math.floor(limit) <= 0)
+            .map(([type]) => type),
+          disabledComponents: Object.entries(this.cfg.maxDispatchPerHourByComponent ?? {})
+            .filter(([, limit]) => Number.isFinite(limit) && Math.floor(limit) <= 0)
+            .map(([component]) => component),
           allowedObjectiveTypes: Object.entries(POLICY)
             .filter(([, rule]) => rule.autonomousAllowed)
             .map(([type]) => type),
@@ -7462,6 +7444,13 @@ export class RemoteBuddyAutonomousEngine {
       if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {
         throw controller.signal.reason ?? new Error("RepositoryAgent ideation cancelled");
       }
+      if (
+        result.analyzedRepository.identity !== repository.identity ||
+        result.analyzedRepository.revision !== repository.revision ||
+        result.analyzedRepository.tree !== repository.tree
+      ) {
+        throw new Error("RepositoryAgent returned evidence for a different repository snapshot");
+      }
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       if (candidates.length === 0) {
@@ -7485,7 +7474,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
+          promptTemplateVersion: "repository-agent-v8-admission-aware",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -9014,13 +9003,30 @@ export class RemoteBuddyAutonomousEngine {
             );
             continue;
           }
-          if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
+          const verifiedAnalysis =
+            repositoryAgentPhase && source === "llm" ? repositoryAgentResult : null;
+          const internalAdmission = evaluateAutonomyInternalWork(candidate, {
+            allowInternalRepository: allowPushPalsInternalCandidates,
+            // repositoryAgentIdeation binds this authenticated, host-verified
+            // evidence to the exact snapshot requested above, before ingestion.
+            currentRepository: verifiedAnalysis?.analyzedRepository,
+            evidenceRepository: verifiedAnalysis?.analyzedRepository,
+            evidence: verifiedAnalysis?.evidence,
+            verifiedTargetPaths: verifiedAnalysis?.evidence.flatMap((entry) =>
+              entry.blobHash ? [{ path: entry.path, blobHash: entry.blobHash }] : [],
+            ),
+          });
+          if (!internalAdmission.ok) {
             recordDropReason(`${source}_pushpals_internal_leak`);
             console.warn(
               `[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`,
             );
             continue;
           }
+          // Preserve the original quote in RepositoryAgent's result/evidence.
+          // Dispatch describes the repo-native defect with exact source locations,
+          // so server and planner guards need no blanket internal-word exemption.
+          candidate.problem_statement = internalAdmission.repositoryNativeProblemStatement;
           const missingTargetPaths = findMissingRepoTargetPaths(
             this.autonomyRepo,
             candidate.target_paths,
