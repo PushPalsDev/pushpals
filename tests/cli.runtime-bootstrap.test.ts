@@ -1548,7 +1548,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("2");
   });
 
-  test("buildEmbeddedRuntimeEnv gives child Bun services the Windows root CA bundle", () => {
+  test("buildEmbeddedRuntimeEnv reuses the once-refreshed Windows root CA bundle", () => {
     const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-runtime-certs-"));
     const bundlePath = resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot);
     mkdirSync(dirname(bundlePath), { recursive: true });
@@ -1558,18 +1558,34 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "utf8",
     );
     try {
-      const env = buildEmbeddedRuntimeEnv(
-        {
-          PATH: process.env.PATH,
-        },
-        {
+      let refreshCalls = 0;
+      const refreshedPem = "-----BEGIN CERTIFICATE-----\nREFRESHED\n-----END CERTIFICATE-----\n";
+      const refreshEnv = { PATH: process.env.PATH };
+      const exporter = (outPath: string) => {
+        refreshCalls += 1;
+        writeFileSync(outPath, refreshedPem, "utf8");
+        return true;
+      };
+      // Prime the per-path refresh cache through its seam, never the host certificate store.
+      expect(refreshWindowsNodeExtraCaCertsBundle(bundlePath, refreshEnv, exporter)).toBe(
+        bundlePath,
+      );
+      expect(refreshCalls).toBe(1);
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const env = buildEmbeddedRuntimeEnv(refreshEnv, {
           repoRoot: "C:/repo/example",
           runtimeRoot,
           platform: "win32",
-        },
-      );
+        });
+        expect(env.NODE_EXTRA_CA_CERTS).toBe(bundlePath);
+        expect(readFileSync(bundlePath, "utf8")).toBe(refreshedPem);
+      }
 
-      expect(env.NODE_EXTRA_CA_CERTS).toBe(bundlePath);
+      expect(refreshWindowsNodeExtraCaCertsBundle(bundlePath, refreshEnv, exporter)).toBe(
+        bundlePath,
+      );
+      expect(refreshCalls).toBe(1);
     } finally {
       rmSync(runtimeRoot, { recursive: true, force: true });
     }
