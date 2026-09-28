@@ -1080,10 +1080,16 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   });
 
   test("ServiceManager opens the repeated-fingerprint circuit after stability resets attempts without stopping healthy services", async () => {
+    let now = 10_000;
     let remoteBuddySpawnCalls = 0;
+    let signalRestarted!: () => void;
+    const restartObserved = new Promise<void>((resolve) => {
+      signalRestarted = resolve;
+    });
     const lifecycleEvents: Array<{ type: string; recoveryPlanned?: boolean }> = [];
     const supervisor = new ServiceManager({
-      pollMs: 20,
+      now: () => now,
+      pollMs: 1_000_000,
       maxRestartAttempts: 4,
       stableWindowMs: 1_000,
       repeatedExitFingerprintLimit: 2,
@@ -1101,10 +1107,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
             env: { ...(spec.env ?? {}) },
             exited: false,
             exitCode: null,
-            launchedAtMs: Date.now(),
+            launchedAtMs: now,
           };
         }
         remoteBuddySpawnCalls += 1;
+        if (remoteBuddySpawnCalls === 2) signalRestarted();
         return {
           name: spec.name,
           proc: {} as any,
@@ -1113,7 +1120,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           env: { ...(spec.env ?? {}) },
           exited: remoteBuddySpawnCalls === 1,
           exitCode: remoteBuddySpawnCalls === 1 ? 3 : null,
-          launchedAtMs: remoteBuddySpawnCalls === 1 ? Date.now() : Date.now() - 2_000,
+          launchedAtMs: now,
         };
       },
       onLifecycleEvent: (event) => lifecycleEvents.push(event),
@@ -1132,15 +1139,22 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     });
 
     try {
-      await Bun.sleep(100);
+      (supervisor as any).tick();
+      await restartObserved;
       const restarted = supervisor.getService("remotebuddy");
       expect(remoteBuddySpawnCalls).toBe(2);
       expect(restarted?.exited).toBe(false);
+      // Advance the stability clock explicitly; real scheduler latency must
+      // neither skip this reset nor decide whether the crash circuit opens.
+      expect((supervisor as any).stateByService.get("remotebuddy").attempts).toBe(1);
+      now += 1_001;
+      (supervisor as any).tick();
+      expect((supervisor as any).stateByService.get("remotebuddy").attempts).toBe(0);
       if (restarted) {
         restarted.exitCode = 3;
         restarted.exited = true;
       }
-      await Bun.sleep(100);
+      (supervisor as any).tick();
 
       expect(remoteBuddySpawnCalls).toBe(2);
       expect(supervisor.getHealth()?.detail).toContain("repeated identical native failure");
