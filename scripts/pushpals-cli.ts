@@ -9,10 +9,12 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "fs";
+import { lstat, rm } from "fs/promises";
 import {
   basename,
   delimiter,
@@ -72,6 +74,7 @@ type CliOptions = {
   runtimeOnly: boolean;
   statusOnce: boolean;
   clear: boolean;
+  clearIncludeCaches: boolean;
   openConfig: boolean;
   createVisionMd: boolean;
 };
@@ -111,7 +114,7 @@ type CliClearRemoveResult = "removed" | "missing" | CliClearFailure;
 type CliClearRemoveOptions = {
   maxAttempts?: number;
   retryDelayMs?: number;
-  removePath?: (pathValue: string) => void;
+  removePath?: (pathValue: string) => void | Promise<void>;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -774,6 +777,9 @@ function printUsage(): void {
   );
   console.log("  --status-once          Print active endpoints once and exit");
   console.log("  --clear                Remove repo-local PushPals state and exit");
+  console.log(
+    "  --include-caches       With --clear, also remove the worker image and host dependency cache",
+  );
   console.log("  --open_config, --open-config");
   console.log("                        Open the active local config file and exit");
   console.log("  --create_vision_md     Create a starter vision.md in the current repo and exit");
@@ -801,6 +807,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     runtimeOnly: false,
     statusOnce: false,
     clear: false,
+    clearIncludeCaches: false,
     openConfig: false,
     createVisionMd: false,
   };
@@ -835,6 +842,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--clear") {
       options.clear = true;
+      continue;
+    }
+    if (arg === "--include-caches") {
+      options.clearIncludeCaches = true;
       continue;
     }
     if (arg === "--open_config" || arg === "--open-config") {
@@ -874,6 +885,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     process.exit(2);
   }
 
+  if (options.clearIncludeCaches && !options.clear) {
+    console.error("[pushpals] --include-caches requires --clear.");
+    process.exit(2);
+  }
   return options;
 }
 
@@ -4559,8 +4574,11 @@ export function buildCliClearTargets(opts: {
   runtimeRoot: string;
   config: ClientRuntimePreflightResult["config"];
   cliStatePath?: string | null;
+  includeCaches?: boolean;
 }): CliClearTarget[] {
   const targets: CliClearTarget[] = [];
+  const gitStateDir = dirname(resolveGitStateFilePath(opts.repoRoot, "pushpals-cli-state.json"));
+  const dependencyCachePath = join(gitStateDir, "pushpals", "dependencies");
   const dataDir = resolve(opts.config.paths.dataDir);
   appendCliClearTarget(targets, "runtime data", dataDir);
 
@@ -4583,34 +4601,75 @@ export function buildCliClearTargets(opts: {
     "client monitor state file",
     resolveGitStateFilePath(opts.repoRoot, "pushpals-client-state.json"),
   );
-  appendCliClearTarget(
-    targets,
-    "WorkerPal dependency cache",
-    join(
-      dirname(resolveGitStateFilePath(opts.repoRoot, "pushpals-cli-state.json")),
-      "pushpals",
-      "dependencies",
-    ),
-  );
+  if (opts.includeCaches) {
+    appendCliClearTarget(targets, "WorkerPal dependency cache", dependencyCachePath);
+  }
   appendCliClearTarget(
     targets,
     "runtime bootstrap logs",
     join(opts.runtimeRoot, "logs", "bootstrap"),
   );
+  const physicalPath = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  const protectedRoots = [opts.repoRoot, opts.runtimeRoot, gitStateDir].flatMap((path) => [
+    path,
+    physicalPath(path),
+  ]);
+  const cachePaths = [dependencyCachePath, physicalPath(dependencyCachePath)];
+  for (const target of targets) {
+    let targetIsLink = false;
+    try {
+      targetIsLink = lstatSync(target.path).isSymbolicLink();
+    } catch {
+      /* Removal reports lookup failures. */
+    }
+    const targetPaths = targetIsLink ? [target.path] : [target.path, physicalPath(target.path)];
+    if (
+      targetPaths.some((targetPath) =>
+        protectedRoots.some((path) => isPathEqualOrWithin(targetPath, path)),
+      )
+    ) {
+      throw new Error(
+        `Refusing to clear ${target.label}: ${target.path} contains a protected repository, runtime, or Git metadata root. Correct the configured state path.`,
+      );
+    }
+    if (
+      !opts.includeCaches &&
+      targetPaths.some((targetPath) =>
+        cachePaths.some(
+          (cachePath) =>
+            isPathEqualOrWithin(targetPath, cachePath) ||
+            isPathEqualOrWithin(cachePath, targetPath),
+        ),
+      )
+    ) {
+      throw new Error(
+        `Refusing to clear ${target.label}: ${target.path} overlaps the preserved WorkerPal dependency cache. Use --clear --include-caches to explicitly include it, or separate the configured state and cache paths.`,
+      );
+    }
+  }
   return targets;
 }
 
-function removeCliClearTargetOnce(
+async function removeCliClearTargetOnce(
   target: CliClearTarget,
-  removePath: (pathValue: string) => void = (pathValue) => {
-    rmSync(pathValue, { recursive: true, force: true });
+  removePath: (pathValue: string) => void | Promise<void> = (pathValue) => {
+    return rm(pathValue, { recursive: true, force: true, maxRetries: 0 });
   },
-): CliClearRemoveResult {
-  if (!existsSync(target.path)) return "missing";
+): Promise<CliClearRemoveResult> {
   try {
-    removePath(target.path);
+    // lstat does not follow a symlink and still detects dangling links. Only
+    // ENOENT is absence; permission and other lookup failures are real errors.
+    await lstat(target.path);
+    await removePath(target.path);
     return "removed";
   } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return "missing";
     return {
       ...target,
       detail: err instanceof Error ? err.message : String(err),
@@ -4636,7 +4695,7 @@ export async function removeCliClearTarget(
   let lastFailure: CliClearFailure | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const result = removeCliClearTargetOnce(target, removePath);
+    const result = await removeCliClearTargetOnce(target, removePath);
     if (result === "removed" || result === "missing") return result;
 
     lastFailure = result;
@@ -5121,34 +5180,49 @@ export async function completeCliStateClear(
   initialFailures: readonly CliClearFailure[] = [],
   writeLine: (level: "log" | "warn" | "error", line: string) => void = (level, line) =>
     console[level](line),
+  options: { progressIntervalMs?: number; removeOptions?: CliClearRemoveOptions } = {},
 ): Promise<number> {
-  const removed: CliClearTarget[] = [];
-  const missing: CliClearTarget[] = [];
   const failed: CliClearFailure[] = [...initialFailures];
-  for (const target of targets) {
-    const result = await removeCliClearTarget(target);
-    if (result === "removed") {
-      removed.push(target);
-    } else if (result === "missing") {
-      missing.push(target);
-    } else {
-      failed.push(result);
-    }
-  }
-
-  for (const target of removed) {
-    writeLine("log", `[pushpals] Cleared ${target.label}: ${target.path}`);
-  }
-  for (const target of missing) {
-    writeLine("log", `[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
-  }
-  for (const failure of failed) {
+  const reportFailure = (failure: CliClearFailure) => {
     writeLine(
       failure.unconfirmed ? "warn" : "error",
       failure.unconfirmed
         ? `[pushpals] Cleanup unconfirmed for ${failure.label}: ${failure.path} (${failure.detail})`
         : `[pushpals] Failed to clear ${failure.label}: ${failure.path} (${failure.detail})`,
     );
+  };
+  for (const failure of initialFailures) reportFailure(failure);
+  const progressIntervalMs = Number.isFinite(options.progressIntervalMs)
+    ? Math.max(1, Math.trunc(options.progressIntervalMs!))
+    : 2_000;
+  // Targets can overlap through configured state/worktree paths. Keep deletion
+  // sequential and fully awaited: a timeout race cannot cancel filesystem rm,
+  // and returning early could delete state recreated by the next invocation.
+  for (const target of targets) {
+    const startedAt = Date.now();
+    writeLine("log", `[pushpals] Clearing ${target.label}: ${target.path}`);
+    const progress = setInterval(() => {
+      writeLine(
+        "log",
+        `[pushpals] Still clearing ${target.label}: elapsedMs=${Date.now() - startedAt} path=${target.path}`,
+      );
+    }, progressIntervalMs);
+    try {
+      const result = await removeCliClearTarget(target, options.removeOptions);
+      if (result === "removed") {
+        writeLine(
+          "log",
+          `[pushpals] Cleared ${target.label}: ${target.path} (${Date.now() - startedAt}ms)`,
+        );
+      } else if (result === "missing") {
+        writeLine("log", `[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
+      } else {
+        failed.push(result);
+        reportFailure(result);
+      }
+    } finally {
+      clearInterval(progress);
+    }
   }
   if (failed.some((failure) => failure.unconfirmed)) {
     writeLine(
@@ -5171,8 +5245,17 @@ async function clearPushpalsState(opts: {
   config: ClientRuntimePreflightResult["config"];
   serverUrl: string;
   cliStatePath?: string | null;
+  includeCaches?: boolean;
 }): Promise<number> {
   console.log("[pushpals] Clear requested. Removing repo-local PushPals state.");
+  // Validate every configured target before stopping services or deleting anything.
+  const targets = buildCliClearTargets({
+    repoRoot: opts.repoRoot,
+    runtimeRoot: opts.runtimeRoot,
+    config: opts.config,
+    cliStatePath: opts.cliStatePath,
+    includeCaches: opts.includeCaches,
+  });
 
   const shutdown = await requestLocalRuntimeShutdown(
     opts.serverUrl,
@@ -5227,13 +5310,12 @@ async function clearPushpalsState(opts: {
     );
   }
 
-  const targets = buildCliClearTargets({
-    repoRoot: opts.repoRoot,
-    runtimeRoot: opts.runtimeRoot,
-    config: opts.config,
-    cliStatePath: opts.cliStatePath,
-  });
   const failed: CliClearFailure[] = [];
+  if (!opts.includeCaches) {
+    console.log(
+      "[pushpals] Preserving reusable WorkerPal image and host dependency cache; use --clear --include-caches to remove them too.",
+    );
+  }
 
   if (opts.config.remotebuddy.workerpalDocker || opts.config.remotebuddy.workerpalRequireDocker) {
     const dockerEnv = normalizeChildProcessEnv(process.env as Record<string, string | undefined>);
@@ -5256,24 +5338,26 @@ async function clearPushpalsState(opts: {
       });
     }
 
-    const imageCleanup = await cleanupLocalWorkerpalSandboxImage({
-      repoRoot: opts.repoRoot,
-      env: dockerEnv,
-      dockerImage: opts.config.remotebuddy.workerpalImage ?? opts.config.workerpals.dockerImage,
-    });
-    if (imageCleanup.ok) {
-      console.log(
-        imageCleanup.removed
-          ? `[pushpals] Cleared WorkerPal sandbox image: ${imageCleanup.imageName}`
-          : `[pushpals] Nothing to clear for WorkerPal sandbox image: ${imageCleanup.detail}`,
-      );
-    } else {
-      failed.push({
-        label: "WorkerPal sandbox image",
-        path: imageCleanup.imageName || opts.repoRoot,
-        detail: imageCleanup.detail,
-        unconfirmed: imageCleanup.outcome === "skipped" || imageCleanup.outcome === "timed_out",
+    if (opts.includeCaches) {
+      const imageCleanup = await cleanupLocalWorkerpalSandboxImage({
+        repoRoot: opts.repoRoot,
+        env: dockerEnv,
+        dockerImage: opts.config.remotebuddy.workerpalImage ?? opts.config.workerpals.dockerImage,
       });
+      if (imageCleanup.ok) {
+        console.log(
+          imageCleanup.removed
+            ? `[pushpals] Cleared WorkerPal sandbox image: ${imageCleanup.imageName}`
+            : `[pushpals] Nothing to clear for WorkerPal sandbox image: ${imageCleanup.detail}`,
+        );
+      } else {
+        failed.push({
+          label: "WorkerPal sandbox image",
+          path: imageCleanup.imageName || opts.repoRoot,
+          detail: imageCleanup.detail,
+          unconfirmed: imageCleanup.outcome === "skipped" || imageCleanup.outcome === "timed_out",
+        });
+      }
     }
   }
 
@@ -7472,6 +7556,7 @@ async function main(): Promise<void> {
       config,
       serverUrl,
       cliStatePath: statePath,
+      includeCaches: parsed.clearIncludeCaches,
     });
     process.exit(exitCode);
   }

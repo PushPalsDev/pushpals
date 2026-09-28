@@ -2075,6 +2075,31 @@ function sanitizeMemoryRef(value) {
     ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
   };
 }
+function sanitizeDiscoveryProgress(value) {
+  if (value === undefined)
+    return;
+  if (!isRecord(value))
+    invalidResponse("result.discoveryProgress must be an object");
+  const integer = (key, min, max) => {
+    const raw = value[key];
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max)
+      invalidResponse(`result.discoveryProgress.${key} is invalid`);
+    return raw;
+  };
+  const pageCount = integer("pageCount", 1, 16);
+  const page = integer("page", 1, pageCount);
+  for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
+    if (typeof value[key] !== "boolean")
+      invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  return {
+    page,
+    pageCount,
+    advanced: value.advanced === true,
+    boundedCoverageExhausted: value.boundedCoverageExhausted === true,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
+  };
+}
 function sanitizeRepositoryAgentResult(value, expectedRequestId) {
   if (!isRecord(value))
     invalidResponse("Repository Agent result must be an object");
@@ -2099,6 +2124,10 @@ function sanitizeRepositoryAgentResult(value, expectedRequestId) {
   const cacheRecord = isRecord(value.cache) ? value.cache : {};
   const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
   const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  const discoveryProgress = sanitizeDiscoveryProgress(value.discoveryProgress);
+  if (discoveryProgress && (!isRecord(data) || !Array.isArray(data.candidates) || data.candidates.length > 0)) {
+    discoveryProgress.retryEligible = false;
+  }
   return {
     schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
     requestId,
@@ -2117,6 +2146,7 @@ function sanitizeRepositoryAgentResult(value, expectedRequestId) {
       ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
     },
     memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    ...discoveryProgress ? { discoveryProgress } : {},
     completedAt
   };
 }
@@ -10470,7 +10500,9 @@ ${referencedText}`;
   };
   return visit(repo, command, 0);
 }
-function isParallelSafeFastValidationCommand(repo, command) {
+function isParallelSafeFastValidationCommand(repo, command, env = process.env) {
+  if (trustedEnvironmentValidationDeferralReason(repo, command, env))
+    return false;
   if (isLongRunningBrowserValidationCommand(command))
     return false;
   if (shouldEnsurePlaywrightBrowserRuntime(repo, command))

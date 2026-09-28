@@ -664,6 +664,7 @@ describe("server RepositoryAgent routes", () => {
       },
       answer: "README.md establishes the route-test repository fixture.",
       summary: "README.md is the fixture evidence.",
+      data: { candidates: [] },
       confidence: 0.98,
       evidence: [
         {
@@ -678,6 +679,14 @@ describe("server RepositoryAgent routes", () => {
       validationProposals: [],
       cache: { hit: false, key: `route-test:${submitted.requestId}` },
       memoryRefs: [],
+      discoveryProgress: {
+        page: 2,
+        pageCount: 8,
+        advanced: true,
+        boundedCoverageExhausted: false,
+        retryEligible: true,
+        excludedCandidateCount: 1,
+      },
       completedAt: new Date().toISOString(),
     };
     const completed = await worker.complete(submitted.requestId, { ...authority, result });
@@ -690,11 +699,16 @@ describe("server RepositoryAgent routes", () => {
         requestId: submitted.requestId,
         answer: result.answer,
         analyzedRepository: result.analyzedRepository,
+        discoveryProgress: result.discoveryProgress,
       },
     });
     const asked = await caller.ask(input, { timeoutMs: 5_000, pollIntervalMs: 100 });
     expect(asked.requestId).toBe(submitted.requestId);
     expect(asked.answer).toBe(result.answer);
+    // Completion must persist host progress outside model data and preserve it
+    // through both polling and the completed-request/idempotent ask path.
+    expect(asked.discoveryProgress).toEqual(result.discoveryProgress);
+    expect(asked.data).toEqual({ candidates: [] });
 
     try {
       await worker.complete(submitted.requestId, { ...authority, result });

@@ -22,6 +22,7 @@ import {
   REPOSITORY_AGENT_SCHEMA_VERSION,
   RepositoryAgentClientError,
   resolveRepositorySnapshot,
+  sanitizeRepositoryAgentResult,
   type MemoryStore,
   type RepositoryAgentClaim,
   type RepositoryAgentClaimInput,
@@ -487,10 +488,326 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       const [cursor] = await coverageRecords(memory, request);
       expect((cursor!.value as any).nextPage).toBe(2);
       expect(cursor!.revision).toBe(2);
+      expect(first.discoveryProgress).toMatchObject({
+        page: 1,
+        pageCount: 3,
+        advanced: true,
+        retryEligible: true,
+      });
+      expect(second.discoveryProgress).toMatchObject({
+        page: 2,
+        advanced: true,
+        retryEligible: true,
+      });
+      expect(third.discoveryProgress).toMatchObject({
+        page: 3,
+        advanced: false,
+        retryEligible: false,
+      });
+      expect(fourth.discoveryProgress).toEqual(third.discoveryProgress);
     } finally {
       await memory.close();
     }
   }, 30_000);
+
+  test("resumes reviewed blobs across revisions and unrelated executed-outcome changes without reusing answer facts", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() => (++calls === 1 ? emptyAutonomyResponse() : modelResponse()));
+    const worker = () =>
+      new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger });
+    await worker().analyze("resume-initial-empty", request);
+    const positive = await worker().analyze("resume-positive", request);
+    const reviewedPacket = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content).evidencePacket;
+    expect([...reviewedPacket.seedPaths, ...reviewedPacket.selectedPaths]).not.toContain(
+      "src/coverage-012.ts",
+    );
+    writeFileSync(join(repo, "src", "coverage-012.ts"), "export const unrelatedChange = true;\n");
+    git(repo, ["add", "--", "src/coverage-012.ts"]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "change unrelated evidence page",
+    ]);
+    const changedOutcomes = {
+      ...request,
+      repository: await resolveRepositorySnapshot(repo),
+      context: {
+        ...request.context,
+        runtimeSignals: {
+          executedOutcomeWatermark: "new-executed-outcome",
+          recentObjectives: [
+            {
+              job_id: "unrelated-completion",
+              status: "completed",
+              target_paths: ["src/index.ts", "src/coverage-012.ts"],
+            },
+          ],
+        },
+      },
+    };
+    const refreshed = await worker().analyze("resume-outcomes-changed", changedOutcomes);
+    expect(changedOutcomes.repository.tree).not.toBe(request.repository.tree);
+    expect(refreshed.cache.hit).toBe(false);
+    const positiveCacheKey = positive.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key;
+    const refreshedCacheKey = refreshed.memoryRefs.find(
+      (ref) => ref.role === "analysis_cache",
+    )?.key;
+    expect(positiveCacheKey).toBeTruthy();
+    expect(refreshedCacheKey).toBeTruthy();
+    expect(refreshedCacheKey).not.toBe(positiveCacheKey);
+    expect(
+      refreshed.evidence.every((entry) => entry.revision === changedOutcomes.repository.revision),
+    ).toBe(true);
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    expect(packets.map((packet) => packet.discoveryCoverage.page)).toEqual([1, 2, 2]);
+    expect(packets[2].seedPaths).toEqual(packets[0].seedPaths);
+    expect(packets[2].selectedPaths).toEqual(packets[1].selectedPaths);
+    const payload = JSON.parse(llm.analysisCalls[2]!.messages[0]!.content);
+    expect(payload.request.context.runtimeSignals.recentObjectives[0].job_id).toBe(
+      "unrelated-completion",
+    );
+    expect(await coverageRecords(memory, request)).toHaveLength(1);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(1);
+  });
+
+  test("revisits a changed blob but preserves unchanged reviewed pages and reports exhaustion with holes", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const logs: string[] = [];
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: { ...quietLogger, log: (line) => logs.push(String(line)) },
+    });
+    for (let page = 1; page <= 3; page++) await worker.analyze(`blob-before-${page}`, request);
+    const firstPacket = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content).evidencePacket;
+    const changedPath = firstPacket.selectedPaths[0] as string;
+    writeFileSync(join(repo, changedPath), "export const changedCoverage = true;\n");
+    git(repo, ["add", "--", changedPath]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "change one reviewed blob",
+    ]);
+    const changed = await worker.analyze("blob-after-change", {
+      ...request,
+      repository: await resolveRepositorySnapshot(repo),
+    });
+    expect(changed.cache.hit).toBe(false);
+    expect(changed.discoveryProgress).toMatchObject({
+      page: 1,
+      pageCount: 3,
+      advanced: true,
+      boundedCoverageExhausted: true,
+      retryEligible: false,
+    });
+    expect(
+      llm.analysisCalls.map(
+        (input) => JSON.parse(input.messages[0]!.content).evidencePacket.discoveryCoverage.page,
+      ),
+    ).toEqual([1, 2, 3, 1]);
+    expect(
+      JSON.parse(
+        logs
+          .filter((line) => line.includes("evidenceCoverage="))
+          .at(-1)!
+          .split("evidenceCoverage=")[1]!,
+      ),
+    ).toMatchObject({ page: 1, boundedCoverageExhausted: true });
+    expect(await coverageRecords(memory, request)).toHaveLength(1);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(4);
+  });
+
+  test.each(["vision", "policy"])(
+    "starts a new bounded pass after changed %s",
+    async (changedField) => {
+      const repo = createCoverageRepository();
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const llm = new FakeLlm(emptyAutonomyResponse);
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      await worker.analyze("qualification-original", request);
+      const context = { ...request.context };
+      if (changedField === "vision")
+        context.vision = {
+          ...(context.vision as any),
+          priorities: ["Improve a different priority"],
+        };
+      else context.deterministicPolicy = { minimumConfidence: 0.8 };
+      const changed = await worker.analyze("qualification-changed", { ...request, context });
+      expect(changed.cache.hit).toBe(false);
+      expect(changed.discoveryProgress).toMatchObject({ page: 1, advanced: true });
+      expect(
+        llm.analysisCalls.map(
+          (input) => JSON.parse(input.messages[0]!.content).evidencePacket.discoveryCoverage.page,
+        ),
+      ).toEqual([1, 1]);
+      expect(await coverageRecords(memory, request)).toHaveLength(2);
+    },
+  );
+
+  test("defers an excluded cached positive across workers without poisoning its reusable answer", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let failCoverageWrite = true;
+    const hooked = memoryWithHooks(memory, {
+      put: async (input) => {
+        if (input.kind === coverageKind && failCoverageWrite)
+          throw new Error("coverage temporarily unavailable");
+      },
+    });
+    let calls = 0;
+    const llm = new FakeLlm(() => {
+      const response = modelResponse() as any;
+      if (++calls > 1) {
+        response.data.candidates[0].id = "other-candidate";
+        response.data.candidates[0].target_paths = ["src/coverage-006.ts"];
+        response.data.candidates[0].scope.write_globs = ["src/coverage-006.ts"];
+      }
+      return response;
+    });
+    const worker = () =>
+      new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: hooked,
+        llm,
+        logger: quietLogger,
+      });
+    const original = await worker().analyze("exclusion-original", request);
+    const excludedRequest = {
+      ...request,
+      context: { ...request.context, discoveryExclusions: { targetPaths: ["src/index.ts"] } },
+    };
+    const failed = await worker().analyze("exclusion-write-failed", excludedRequest);
+    expect(failed.cache.hit).toBe(true);
+    expect(failed.discoveryProgress).toMatchObject({
+      advanced: false,
+      retryEligible: false,
+      excludedCandidateCount: 1,
+    });
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+    failCoverageWrite = false;
+    const excluded = await worker().analyze("exclusion-cached", excludedRequest);
+    expect(excluded.cache.hit).toBe(true);
+    expect((excluded.data as any).candidates).toEqual([]);
+    expect(excluded.discoveryProgress).toMatchObject({
+      page: 1,
+      advanced: true,
+      retryEligible: true,
+      excludedCandidateCount: 1,
+    });
+    expect(sanitizeRepositoryAgentResult(excluded).discoveryProgress).toEqual(
+      excluded.discoveryProgress,
+    );
+    const [cursor] = await coverageRecords(memory, request);
+    expect((cursor!.value as any).reviewedPageFingerprints).toEqual([]);
+    expect((cursor!.value as any).deferredPageFingerprints).toHaveLength(1);
+    const next = await worker().analyze("exclusion-next-page", excludedRequest);
+    expect((next.data as any).candidates[0].id).toBe("other-candidate");
+    expect(next.discoveryProgress).toMatchObject({
+      page: 2,
+      advanced: false,
+      retryEligible: false,
+      excludedCandidateCount: 0,
+    });
+    const restored = await worker().analyze("exclusion-removed", request);
+    expect(restored.cache.hit).toBe(true);
+    const originalCacheKey = original.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key;
+    expect(originalCacheKey).toBeTruthy();
+    expect(restored.cache.key).toBe(originalCacheKey);
+    expect(restored.data).toEqual(original.data);
+    expect(restored.discoveryProgress).toMatchObject({
+      page: 1,
+      advanced: false,
+      retryEligible: false,
+      excludedCandidateCount: 0,
+    });
+    expect(llm.analysisCalls).toHaveLength(2);
+    expect(
+      llm.analysisCalls.every(
+        (input) => !input.messages[0]!.content.includes("discoveryExclusions"),
+      ),
+    ).toBe(true);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(cursor!.revision);
+  });
+
+  test("filters only overlapping siblings at delivery and never stores filtered positive facts", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const response = modelResponse() as any;
+    const sibling = structuredClone(response.data.candidates[0]);
+    Object.assign(sibling, {
+      id: "sibling",
+      target_paths: ["src/coverage-000.ts"],
+      scope: { read_anywhere: true, write_globs: ["src/coverage-000.ts"] },
+    });
+    response.data.candidates.push(sibling);
+    const llm = new FakeLlm(() => response);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const filtered = await worker.analyze("mixed-exclusion", {
+      ...request,
+      context: { ...request.context, discoveryExclusions: { targetPaths: ["src/index.ts/child"] } },
+    });
+    expect((filtered.data as any).candidates.map((candidate: any) => candidate.id)).toEqual([
+      "sibling",
+    ]);
+    expect(filtered.discoveryProgress).toMatchObject({
+      advanced: false,
+      retryEligible: false,
+      excludedCandidateCount: 1,
+    });
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+    const restored = await worker.analyze("mixed-restored", request);
+    expect(restored.cache.hit).toBe(true);
+    expect(restored.data).toEqual(response.data);
+    expect(llm.analysisCalls).toHaveLength(1);
+    expect(
+      sanitizeRepositoryAgentResult({
+        ...filtered,
+        discoveryProgress: { ...filtered.discoveryProgress, advanced: true, retryEligible: true },
+      }).discoveryProgress!.retryEligible,
+    ).toBe(false);
+    expect(() =>
+      sanitizeRepositoryAgentResult({
+        ...filtered,
+        discoveryProgress: { ...filtered.discoveryProgress, pageCount: 17 },
+      }),
+    ).toThrow("pageCount");
+    expect(() =>
+      sanitizeRepositoryAgentResult({
+        ...filtered,
+        discoveryProgress: { ...filtered.discoveryProgress, advanced: "true" },
+      }),
+    ).toThrow("advanced");
+  });
 
   test.each([
     ["objective_type_not_allowed", { objective_type: "feature_large" }],
@@ -863,8 +1180,24 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     await worker.analyze("coverage-cap-first", request);
     const [first] = await coverageRecords(memory, request);
     expect((first!.value as any).pageCount).toBe(16);
+    const paths = git(repo, ["ls-files", "-z"]).split("\0").filter(Boolean);
+    const coverage = await (worker as any).readEvidenceCoverage(
+      request,
+      { paths, pathByComparable: new Map(paths.map((path) => [path, path])) },
+      "fixture-analysis",
+      new AbortController().signal,
+      Date.parse(request.deadlineAt),
+      [],
+    );
     await memory.put(
-      { ...first!, value: { ...(first!.value as any), nextPage: 15 } },
+      {
+        ...first!,
+        value: {
+          ...(first!.value as any),
+          nextPage: 15,
+          reviewedPageFingerprints: coverage.pageFingerprints.slice(0, 15),
+        },
+      },
       { expectedRevision: first!.revision },
     );
     await worker.analyze("coverage-cap-last", request);
@@ -908,7 +1241,8 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       llm,
       logger: quietLogger,
     });
-    await worker.analyze("coverage-write-failed", request);
+    const failed = await worker.analyze("coverage-write-failed", request);
+    expect(failed.discoveryProgress).toMatchObject({ advanced: false, retryEligible: false });
     expect(await coverageRecords(memory, request)).toHaveLength(0);
     failWrite = false;
     const only = await worker.analyze("coverage-cache-only", {
@@ -916,9 +1250,11 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       freshness: "cache_only",
     });
     expect(only.cache.hit).toBe(true);
+    expect(only.discoveryProgress).toMatchObject({ advanced: false, retryEligible: false });
     expect(fences).toHaveLength(1);
     const retry = await worker.analyze("coverage-write-retry", request);
     expect(retry.cache.hit).toBe(true);
+    expect(retry.discoveryProgress).toMatchObject({ advanced: true, retryEligible: true });
     expect(llm.analysisCalls).toHaveLength(1);
     const [cursor] = await coverageRecords(memory, request);
     expect((cursor!.value as any).nextPage).toBe(1);
@@ -967,7 +1303,9 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     );
     await both;
     release();
-    await Promise.all(pending);
+    const results = await Promise.all(pending);
+    expect(results.filter((result) => result.discoveryProgress?.retryEligible)).toHaveLength(1);
+    expect(results.filter((result) => result.discoveryProgress?.advanced)).toHaveLength(1);
     const [cursor] = await coverageRecords(memory, request);
     expect((cursor!.value as any).nextPage).toBe(1);
     expect(cursor!.revision).toBe(1);

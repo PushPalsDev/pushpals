@@ -81,6 +81,22 @@ Explicit vision non-goals remain in the structural model context. Transient
 queue, objective, and cooldown state is applied by current downstream eligibility
 checks rather than cached as repository structure.
 
+Discovery coverage remembers reviewed Git blobs across unrelated commits and
+outcome updates; it does not reuse candidate facts from an old tree. Active or
+recently completed target paths are delivery exclusions, so an already assigned
+positive answer need not pin every subsequent discovery request to that page.
+Removing the exclusion makes the original structural answer eligible again.
+
+After durable progress through an empty or target-excluded evidence page,
+autonomy can schedule a bounded idle-worker follow-up before the regular
+`tick_interval_ms`. Each follow-up rechecks current worker capacity, safety,
+resource/dispatch budgets, publication backpressure, and the dispatch lock.
+Unknown capacity, analysis failures, exhausted coverage, pause, and shutdown
+cannot start an accelerated loop. A successful dispatch retains the normal
+cadence because its planning request may not yet be visible as a worker job.
+Discovery progress and scheduling logs distinguish useful coverage advancement
+from a cache replay; neither is counted as a completed coding job.
+
 Codex-backed analysis never runs with the target repository as its working directory. It runs in a disposable neutral Git repository with project instructions, user rules, shell, apps, and web access disabled. HTTP completion backends receive the same evidence-only request and ignore the Codex execution hint.
 
 See [RepositoryAgent and shared memory](https://github.com/PushPalsDev/pushpals/wiki/13-repository-agent-and-memory) for the cross-service contract.

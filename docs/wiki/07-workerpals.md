@@ -154,6 +154,15 @@ runnable children remain active and only the blocked node is handed to the
 trusted host. Critic findings are typed and tied to supplied evidence IDs, so a
 host-validation request cannot be confused with a code-revision request.
 
+Editing passes are directed to use focused checks and leave full aggregate
+validation to that deterministic gate, avoiding duplicate full-suite work.
+Known sandbox-unavailable checks are handed off without repeated executor
+attempts. Parallel validation batches apply the same capability preflight as
+sequential commands: a script name such as `lint` does not make a Docker-backed
+command runnable in a socketless container. Runnable child checks still run,
+and a deferred command is not a pass; trusted-host publication checks remain
+required for the exact candidate.
+
 The progress watchdog tracks meaningful discovery, unique targeted searches,
 active bounded commands, tests, documentation, and implementation artifacts.
 For an edit request that requires tests or docs, a small source-only diff is not

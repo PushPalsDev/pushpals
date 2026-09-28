@@ -884,7 +884,12 @@ def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
         ),
         "- No-edit checkpoint: if you have not made a patch after identifying the behavior-owning file, stop discovering and edit that file now. Do not spend the execution budget proving every adjacent assumption first.",
         "- Discovery command budget: for compact tasks, use at most 5-8 targeted read/search commands before editing. If that is not enough, state the blocker and patch the best behavior owner rather than widening discovery.",
+        "- Validation ownership: discover and run the focused checks needed for the changed behavior or failing-stage reproduction. Do not run the whole test suite or long aggregate validation merely to satisfy the required-validation list during editing; PushPals ValidationGate runs those required gates after this turn. If the task specifically requires reproducing an aggregate failure, use the smallest necessary reproduction once rather than repeating the whole suite.",
     ]
+    if str(os.environ.get("PUSHPALS_WORKER_DOCKER_CAPABILITY", "")).strip() == "unavailable":
+        lines.append(
+            "- Known worker capability: this sandbox intentionally has no Docker daemon/socket. Do not run or retry validation commands known to require it, including aggregate commands containing a Docker-dependent stage. Continue with runnable focused checks and report the pending gate. ValidationGate preserves the required command for trusted-host validation against the exact candidate SHA before publication; deferral is not a pass and must not be reported as successful validation. Do not alter tests or product code to bypass this requirement."
+        )
     route_shell_task = _looks_like_route_shell_task(params)
     visual_task = _looks_like_visual_derivation_task(params)
     if route_shell_task or visual_task:
@@ -937,7 +942,7 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
     lines.append("  - editing: make the smallest behavior-owning patch.")
     lines.append("  - focused validation: run targeted fast checks for the changed surface.")
     lines.append(
-        "  - full validation: let PushPals ValidationGate own long required/browser checks unless one local confirmation is explicitly useful."
+        "  - full validation: hand off the whole suite and long required/aggregate/browser checks to PushPals ValidationGate after focused validation; required gates are not waived."
     )
     lines.append("  - final diff review: remove unrelated churn before returning.")
     lines.append(

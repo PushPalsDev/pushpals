@@ -443,16 +443,39 @@ enabled = false
   }, 15000);
 
   test.each([
-    { mode: "local-only succeeds", dockerEnabled: false, expectedExitCode: 0 },
-    { mode: "missing Docker reports incomplete", dockerEnabled: true, expectedExitCode: 1 },
+    {
+      mode: "local-only preserves cache",
+      dockerEnabled: false,
+      includeCaches: false,
+      expectedExitCode: 0,
+    },
+    {
+      mode: "local-only includes cache on request",
+      dockerEnabled: false,
+      includeCaches: true,
+      expectedExitCode: 0,
+    },
+    {
+      mode: "missing Docker reports warm-container cleanup incomplete",
+      dockerEnabled: true,
+      includeCaches: false,
+      expectedExitCode: 1,
+    },
+    {
+      mode: "missing Docker reports warm-container and image cleanup incomplete",
+      dockerEnabled: true,
+      includeCaches: true,
+      expectedExitCode: 1,
+    },
   ])(
     "pushpals --clear $mode while deleting local state without runtime preflight",
-    async ({ dockerEnabled, expectedExitCode }) => {
+    async ({ dockerEnabled, includeCaches, expectedExitCode }) => {
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-"));
       const repoRoot = join(root, "repo");
       const runtimeRoot = join(root, "runtime");
       const gitDir = join(repoRoot, ".git");
       const dataDir = join(repoRoot, "outputs", "data");
+      const cacheDir = join(gitDir, "pushpals", "dependencies");
       const scmWorktree = join(repoRoot, ".worktrees", "source_control_manager");
       const missingDocker = join(
         root,
@@ -470,6 +493,8 @@ enabled = false
         });
         expect(init.exitCode).toBe(0);
         mkdirSync(dataDir, { recursive: true });
+        mkdirSync(cacheDir, { recursive: true });
+        writeFileSync(join(cacheDir, "fixture-cache.txt"), "reusable cache\n", "utf8");
         mkdirSync(scmWorktree, { recursive: true });
         mkdirSync(runtimeRoot, { recursive: true });
         writeFileSync(join(dataDir, "pushpals.db"), "placeholder\n", "utf8");
@@ -482,6 +507,7 @@ enabled = false
             bunExecPath,
             cliScriptPath,
             "--clear",
+            ...(includeCaches ? ["--include-caches"] : []),
             "--runtime-root",
             runtimeRoot,
             "--server-url",
@@ -525,7 +551,11 @@ enabled = false
         expect(stdout).not.toContain("Starting embedded");
         if (dockerEnabled) {
           expect(stderr).toContain("Cleanup unconfirmed for WorkerPal warm containers:");
-          expect(stderr).toContain("Cleanup unconfirmed for WorkerPal sandbox image:");
+          if (includeCaches) {
+            expect(stderr).toContain("Cleanup unconfirmed for WorkerPal sandbox image:");
+          } else {
+            expect(stderr).not.toContain("WorkerPal sandbox image:");
+          }
           expect(stderr).toContain(
             "Clear incomplete: requested Docker cleanup could not be confirmed.",
           );
@@ -540,6 +570,13 @@ enabled = false
         }
         expect(existsSync(dataDir)).toBe(false);
         expect(existsSync(scmWorktree)).toBe(false);
+        expect(existsSync(cacheDir)).toBe(!includeCaches);
+        if (!includeCaches) {
+          expect(readFileSync(join(cacheDir, "fixture-cache.txt"), "utf8")).toBe(
+            "reusable cache\n",
+          );
+          expect(stdout).toContain("Preserving reusable WorkerPal image and host dependency cache");
+        }
         expect(existsSync(join(gitDir, "pushpals-cli-state.json"))).toBe(false);
         expect(existsSync(join(gitDir, "pushpals-client-state.json"))).toBe(false);
       } finally {
@@ -548,6 +585,29 @@ enabled = false
     },
     15000,
   );
+
+  test("--include-caches requires --clear before repository or runtime setup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-argument-"));
+    try {
+      const proc = Bun.spawn([bunExecPath, cliScriptPath, "--include-caches"], {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(code).toBe(2);
+      expect(stderr).toContain("--include-caches requires --clear.");
+      expect(stderr).not.toContain("not a git repository");
+      expect(stdout).not.toContain("Clear requested");
+      expect(stdout).not.toContain("Running runtime preflight");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test("refuses to attach to a healthy server that belongs to a different repo", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-repo-affinity-"));

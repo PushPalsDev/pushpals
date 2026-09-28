@@ -2616,7 +2616,14 @@ export function validationCommandIncludesTestWork(repo: string, command: string)
   return visit(repo, command, 0);
 }
 
-export function isParallelSafeFastValidationCommand(repo: string, command: string): boolean {
+export function isParallelSafeFastValidationCommand(
+  repo: string,
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  // Deferred commands must reach the sequential handoff path, which records
+  // pending trusted-host evidence without attempting unavailable worker work.
+  if (trustedEnvironmentValidationDeferralReason(repo, command, env)) return false;
   if (isLongRunningBrowserValidationCommand(command)) return false;
   if (shouldEnsurePlaywrightBrowserRuntime(repo, command)) return false;
   const tokens = tokenizeValidationCommandArgv(command);

@@ -43,20 +43,23 @@ pushpals --version
 
 Run from inside the Git repository you want PushPals to manage.
 
-| Command                         | Purpose                                                                |
-| ------------------------------- | ---------------------------------------------------------------------- |
-| `pushpals`                      | Connect or auto-start, then open interactive chat and event streaming. |
-| `pushpals --runtime-tag vX.Y.Z` | Pin embedded assets and binaries to a release.                         |
-| `pushpals --no-auto-start`      | Require an existing healthy runtime.                                   |
-| `pushpals --runtime-only`       | Supervise the local runtime without interactive chat.                  |
-| `pushpals --status-once`        | Print endpoints and readiness once, then exit.                         |
-| `pushpals --version`            | Print CLI, Bun runtime, and platform versions, then exit.              |
-| `pushpals --open-config`        | Open the active local runtime configuration.                           |
-| `pushpals --clear`              | Stop the repo's managed runtime and remove repo-local PushPals state.  |
+| Command                             | Purpose                                                                              |
+| ----------------------------------- | ------------------------------------------------------------------------------------ |
+| `pushpals`                          | Connect or auto-start, then open interactive chat and event streaming.               |
+| `pushpals --runtime-tag vX.Y.Z`     | Pin embedded assets and binaries to a release.                                       |
+| `pushpals --no-auto-start`          | Require an existing healthy runtime.                                                 |
+| `pushpals --runtime-only`           | Supervise the local runtime without interactive chat.                                |
+| `pushpals --status-once`            | Print endpoints and readiness once, then exit.                                       |
+| `pushpals --version`                | Print CLI, Bun runtime, and platform versions, then exit.                            |
+| `pushpals --open-config`            | Open the active local runtime configuration.                                         |
+| `pushpals --clear`                  | Stop the repo's managed runtime and clear state, preserving reusable caches.         |
+| `pushpals --clear --include-caches` | Also remove the configured WorkerPal sandbox image and legacy host dependency cache. |
 
 The CLI refuses to run outside a Git repository or against a Server attached to a different repository. Embedded release assets live under `~/.pushpals/runtime`; repo-specific CLI state lives in the repository's Git metadata directory.
 
-When Docker cleanup is requested, `--clear` exits with code 1 if Docker is unavailable or cleanup times out, even if local state was successfully removed. The output identifies the unconfirmed cleanup; retry when Docker is responsive. Startup cleanup remains best-effort and warns without blocking startup indefinitely.
+`--clear` removes runtime data, state files, the managed SourceControlManager worktree, bootstrap logs, and repo-labeled WorkerPal warm containers when Docker is configured. It preserves the reusable sandbox image and legacy host dependency cache; a matching image can be reused on the next start. Use `--clear --include-caches` when you also want those caches removed; the next start may need to rebuild the image. `--include-caches` requires `--clear`. Neither mode removes Docker named volumes, including WorkerPal dependency snapshots and Codex state, or installed runtime assets and configuration.
+
+Requested Docker cleanup remains strict: `--clear` exits with code 1 if warm-container cleanup cannot be confirmed, and `--clear --include-caches` also requires confirmed image cleanup. Docker unavailability or a cleanup timeout produces an incomplete summary even if local state was successfully removed; retry when Docker is responsive. Preserved caches are not cleanup failures. Startup and shutdown cleanup remain best-effort and warn without blocking indefinitely.
 
 ## Implementation Map
 

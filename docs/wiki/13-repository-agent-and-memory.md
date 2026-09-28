@@ -64,7 +64,9 @@ A result carries:
 - prioritized recommendations,
 - direct-argv validation proposals,
 - exact-cache metadata,
-- memory references and completion time.
+- memory references and completion time,
+- optional host-computed autonomous discovery progress, separate from model
+  output and structural cache contents.
 
 The shared client sanitizes request and response shapes, caps payload sizes,
 requires exact positive acknowledgements, can attach a bearer header for API
@@ -212,8 +214,8 @@ The compare-and-set `expectedRevision` option prevents lost updates. A staged wr
 
 RepositoryAgent cache keys include schema version, repository identity, content tree, purpose, assigned model, and prompt version. Ordinary questions additionally include their exact revision and question/context so an empty commit or changed history cannot reuse a history-sensitive answer. RemoteBuddy autonomy-priority requests instead use the `vision.md` fingerprint, normalized deterministic candidate policy, and stable operation/question protocol, deliberately excluding revision-specific Git history, recalled observations, volatile runtime snapshots, open-objective lists, and signal ordering. A same-tree autonomy hit revalidates each cited blob and rebinds it to the current revision before use; downstream deterministic eligibility still filters a reused candidate against current objectives and cooldowns. Only clean snapshots with a cache-permitting freshness policy are eligible. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
 
-The current source uses prompt/cache version `repository-agent-v8-admission-aware`.
-This separates admission-aware analysis and coverage records from earlier cache
+The current source uses prompt/cache version `repository-agent-v9-resumable-discovery`.
+This separates resumable analysis and coverage records from earlier cache
 entries; it does not rewrite or clear a running installation's memory. The worker
 applies snapshot-stable candidate admission after evidence verification and before
 caching fresh autonomy results, and reapplies it to validated cache hits. A raw
@@ -235,9 +237,11 @@ not follow symlinks or read ignored/untracked host manifests. Incomplete manifes
 inspection is a retryable error, not evidence that validation is unavailable;
 it cannot advance coverage or cache a false negative.
 
-Current capacity, open work, cooldowns, ranking scores, and other transient
-eligibility checks remain downstream. They must not turn a temporarily ineligible
-proposal into permanently cached structural absence. Implementation:
+Current capacity, cooldowns, ranking scores, and final eligibility checks remain
+downstream. Active/recent target exclusions can also filter the result delivered
+to autonomy, without changing the structural cached answer or suppressing valid
+nonoverlapping siblings. They must not turn a temporarily ineligible proposal
+into permanently cached structural absence. Implementation:
 [`repository_agent.ts`](../../apps/remotebuddy/src/repository_agent.ts),
 [`autonomy_candidate_policy.ts`](../../apps/remotebuddy/src/autonomy_candidate_policy.ts),
 and [`autonomous_engine.ts`](../../apps/remotebuddy/src/autonomous_engine.ts).
@@ -272,11 +276,14 @@ does not edit the user's repository.
 Clean autonomy-priority analysis uses a bounded, persistent discovery cursor in
 the existing authorized `repository_agent_cache` namespace. The cursor has a
 distinct `coverage:` key and record kind; it is not an analysis answer or a
-repository fact. Its identity includes the keyed structural context, repository
-tree, assigned model, prompt version, and deterministic discovery plan. Explicit
-vision non-goals and the other compact vision constraints affect both that key
-and the model context. Transient eligibility signals are left to downstream
-admission rather than incorporated into a reusable structural answer.
+repository fact. Its stable identity includes repository identity, compact
+vision constraints, deterministic policy, question protocol, assigned model,
+and prompt version. Reviewed pages are identified by their current tracked Git
+blob IDs, including shared seed evidence. Unrelated commits or new job outcomes
+therefore need not restart discovery at page one. Changed evidence is revisited;
+changed vision, policy, or model starts a new sweep. Exact candidate answers
+remain separately fenced to their current tree and outcome context, and every
+returned result still passes current-snapshot validation.
 
 The worker keeps seed evidence and examines at most six additional ranked tracked
 paths per page, for at most sixteen pages. Each page has its own exact cache. A
@@ -286,14 +293,24 @@ Concurrent completions cannot skip a page. Cache-only calls, dirty worktrees,
 cancellation, provider failures, and evidence-only fallback do not advance it.
 Structurally admissible positive answers remain reusable; an effective empty
 cache hit, including one whose proposals fail static admission, can recover a
-previously failed cursor write. Cursor expiry or changed keyed context starts a
-new sweep.
+previously failed cursor write. If all admitted candidates overlap active/recent
+target exclusions, the worker can defer that page for that exclusion set only.
+This is not a structural-empty observation: removing the exclusion makes its
+valid candidates available again. Cursor expiry starts a new sweep.
 
 The `evidenceCoverage` log records request identity, page/count/limit, cache use,
 and advancement. Reaching the discovery cap reports bounded coverage exhaustion
 and explicitly does **not** establish repository-wide exhaustion. This does not
 force candidates, add a second retrieval-model call, execute suggested checks,
 or bypass scope, validation, and review gates.
+
+RemoteBuddy can schedule a bounded, earlier follow-up after durable discovery
+progress when workers are verified idle. Unknown capacity, publication
+backpressure, dispatch backoff, failures, exhausted coverage, and disabled or
+stopped autonomy cannot create a fast discovery loop. Successful dispatch keeps
+the ordinary cadence: a newly enqueued planning request may not yet appear in
+worker job counts. Faster discovery is not permission to fabricate work or
+reuse a stale answer.
 
 ### Capability circuit
 

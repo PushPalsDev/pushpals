@@ -42,8 +42,22 @@ binaries. On Windows it skips those standalone downloads and launches the
 embedded source bundles through bounded, isolated launchers. `--runtime-only`
 keeps the supervisor alive without terminal chat, `--status-once` reports
 readiness and exits, and `--clear` stops the repo-affine managed runtime and
-clears its validated state targets, warm containers, and configured WorkerPal
-sandbox image. The CLI also serves the exported Expo
+clears its validated runtime data, state files, SourceControlManager worktree,
+bootstrap logs, and repo-labeled WorkerPal warm containers when Docker is
+configured. It preserves the reusable WorkerPal sandbox image and legacy host
+dependency cache by default. `--clear --include-caches` also removes the configured
+sandbox image and legacy host dependency cache, which can make the next startup
+slower. `--include-caches` is invalid without `--clear`. Neither mode purges Docker
+named volumes (including dependency snapshots and Codex state), installed runtime
+assets, or configuration.
+
+An unconfirmed requested Docker cleanup (unavailable Docker or a timeout) still
+produces an incomplete summary and exit code `1`, after local cleanup runs. Normal
+clear requires confirmed warm-container cleanup; `--include-caches` additionally
+requires confirmed image cleanup. Intentionally preserved caches are not failures.
+Automatic startup and shutdown cleanup remain warning-only and best-effort.
+
+The CLI also serves the exported Expo
 monitor UI locally when those assets are available. Planning, execution, and
 publication remain with their runtime services.
 

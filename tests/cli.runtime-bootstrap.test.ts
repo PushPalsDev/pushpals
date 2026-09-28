@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "fs";
@@ -5292,58 +5293,146 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
-  test("buildCliClearTargets removes repo-local runtime state without targeting the repo root", () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-targets-"));
-    const repoRoot = join(root, "repo");
-    const runtimeRoot = join(root, "runtime");
-    const gitDir = join(repoRoot, ".git");
+  test.each([false, true])(
+    "buildCliClearTargets preserves caches unless requested (%s)",
+    (includeCaches) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-targets-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+      const gitDir = join(repoRoot, ".git");
 
-    try {
-      mkdirSync(join(repoRoot, "outputs", "data"), { recursive: true });
-      mkdirSync(join(repoRoot, ".worktrees", "source_control_manager"), { recursive: true });
-      mkdirSync(gitDir, { recursive: true });
-      writeFileSync(join(gitDir, "pushpals-cli-state.json"), "{}\n", "utf8");
-      writeFileSync(join(gitDir, "pushpals-client-state.json"), "{}\n", "utf8");
+      try {
+        mkdirSync(join(repoRoot, "outputs", "data"), { recursive: true });
+        mkdirSync(join(repoRoot, ".worktrees", "source_control_manager"), { recursive: true });
+        mkdirSync(gitDir, { recursive: true });
+        writeFileSync(join(gitDir, "pushpals-cli-state.json"), "{}\n", "utf8");
+        writeFileSync(join(gitDir, "pushpals-client-state.json"), "{}\n", "utf8");
 
-      const targets = buildCliClearTargets({
-        repoRoot,
-        runtimeRoot,
-        cliStatePath: join(gitDir, "pushpals-cli-state.json"),
-        config: {
-          paths: {
-            dataDir: join(repoRoot, "outputs", "data"),
+        const targets = buildCliClearTargets({
+          repoRoot,
+          runtimeRoot,
+          includeCaches,
+          cliStatePath: join(gitDir, "pushpals-cli-state.json"),
+          config: {
+            paths: {
+              dataDir: join(repoRoot, "outputs", "data"),
+            },
+            sourceControlManager: {
+              repoPath: join(repoRoot, ".worktrees", "source_control_manager"),
+              stateDir: join(repoRoot, "outputs", "data", "source_control_manager"),
+            },
+          } as any,
+        });
+
+        expect(targets).toEqual([
+          { label: "runtime data", path: join(repoRoot, "outputs", "data") },
+          {
+            label: "SourceControlManager worktree",
+            path: join(repoRoot, ".worktrees", "source_control_manager"),
           },
-          sourceControlManager: {
-            repoPath: join(repoRoot, ".worktrees", "source_control_manager"),
-            stateDir: join(repoRoot, "outputs", "data", "source_control_manager"),
+          { label: "CLI state file", path: join(gitDir, "pushpals-cli-state.json") },
+          {
+            label: "client monitor state file",
+            path: join(gitDir, "pushpals-client-state.json"),
           },
-        } as any,
-      });
+          ...(includeCaches
+            ? [
+                {
+                  label: "WorkerPal dependency cache",
+                  path: join(gitDir, "pushpals", "dependencies"),
+                },
+              ]
+            : []),
+          {
+            label: "runtime bootstrap logs",
+            path: join(runtimeRoot, "logs", "bootstrap"),
+          },
+        ]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
-      expect(targets).toEqual([
-        { label: "runtime data", path: join(repoRoot, "outputs", "data") },
-        {
-          label: "SourceControlManager worktree",
-          path: join(repoRoot, ".worktrees", "source_control_manager"),
-        },
-        { label: "CLI state file", path: join(gitDir, "pushpals-cli-state.json") },
-        {
-          label: "client monitor state file",
-          path: join(gitDir, "pushpals-client-state.json"),
-        },
-        {
-          label: "WorkerPal dependency cache",
-          path: join(gitDir, "pushpals", "dependencies"),
-        },
-        {
-          label: "runtime bootstrap logs",
-          path: join(runtimeRoot, "logs", "bootstrap"),
-        },
-      ]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+  test.each(["same", "ancestor", "descendant", "ancestor-link"])(
+    "default clear rejects configured cache overlap (%s) before deleting anything",
+    (kind) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-overlap-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+      const cacheRoot = join(repoRoot, ".git", "pushpals", "dependencies");
+      try {
+        mkdirSync(join(cacheRoot, "snapshot"), { recursive: true });
+        writeFileSync(join(cacheRoot, "sentinel"), "preserve");
+        let dataDir =
+          kind === "ancestor"
+            ? dirname(cacheRoot)
+            : kind === "descendant"
+              ? join(cacheRoot, "snapshot")
+              : cacheRoot;
+        if (kind === "ancestor-link") {
+          const alias = join(root, "metadata-alias");
+          symlinkSync(dirname(cacheRoot), alias, process.platform === "win32" ? "junction" : "dir");
+          dataDir = join(alias, "dependencies");
+        }
+        const options = {
+          repoRoot,
+          runtimeRoot,
+          config: {
+            paths: { dataDir },
+            sourceControlManager: { repoPath: repoRoot, stateDir: join(dataDir, "scm") },
+          } as any,
+        };
+        expect(() => buildCliClearTargets(options)).toThrow(
+          "overlaps the preserved WorkerPal dependency cache",
+        );
+        expect(
+          buildCliClearTargets({ ...options, includeCaches: true }).some(
+            (target) => target.path === dataDir,
+          ),
+        ).toBe(true);
+        expect(readFileSync(join(cacheRoot, "sentinel"), "utf8")).toBe("preserve");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["repo", "git", "runtime", "parent"])(
+    "clear never accepts a protected root as a state target, even with caches (%s)",
+    (kind) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-protected-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+      const gitDir = join(repoRoot, ".git");
+      try {
+        mkdirSync(gitDir, { recursive: true });
+        mkdirSync(runtimeRoot);
+        const dataDir =
+          kind === "repo"
+            ? repoRoot
+            : kind === "git"
+              ? gitDir
+              : kind === "runtime"
+                ? runtimeRoot
+                : root;
+        expect(() =>
+          buildCliClearTargets({
+            repoRoot,
+            runtimeRoot,
+            includeCaches: true,
+            config: {
+              paths: { dataDir },
+              sourceControlManager: { repoPath: repoRoot, stateDir: join(dataDir, "scm") },
+            } as any,
+          }),
+        ).toThrow("protected repository, runtime, or Git metadata root");
+        expect(existsSync(gitDir)).toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("isRetryableCliClearRemoveFailure recognizes transient Windows cleanup locks", () => {
     expect(

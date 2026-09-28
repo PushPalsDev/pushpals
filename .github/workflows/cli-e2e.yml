@@ -23,6 +23,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
+      - "tests/cli.clear-progress.test.ts"
       - "tests/cli.worker-startup-readiness.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
@@ -63,6 +64,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
+      - "tests/cli.clear-progress.test.ts"
       - "tests/cli.worker-startup-readiness.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
@@ -114,7 +116,7 @@ jobs:
         run: bun test tests/cli.worker-startup-readiness.test.ts
 
       - name: Verify health recovery reporting
-        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts
+        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts tests/cli.clear-progress.test.ts
 
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-
@@ -185,7 +187,7 @@ jobs:
         run: bun test tests/cli.worker-startup-readiness.test.ts
 
       - name: Verify health recovery reporting
-        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts
+        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts tests/cli.clear-progress.test.ts
 
       - name: Verify Docker engine
         run: docker version

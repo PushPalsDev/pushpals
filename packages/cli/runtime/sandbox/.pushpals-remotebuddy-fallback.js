@@ -2924,6 +2924,31 @@ function sanitizeMemoryRef(value) {
     ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
   };
 }
+function sanitizeDiscoveryProgress(value) {
+  if (value === undefined)
+    return;
+  if (!isRecord(value))
+    invalidResponse("result.discoveryProgress must be an object");
+  const integer = (key, min, max) => {
+    const raw = value[key];
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max)
+      invalidResponse(`result.discoveryProgress.${key} is invalid`);
+    return raw;
+  };
+  const pageCount = integer("pageCount", 1, 16);
+  const page = integer("page", 1, pageCount);
+  for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
+    if (typeof value[key] !== "boolean")
+      invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  return {
+    page,
+    pageCount,
+    advanced: value.advanced === true,
+    boundedCoverageExhausted: value.boundedCoverageExhausted === true,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
+  };
+}
 function sanitizeRepositoryAgentResult(value, expectedRequestId) {
   if (!isRecord(value))
     invalidResponse("Repository Agent result must be an object");
@@ -2948,6 +2973,10 @@ function sanitizeRepositoryAgentResult(value, expectedRequestId) {
   const cacheRecord = isRecord(value.cache) ? value.cache : {};
   const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
   const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  const discoveryProgress = sanitizeDiscoveryProgress(value.discoveryProgress);
+  if (discoveryProgress && (!isRecord(data) || !Array.isArray(data.candidates) || data.candidates.length > 0)) {
+    discoveryProgress.retryEligible = false;
+  }
   return {
     schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
     requestId,
@@ -2966,6 +2995,7 @@ function sanitizeRepositoryAgentResult(value, expectedRequestId) {
       ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
     },
     memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    ...discoveryProgress ? { discoveryProgress } : {},
     completedAt
   };
 }
@@ -8355,6 +8385,12 @@ function canonicalizeInstructionTextForBun(text2) {
 }
 
 // apps/remotebuddy/src/autonomous_engine.ts
+function autonomyDiscoveryProgress(value) {
+  const row = asObject(value);
+  if (!Number.isInteger(row.page) || !Number.isInteger(row.pageCount) || Number(row.page) < 1 || Number(row.pageCount) > 16 || Number(row.page) > Number(row.pageCount) || typeof row.advanced !== "boolean" || typeof row.boundedCoverageExhausted !== "boolean" || typeof row.retryEligible !== "boolean" || !Number.isInteger(row.excludedCandidateCount) || Number(row.excludedCandidateCount) < 0)
+    return null;
+  return row;
+}
 var IDEATION_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_ideation_system_prompt.md").trim();
 var SCORING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_scoring_system_prompt.md").trim();
 var PLANNING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_planning_system_prompt.md").trim();
@@ -8364,6 +8400,8 @@ var IDEATION_RETRY_MAX_TOKENS = 900;
 var IDEATION_NORMAL_MAX_CANDIDATES = 5;
 var STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 var STARTUP_FAST_TICK_MAX_DELAY_MS = 15000;
+var DISCOVERY_FOLLOWUP_DELAY_MS = 30000;
+var DISCOVERY_FOLLOWUP_MAX_ATTEMPTS = 16;
 var STARTUP_STALE_LOCK_AFTER_MS = 30000;
 var VISION_DOC_FNAME = "vision.md";
 var MAX_VISION_SECTION_CHARS = 1200;
@@ -12390,9 +12428,16 @@ class RemoteBuddyAutonomousEngine {
   timer = null;
   startupGraceTimer = null;
   startupFastTickTimer = null;
+  discoveryFollowupTimer = null;
   heartbeatTimer = null;
   inFlight = false;
   nextTickAtMs = 0;
+  baselineNextTickAtMs = 0;
+  startupGraceAtMs = 0;
+  startupFastTickAtMs = 0;
+  discoveryFollowupAtMs = 0;
+  schedulingGeneration = 0;
+  discoveryFollowupAttemptsRemaining = 0;
   startupFastTickAttemptsRemaining = 0;
   currentRunId = null;
   currentPhase = "idle";
@@ -12433,12 +12478,16 @@ class RemoteBuddyAutonomousEngine {
     const wasEnabled = this.runtimeEnabled;
     this.runtimeEnabled = Boolean(enabled);
     if (!this.runtimeEnabled) {
+      this.schedulingGeneration += 1;
       this.activeCycle?.controller.abort(new Error("Autonomy cycle cancelled because autonomy was disabled"));
       this.activeRepositoryIdeation?.abort(new Error("RepositoryAgent ideation cancelled because autonomy was disabled"));
       this.nextTickAtMs = 0;
+      this.baselineNextTickAtMs = 0;
+      this.discoveryFollowupAttemptsRemaining = 0;
       this.startupFastTickAttemptsRemaining = 0;
       this.clearStartupGraceTimer();
       this.clearStartupFastTickTimer();
+      this.clearDiscoveryFollowupTimer();
       if (this.timer) {
         clearInterval(this.timer);
         this.timer = null;
@@ -12486,7 +12535,7 @@ class RemoteBuddyAutonomousEngine {
       console.log(`[RemoteBuddyAutonomousEngine] heartbeat: status=running run=${this.currentRunId} phase=${this.currentPhase} run_elapsed_ms=${runElapsedMs} phase_elapsed_ms=${phaseElapsedMs}`);
       return;
     }
-    const hasScheduledTick = Boolean(this.timer || this.startupGraceTimer || this.startupFastTickTimer);
+    const hasScheduledTick = Boolean(this.timer || this.startupGraceTimer || this.startupFastTickTimer || this.discoveryFollowupTimer);
     const nextTickInMs = hasScheduledTick && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
     const lastAgeMs = this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
     console.log(`[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`);
@@ -12529,12 +12578,60 @@ class RemoteBuddyAutonomousEngine {
       clearTimeout(this.startupGraceTimer);
       this.startupGraceTimer = null;
     }
+    this.startupGraceAtMs = 0;
+    this.refreshNextTickAt();
   }
   clearStartupFastTickTimer() {
     if (this.startupFastTickTimer) {
       clearTimeout(this.startupFastTickTimer);
       this.startupFastTickTimer = null;
     }
+    this.startupFastTickAtMs = 0;
+    this.refreshNextTickAt();
+  }
+  refreshNextTickAt() {
+    const times = [
+      this.timer ? this.baselineNextTickAtMs : 0,
+      this.startupGraceTimer ? this.startupGraceAtMs : 0,
+      this.startupFastTickTimer ? this.startupFastTickAtMs : 0,
+      this.discoveryFollowupTimer ? this.discoveryFollowupAtMs : 0
+    ].filter((time) => time > 0);
+    this.nextTickAtMs = times.length ? Math.min(...times) : 0;
+  }
+  clearDiscoveryFollowupTimer() {
+    if (this.discoveryFollowupTimer)
+      clearTimeout(this.discoveryFollowupTimer);
+    this.discoveryFollowupTimer = null;
+    this.discoveryFollowupAtMs = 0;
+    this.refreshNextTickAt();
+  }
+  scheduleDiscoveryFollowup(progress, generation) {
+    if (generation !== this.schedulingGeneration || this.stopped || !this.runtimeEnabled || !this.startRequested || !this.timer || this.inFlight || this.cfg.killSwitchEnabled || this.discoveryFollowupTimer || this.discoveryFollowupAttemptsRemaining <= 0 || Date.now() < this.dispatchBackoffUntilMs || !progress.retryEligible || !progress.advanced || progress.boundedCoverageExhausted || progress.page >= progress.pageCount)
+      return;
+    const dueAt = Date.now() + DISCOVERY_FOLLOWUP_DELAY_MS;
+    if (this.baselineNextTickAtMs <= dueAt)
+      return;
+    this.discoveryFollowupAttemptsRemaining -= 1;
+    this.discoveryFollowupAtMs = dueAt;
+    const timer = setTimeout(() => {
+      if (this.discoveryFollowupTimer !== timer || generation !== this.schedulingGeneration)
+        return;
+      this.clearDiscoveryFollowupTimer();
+      if (this.stopped || !this.runtimeEnabled || !this.timer)
+        return;
+      this.tick(true, generation);
+    }, DISCOVERY_FOLLOWUP_DELAY_MS);
+    this.discoveryFollowupTimer = timer;
+    this.refreshNextTickAt();
+    console.log(`[RemoteBuddyAutonomousEngine] discoveryFollowup=${JSON.stringify({
+      event: "scheduled",
+      delayMs: DISCOVERY_FOLLOWUP_DELAY_MS,
+      page: progress.page,
+      pageCount: progress.pageCount,
+      advanced: progress.advanced,
+      excludedCandidateCount: progress.excludedCandidateCount,
+      remaining: this.discoveryFollowupAttemptsRemaining
+    })}`);
   }
   scheduleStartupFastTick(reason) {
     if (!this.runtimeEnabled || !this.timer || this.startupFastTickTimer)
@@ -12543,15 +12640,21 @@ class RemoteBuddyAutonomousEngine {
       return;
     const delayMs = this.startupFastTickDelayMs();
     this.startupFastTickAttemptsRemaining -= 1;
-    this.nextTickAtMs = Date.now() + delayMs;
+    this.startupFastTickAtMs = Date.now() + delayMs;
+    const generation = this.schedulingGeneration;
     console.log(`[RemoteBuddyAutonomousEngine] startup fast tick scheduled in ${delayMs}ms after ${reason} (remaining=${this.startupFastTickAttemptsRemaining}).`);
-    this.startupFastTickTimer = setTimeout(() => {
-      this.startupFastTickTimer = null;
-      if (!this.runtimeEnabled || !this.timer)
+    const timer = setTimeout(() => {
+      if (this.startupFastTickTimer !== timer || generation !== this.schedulingGeneration)
         return;
-      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+      this.startupFastTickTimer = null;
+      this.startupFastTickAtMs = 0;
+      this.refreshNextTickAt();
+      if (this.stopped || !this.runtimeEnabled || !this.timer)
+        return;
       this.tick();
     }, delayMs);
+    this.startupFastTickTimer = timer;
+    this.refreshNextTickAt();
   }
   cycleBudgetMs() {
     const ideationTimeoutMs = this.phaseTimeoutMs("ideation");
@@ -12727,7 +12830,19 @@ class RemoteBuddyAutonomousEngine {
       const data = await res.json();
       if (!data.ok || !data.workers || !data.jobs)
         return null;
+      const publication = asObject(data.publication);
       return {
+        discoveryCapacityVerified: [
+          data.workers.online,
+          data.workers.idle,
+          data.workers.busy,
+          data.jobs.pending,
+          data.jobs.autoscalablePending,
+          publication.backlog,
+          publication.oldestPendingAgeMs,
+          publication.oldestFinalizingAgeMs,
+          publication.expiredClaims
+        ].every((value) => typeof value === "number" && Number.isInteger(value) && value >= 0) && typeof publication.unhealthy === "boolean" && typeof data.autonomyAdmission?.allowed === "boolean",
         ...typeof data.autonomyAdmission?.allowed === "boolean" ? { autonomyAdmission: data.autonomyAdmission } : {},
         workers: data.workers,
         jobs: data.jobs,
@@ -12770,6 +12885,19 @@ class RemoteBuddyAutonomousEngine {
       return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
     }
     return null;
+  }
+  hasIdleDiscoveryCapacity(snapshot) {
+    if (!snapshot || snapshot.discoveryCapacityVerified !== true)
+      return false;
+    const { online, idle, busy } = snapshot.workers;
+    const { pending, autoscalablePending } = snapshot.jobs;
+    return [online, idle, busy, pending, autoscalablePending].every((value) => typeof value === "number" && Number.isInteger(value) && value >= 0) && online > 0 && idle > 0 && idle + busy <= online && pending === 0 && autoscalablePending === 0 && snapshot.publication.expiredClaims === 0 && this.deferReasonForWorkerLoad(snapshot) === null;
+  }
+  discoveryBudgetDeferReason(snapshot) {
+    if (snapshot.dispatch_budget.global_count_last_hour >= this.cfg.maxDispatchPerHour)
+      return "discovery_followup_global_dispatch_budget";
+    const active = snapshot.open_objectives.filter((objective) => ["proposed", "gated", "dispatched", "running", "blocked", "needs_clarification"].includes(objective.status)).length;
+    return active >= this.cfg.maxConcurrentObjectives ? "discovery_followup_max_concurrent" : null;
   }
   async fetchInspirationPatterns(limit = 60) {
     const qs = new URLSearchParams({
@@ -13044,13 +13172,14 @@ ${JSON.stringify(input.messages ?? [])}`),
       return {
         json: response,
         result: null,
+        discoveryProgress: null,
         llmCall: {
           id: randomUUID2(),
           runId: params.runId,
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v8-admission-aware",
+          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -13156,6 +13285,18 @@ ${JSON.stringify(input.messages ?? [])}`),
             "Return data.candidates=[] when evidence does not establish unfinished, actionable work. A desired outcome or matching filename alone is not evidence of a defect."
           ]
         },
+        discoveryExclusions: {
+          targetPaths: [
+            ...new Set([
+              ...params.snapshot.open_objectives.filter((objective) => isActiveWorkDiversityStatus(objective.status)),
+              ...(params.snapshot.recent_objectives ?? []).filter((objective) => isRecentWorkDiversityObjective(objective))
+            ].flatMap((objective) => [
+              ...asStringArray2(objective.target_paths),
+              ...asStringArray2(objective.scope?.target_paths),
+              ...asStringArray2(objective.scope?.targetPaths)
+            ]).filter((path) => !/[*?\[\]{}!]/.test(path)).map(normalizeValidationTargetPath).filter(Boolean))
+          ].slice(0, 128)
+        },
         runtimeSignals: {
           executedOutcomeWatermark: params.snapshot.executed_outcome_watermark ?? null,
           topSignals: params.snapshot.top_signals.slice(0, 5),
@@ -13191,6 +13332,9 @@ ${JSON.stringify(input.messages ?? [])}`),
       }
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const discoveryProgress = Array.isArray(data.candidates) ? autonomyDiscoveryProgress(result.discoveryProgress) : null;
+      if (discoveryProgress)
+        console.log(`[RemoteBuddyAutonomousEngine] repositoryDiscoveryProgress=${JSON.stringify({ runId: params.runId, ...discoveryProgress })}`);
       if (candidates.length === 0) {
         console.warn(`[RemoteBuddyAutonomousEngine] RepositoryAgent returned no grounded candidates for ${params.runId}; recording an empty planning cycle without inventing implementation work.`);
       }
@@ -13200,13 +13344,14 @@ ${JSON.stringify(input.messages ?? [])}`),
       return {
         json: response,
         result: candidates.length > 0 ? result : null,
+        discoveryProgress,
         llmCall: {
           id: randomUUID2(),
           runId: params.runId,
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v8-admission-aware",
+          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -13883,9 +14028,12 @@ ${JSON.stringify(input.messages ?? [])}`),
       detail: `validation_repair_dispatched_${requestId.slice(0, 8)}`
     };
   }
-  async tick() {
+  async tick(discoveryFollowup = false, generation = this.schedulingGeneration) {
+    if (generation !== this.schedulingGeneration)
+      return;
     if (this.stopped || !this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight)
       return;
+    this.clearDiscoveryFollowupTimer();
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID2().slice(0, 8)}`;
     const cycleController = new AbortController;
@@ -13895,6 +14043,8 @@ ${JSON.stringify(input.messages ?? [])}`),
     let lockAcquired = false;
     let outcome = "skipped";
     let outcomeDetail = "not_dispatched";
+    let idleDiscoveryCapacity = false;
+    let followupProgress = null;
     try {
       if (Date.now() < this.dispatchBackoffUntilMs) {
         this.setPhase("dispatch_backoff");
@@ -13957,8 +14107,20 @@ ${JSON.stringify(input.messages ?? [])}`),
         outcomeDetail = "resource_budget_runtime_exhausted";
         return;
       }
+      if (discoveryFollowup) {
+        const budgetReason = this.discoveryBudgetDeferReason(snapshot);
+        if (budgetReason) {
+          outcomeDetail = budgetReason;
+          return;
+        }
+      }
       this.setPhase("check_worker_load");
       const workerLoad = await this.fetchWorkerLoadSnapshot();
+      idleDiscoveryCapacity = this.hasIdleDiscoveryCapacity(workerLoad);
+      if (discoveryFollowup && !idleDiscoveryCapacity) {
+        outcomeDetail = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) ?? "discovery_followup_no_idle_capacity" : "discovery_followup_capacity_unavailable";
+        return;
+      }
       const workerLoadDeferReason = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) : null;
       if (workerLoad && workerLoadDeferReason) {
         console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to capacity/publication backpressure (busy=${workerLoad.workers.busy} idle=${workerLoad.workers.idle} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending} publicationBacklog=${workerLoad.publication.backlog}).`);
@@ -14467,13 +14629,16 @@ ${JSON.stringify(input.messages ?? [])}`),
         const parseHint = rawCandidates.length === 0 && Object.keys(ideationJson).length === 0 ? " (ideation returned empty or non-parseable JSON)" : "";
         console.log(`[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=${normalizedCandidates.length} distinct=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`);
         this.setPhase("record_no_candidate_objective");
-        await this.postObjective({
+        const recorded = await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
           sessionId: this.sessionId,
           candidates: candidatesPayload,
           llmCalls
         });
+        if (recorded && rawCandidates.length === 0 && !this.discoveryBudgetDeferReason(snapshot)) {
+          followupProgress = repositoryAgentPhase?.discoveryProgress ?? null;
+        }
         outcomeDetail = "no_eligible_candidates";
         return;
       }
@@ -15057,8 +15222,11 @@ Scope:
       }
       this.inFlight = false;
       this.markTickDone(outcome, outcomeDetail);
-      if (!lockAcquired && outcomeDetail.startsWith("lock_not_acquired")) {
+      if (generation === this.schedulingGeneration && !lockAcquired && outcomeDetail.startsWith("lock_not_acquired")) {
         this.scheduleStartupFastTick("dispatch lock contention");
+      }
+      if (outcome === "skipped" && idleDiscoveryCapacity && followupProgress) {
+        this.scheduleDiscoveryFollowup(followupProgress, generation);
       }
     }
   }
@@ -15088,47 +15256,67 @@ Scope:
     if (!this.runtimeEnabled || this.timer || this.startupGraceTimer)
       return;
     console.log(`[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`);
+    const generation = ++this.schedulingGeneration;
     this.startupFastTickAttemptsRemaining = STARTUP_FAST_TICK_MAX_ATTEMPTS;
+    this.discoveryFollowupAttemptsRemaining = DISCOVERY_FOLLOWUP_MAX_ATTEMPTS;
     const startInterval = () => {
-      if (this.timer)
+      if (this.timer || generation !== this.schedulingGeneration || this.stopped || !this.runtimeEnabled)
         return;
-      this.timer = setInterval(() => {
-        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-        this.tick();
+      this.baselineNextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+      const interval = setInterval(() => {
+        if (this.timer !== interval || generation !== this.schedulingGeneration)
+          return;
+        this.baselineNextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        this.discoveryFollowupAttemptsRemaining = DISCOVERY_FOLLOWUP_MAX_ATTEMPTS;
+        this.clearDiscoveryFollowupTimer();
+        this.clearStartupFastTickTimer();
+        this.refreshNextTickAt();
+        this.tick(false, generation);
       }, this.cfg.tickIntervalMs);
+      this.timer = interval;
+      this.refreshNextTickAt();
     };
     const firstTickDelayMs = this.startupGraceMs();
-    this.nextTickAtMs = Date.now() + firstTickDelayMs;
     this.heartbeatTimer = setInterval(() => {
+      if (generation !== this.schedulingGeneration)
+        return;
       this.logHeartbeat();
     }, this.cfg.heartbeatLogMs);
-    this.logHeartbeat();
     if (firstTickDelayMs > 0) {
       console.log(`[RemoteBuddyAutonomousEngine] startup autonomy tick delayed by ${firstTickDelayMs}ms to leave cold-start capacity available for user work.`);
-      this.startupGraceTimer = setTimeout(() => {
+      this.startupGraceAtMs = Date.now() + firstTickDelayMs;
+      const timer = setTimeout(() => {
+        if (this.startupGraceTimer !== timer || generation !== this.schedulingGeneration)
+          return;
         this.startupGraceTimer = null;
-        if (!this.runtimeEnabled)
+        this.startupGraceAtMs = 0;
+        if (this.stopped || !this.runtimeEnabled)
           return;
         startInterval();
-        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-        this.tick();
+        this.refreshNextTickAt();
+        this.tick(false, generation);
       }, firstTickDelayMs);
+      this.startupGraceTimer = timer;
+      this.refreshNextTickAt();
+      this.logHeartbeat();
       return;
     }
     startInterval();
-    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-    this.tick();
+    this.logHeartbeat();
+    this.tick(false, generation);
   }
   stop() {
     if (this.stopped)
       return;
     this.stopped = true;
+    this.schedulingGeneration += 1;
     this.startRequested = false;
     this.runtimeEnabled = false;
     this.activeCycle?.controller.abort(new Error("Autonomy cycle cancelled because autonomy is stopping"));
     this.activeRepositoryIdeation?.abort(new Error("RepositoryAgent ideation cancelled because autonomy is stopping"));
     this.clearStartupGraceTimer();
     this.clearStartupFastTickTimer();
+    this.clearDiscoveryFollowupTimer();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -15138,6 +15326,8 @@ Scope:
       this.heartbeatTimer = null;
     }
     this.startupFastTickAttemptsRemaining = 0;
+    this.discoveryFollowupAttemptsRemaining = 0;
+    this.baselineNextTickAtMs = 0;
     this.nextTickAtMs = 0;
   }
 }
@@ -15283,7 +15473,7 @@ ${chunk.text}`;
 }
 
 // apps/remotebuddy/src/repository_agent.ts
-var PROMPT_VERSION = "repository-agent-v8-admission-aware";
+var PROMPT_VERSION = "repository-agent-v9-resumable-discovery";
 var CACHE_NAMESPACE = "repository_agent_cache";
 var CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 var FACT_NAMESPACE = "repository_facts";
@@ -15303,6 +15493,7 @@ var MAX_SEED_PACKET_FILES = 6;
 var MAX_DISCOVERY_PATHS = 6;
 var MAX_AUTONOMY_DISCOVERY_PAGES = 16;
 var COVERAGE_KIND = "repository_autonomy_evidence_coverage";
+var MAX_REVIEWED_PAGE_FINGERPRINTS = MAX_AUTONOMY_DISCOVERY_PAGES * 4;
 var MAX_PACKET_FILE_BYTES = 16 * 1024;
 var MAX_PACKET_SCAN_FILE_BYTES = 128 * 1024;
 var MAX_PACKET_TOTAL_BYTES = 64000;
@@ -16132,6 +16323,58 @@ function cacheKey(request, modelId, promptVersion) {
     modelId,
     promptVersion
   }));
+}
+function discoveryCoverageKey(request, modelId, promptVersion) {
+  return sha2562(canonicalJson({
+    schemaVersion: 2,
+    repositoryIdentity: request.repository.identity,
+    purpose: request.purpose,
+    visionFingerprint: autonomyVisionFingerprint(request),
+    questionProtocol: sha2562(compactText2(request.question, 32000)),
+    deterministicPolicy: normalizedDeterministicPolicy(request),
+    modelId,
+    promptVersion
+  }));
+}
+function discoveryExclusionPaths(request) {
+  if (autonomyVisionFingerprint(request) == null)
+    return [];
+  const exclusions = isRecord2(request.context?.discoveryExclusions) ? request.context.discoveryExclusions : {};
+  return [
+    ...new Set(boundedStrings(exclusions.targetPaths, 128, 1000).map(normalizeRelativePath).filter((path) => path != null).map(comparablePath))
+  ].sort();
+}
+function discoveryRetrievalRequest(request) {
+  const { runtimeSignals: _outcomes, ...context } = request.context ?? {};
+  return { ...request, context };
+}
+function filterDiscoveryDelivery(result, excludedPaths) {
+  const { discoveryProgress: _oldProgress, ...structural } = result;
+  if (!excludedPaths.length || !isRecord2(result.data) || !Array.isArray(result.data.candidates))
+    return { result: structural, excludedCandidateCount: 0 };
+  const candidates = result.data.candidates.filter((candidate) => {
+    if (!isRecord2(candidate) || !Array.isArray(candidate.target_paths))
+      return true;
+    return !candidate.target_paths.some((raw) => {
+      const path = normalizeRelativePath(raw);
+      if (!path)
+        return false;
+      const comparable = comparablePath(path);
+      return excludedPaths.some((excluded) => comparable === excluded || comparable.startsWith(`${excluded}/`) || excluded.startsWith(`${comparable}/`));
+    });
+  });
+  const excludedCandidateCount = result.data.candidates.length - candidates.length;
+  return {
+    result: {
+      ...structural,
+      data: { ...result.data, candidates },
+      ...excludedCandidateCount > 0 && candidates.length === 0 ? {
+        answer: "The structurally valid candidates on this page overlap current work and are deferred for this delivery.",
+        summary: "Current-work exclusions defer this page without changing its reusable structural analysis."
+      } : {}
+    },
+    excludedCandidateCount
+  };
 }
 function executedAutonomyOutcomes(request) {
   const signals = isRecord2(request.context?.runtimeSignals) ? request.context.runtimeSignals : {};
@@ -17174,14 +17417,56 @@ class RepositoryAgentWorker {
       return null;
     }
   }
-  async readEvidenceCoverage(request, tracked, analysisKey, signal, deadlineMs) {
+  async readEvidenceCoverage(request, tracked, analysisKey, signal, deadlineMs, excludedPaths) {
     if (request.repository.dirty || autonomyVisionFingerprint(request) == null)
       return null;
-    const seedPaths = seedEvidencePacketPaths(tracked, request.question, request.context);
-    const rankedPaths = rankedAdditionalPaths(request, tracked, seedPaths, true);
+    const retrievalRequest = discoveryRetrievalRequest(request);
+    const seedPaths = seedEvidencePacketPaths(tracked, retrievalRequest.question, retrievalRequest.context);
+    const rankedPaths = rankedAdditionalPaths(retrievalRequest, tracked, seedPaths, true);
     const pageCount = Math.max(1, Math.min(MAX_AUTONOMY_DISCOVERY_PAGES, Math.ceil(rankedPaths.length / MAX_DISCOVERY_PATHS)));
-    const key = `coverage:${analysisKey}`;
-    const planHash = sha2562(canonicalJson({ seedPaths, rankedPaths, pageCount }));
+    const discoveryKey = discoveryCoverageKey(request, this.modelId, this.promptVersion);
+    const key = `coverage:${discoveryKey}`;
+    const inspectedPaths = [
+      ...new Set([...seedPaths, ...rankedPaths.slice(0, pageCount * MAX_DISCOVERY_PATHS)])
+    ];
+    if (inspectedPaths.some((path) => path.length + 3 > 8000)) {
+      this.logger.warn("[RepositoryAgent] evidence coverage disabled: path exceeds bounded Git argument size");
+      return null;
+    }
+    const blobs = new Map;
+    for (let offset = 0;offset < inspectedPaths.length; ) {
+      const batch = [];
+      let chars = 0;
+      while (offset < inspectedPaths.length) {
+        const path = inspectedPaths[offset];
+        if (batch.length && chars + path.length + 3 > 8000)
+          break;
+        batch.push(path);
+        chars += path.length + 3;
+        offset++;
+      }
+      const tree = await runGit(request.repository.root, ["--literal-pathspecs", "ls-tree", "-r", "-z", request.repository.revision, "--", ...batch], {
+        signal,
+        outputLimitBytes: MAX_TRACKED_PATH_BYTES
+      });
+      for (const entry of tree.split("\x00")) {
+        const match = /^(\d+) (?:blob|commit) ([a-f\d]{40,64})\t([\s\S]+)$/.exec(entry);
+        if (match)
+          blobs.set(match[3], `${match[1]}:${match[2]}`);
+      }
+    }
+    if (inspectedPaths.some((path) => !blobs.has(path))) {
+      this.logger.warn("[RepositoryAgent] evidence coverage disabled: current blob inventory is incomplete");
+      return null;
+    }
+    const coordinates = (paths) => paths.map((path) => [path, blobs.get(path)]);
+    const seedFingerprint = sha2562(canonicalJson(coordinates(seedPaths)));
+    const pageFingerprints = Array.from({ length: pageCount }, (_, page2) => sha2562(canonicalJson({
+      seedFingerprint,
+      selected: coordinates(rankedPaths.slice(page2 * MAX_DISCOVERY_PATHS, (page2 + 1) * MAX_DISCOVERY_PATHS))
+    })));
+    const planHash = sha2562(canonicalJson({ seedPaths, pageFingerprints, pageCount }));
+    const exclusionFingerprint = excludedPaths.length ? sha2562(canonicalJson(excludedPaths)) : null;
     let record = null;
     let observedRevision = null;
     try {
@@ -17192,22 +17477,30 @@ class RepositoryAgentWorker {
       this.logger.warn(`[RepositoryAgent] evidence coverage read skipped: ${String(error)}`);
     }
     const value = record?.value;
-    const valid = record?.status === "active" && !isExpiredMemoryRecord(record) && record.kind === COVERAGE_KIND && isRecord2(value) && value.schemaVersion === 1 && value.analysisKey === analysisKey && value.planHash === planHash && typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage >= 0 && value.nextPage <= pageCount;
-    const nextPage = valid ? value.nextPage : 0;
-    const page = Math.min(nextPage, pageCount - 1);
+    const valid = record?.status === "active" && !isExpiredMemoryRecord(record) && record.kind === COVERAGE_KIND && isRecord2(value) && value.schemaVersion === 2 && value.discoveryKey === discoveryKey && typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage >= 0 && value.nextPage <= MAX_AUTONOMY_DISCOVERY_PAGES && Array.isArray(value.reviewedPageFingerprints) && value.reviewedPageFingerprints.length <= MAX_REVIEWED_PAGE_FINGERPRINTS && value.reviewedPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry)) && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length <= MAX_AUTONOMY_DISCOVERY_PAGES && value.deferredPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry));
+    const reviewedPageFingerprints = valid ? value.reviewedPageFingerprints : [];
+    const deferredPageFingerprints = valid && exclusionFingerprint != null && value.exclusionFingerprint === exclusionFingerprint ? value.deferredPageFingerprints : [];
+    const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
+    const nextPage = pageFingerprints.findIndex((fingerprint) => !visited.has(fingerprint));
+    const page = nextPage < 0 ? pageCount - 1 : nextPage;
     return {
       key,
       analysisKey,
+      discoveryKey,
       planHash,
+      pageFingerprints,
+      reviewedPageFingerprints,
+      exclusionFingerprint,
+      deferredPageFingerprints,
       observedRevision,
       page,
       pageCount,
       rankedPathCount: rankedPaths.length,
       selectedPaths: rankedPaths.slice(page * MAX_DISCOVERY_PATHS, (page + 1) * MAX_DISCOVERY_PATHS),
-      boundedCoverageExhausted: nextPage >= pageCount
+      boundedCoverageExhausted: nextPage < 0
     };
   }
-  logEvidenceCoverage(requestId, coverage, cacheHit, advanced) {
+  logEvidenceCoverage(requestId, coverage, cacheHit, advanced, boundedCoverageExhausted) {
     this.logger.log(`[RepositoryAgent] evidenceCoverage=${JSON.stringify({
       requestId,
       page: coverage.page + 1,
@@ -17216,32 +17509,42 @@ class RepositoryAgentWorker {
       rankedPathCount: coverage.rankedPathCount,
       selectedPathCount: coverage.selectedPaths.length,
       additionalPathsCapped: coverage.rankedPathCount > coverage.pageCount * MAX_DISCOVERY_PATHS,
-      boundedCoverageExhausted: coverage.boundedCoverageExhausted || advanced && coverage.page + 1 >= coverage.pageCount,
+      boundedCoverageExhausted,
       repositoryExhaustivenessEstablished: false,
       cacheHit,
       advanced
     })}`);
   }
-  async advanceEvidenceCoverage(request, coverage, result, successfulSynthesis, signal, deadlineMs) {
+  async advanceEvidenceCoverage(request, coverage, result, successfulSynthesis, signal, deadlineMs, excludedCandidateCount, allCandidatesExcluded) {
     if (!coverage)
-      return false;
+      return { attempted: false };
     let advanced = false;
     let attempted = false;
-    if (successfulSynthesis && isGroundedEmptyAutonomyResult(result) && request.freshness !== "cache_only" && !request.repository.dirty && !coverage.boundedCoverageExhausted && coverage.observedRevision != null) {
+    let exhausted = coverage.boundedCoverageExhausted;
+    if (successfulSynthesis && (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded) && request.freshness !== "cache_only" && !request.repository.dirty && !coverage.boundedCoverageExhausted && coverage.observedRevision != null) {
       throwIfAborted(signal);
       attempted = true;
       try {
+        const fingerprint = coverage.pageFingerprints[coverage.page];
+        const reviewedPageFingerprints = allCandidatesExcluded ? coverage.reviewedPageFingerprints : [...new Set([...coverage.reviewedPageFingerprints, fingerprint])].slice(-MAX_REVIEWED_PAGE_FINGERPRINTS);
+        const deferredPageFingerprints = allCandidatesExcluded ? [...new Set([...coverage.deferredPageFingerprints, fingerprint])].slice(-MAX_AUTONOMY_DISCOVERY_PAGES) : coverage.deferredPageFingerprints;
+        const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
+        const nextPage = coverage.pageFingerprints.findIndex((entry) => !visited.has(entry));
         await this.memoryPutWithinDeadline("evidence coverage advance", signal, this.memoryStageDeadline(deadlineMs - MIN_FINALIZATION_RESERVE_MS), {
           scope: cacheScope(request),
           key: coverage.key,
           kind: COVERAGE_KIND,
           subjectKey: request.purpose,
-          summary: "Bounded autonomous evidence coverage; not repository-wide exhaustion",
+          summary: "Blob-scoped bounded discovery history; not reusable candidate facts or repository-wide exhaustion",
           value: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             analysisKey: coverage.analysisKey,
+            discoveryKey: coverage.discoveryKey,
             planHash: coverage.planHash,
-            nextPage: coverage.page + 1,
+            reviewedPageFingerprints,
+            exclusionFingerprint: coverage.exclusionFingerprint,
+            deferredPageFingerprints,
+            nextPage: nextPage < 0 ? coverage.pageCount : nextPage,
             pageCount: coverage.pageCount
           },
           status: "active",
@@ -17257,13 +17560,36 @@ class RepositoryAgentWorker {
           ttlMs: this.cacheTtlMs
         }, { expectedRevision: coverage.observedRevision });
         advanced = true;
+        exhausted = nextPage < 0;
       } catch (error) {
         throwIfAborted(signal);
         this.logger.warn(`[RepositoryAgent] evidence coverage advance skipped: ${String(error)}`);
       }
     }
-    this.logEvidenceCoverage(result.requestId, coverage, result.cache.hit, advanced);
-    return attempted;
+    this.logEvidenceCoverage(result.requestId, coverage, result.cache.hit, advanced, exhausted);
+    return {
+      attempted,
+      progress: {
+        page: coverage.page + 1,
+        pageCount: coverage.pageCount,
+        advanced,
+        boundedCoverageExhausted: exhausted,
+        retryEligible: advanced && !exhausted && (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded),
+        excludedCandidateCount
+      }
+    };
+  }
+  async finalizeDiscoveryDelivery(result, request, coverage, excludedPaths, successfulSynthesis, repoRoot, signal, deadlineMs) {
+    const delivery = filterDiscoveryDelivery(result, excludedPaths);
+    const allCandidatesExcluded = delivery.excludedCandidateCount > 0 && isRecord2(delivery.result.data) && Array.isArray(delivery.result.data.candidates) && delivery.result.data.candidates.length === 0;
+    const update = await this.advanceEvidenceCoverage(request, coverage, result, successfulSynthesis, signal, deadlineMs, delivery.excludedCandidateCount, allCandidatesExcluded);
+    if (update.attempted)
+      await this.assertCurrentSnapshot(repoRoot, request, signal, deadlineMs);
+    throwIfAborted(signal);
+    return {
+      ...delivery.result,
+      ...update.progress ? { discoveryProgress: update.progress } : {}
+    };
   }
   compactSynthesisContext(request) {
     return autonomyVisionFingerprint(request) == null ? request.context ?? {} : normalizedStructuralContext(request);
@@ -17356,7 +17682,8 @@ class RepositoryAgentWorker {
   }
   async generateResult(requestId, request, repoRoot, tracked, advisoryMemory, signal, deadlineMs, coverage = null) {
     throwIfAborted(signal);
-    const seedPacket = await buildSeedEvidencePacket(repoRoot, request, tracked, request.question, request.context, signal);
+    const retrievalRequest = coverage ? discoveryRetrievalRequest(request) : request;
+    const seedPacket = await buildSeedEvidencePacket(repoRoot, retrievalRequest, tracked, retrievalRequest.question, retrievalRequest.context, signal);
     throwIfAborted(signal);
     const selectedPaths = coverage?.selectedPaths ?? rankedAdditionalPaths(request, tracked, seedPacket.seedPaths).slice(0, MAX_DISCOVERY_PATHS);
     const evidencePacket = await extendEvidencePacket(repoRoot, request, seedPacket, selectedPaths, signal);
@@ -17636,6 +17963,7 @@ class RepositoryAgentWorker {
     this.activeAnalyses.add(controller);
     try {
       throwIfAborted(controller.signal);
+      const excludedPaths = discoveryExclusionPaths(request);
       if (autonomyVisionFingerprint(request) != null) {
         request = {
           ...request,
@@ -17659,18 +17987,13 @@ class RepositoryAgentWorker {
       const analysisKey = cacheKey(request, this.modelId, this.promptVersion);
       const allowExactCache = !request.repository.dirty && request.freshness !== "fresh_required";
       const preSynthesisMemoryDeadlineMs = Math.min(deadlineMs, Math.max(Date.now() + 1, deadlineMs - this.finalizationReserveFor(deadlineMs) - MIN_SYNTHESIS_START_BUDGET_MS));
-      const coverage = await this.readEvidenceCoverage(request, tracked, analysisKey, controller.signal, preSynthesisMemoryDeadlineMs);
+      const coverage = await this.readEvidenceCoverage(request, tracked, analysisKey, controller.signal, preSynthesisMemoryDeadlineMs, excludedPaths);
       const key = coverage ? sha2562(`${analysisKey}:coverage:${coverage.planHash}:${coverage.page}`) : analysisKey;
       if (allowExactCache) {
         const cached = await this.cachedResult(requestId, request, key, exactRepoRoot, tracked, controller.signal, preSynthesisMemoryDeadlineMs);
         if (cached) {
           await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-          const coverageWriteAttempted2 = await this.advanceEvidenceCoverage(request, coverage, cached, true, controller.signal, deadlineMs);
-          if (coverageWriteAttempted2) {
-            await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-          }
-          throwIfAborted(controller.signal);
-          return cached;
+          return await this.finalizeDiscoveryDelivery(cached, request, coverage, excludedPaths, true, exactRepoRoot, controller.signal, deadlineMs);
         }
       }
       if (request.freshness === "cache_only") {
@@ -17686,12 +18009,7 @@ class RepositoryAgentWorker {
       const learned = await this.storeResultMemory(request, key, generated.result, allowExactCache && generated.cacheable, generated.inferenceModelId, controller.signal, deadlineMs);
       throwIfAborted(controller.signal);
       await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-      const coverageWriteAttempted = await this.advanceEvidenceCoverage(request, coverage, learned, generated.cacheable, controller.signal, deadlineMs);
-      if (coverageWriteAttempted) {
-        await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-      }
-      throwIfAborted(controller.signal);
-      return learned;
+      return await this.finalizeDiscoveryDelivery(learned, request, coverage, excludedPaths, generated.cacheable, exactRepoRoot, controller.signal, deadlineMs);
     } finally {
       clearTimeout(deadlineTimer);
       upstreamSignal?.removeEventListener("abort", abortFromUpstream);

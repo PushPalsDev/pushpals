@@ -245,6 +245,8 @@ type SnapshotOpenObjective = {
 };
 
 type WorkerLoadSnapshot = {
+  /** Only complete raw capacity/publication telemetry may authorize faster discovery. */
+  discoveryCapacityVerified?: boolean;
   autonomyAdmission?: { allowed: boolean; code?: string; retryAfterMs?: number };
   workers: {
     total: number;
@@ -280,6 +282,33 @@ type IdeationTimeoutRecovery = {
   timeoutMs: number;
 };
 
+type AutonomyDiscoveryProgress = {
+  page: number;
+  pageCount: number;
+  advanced: boolean;
+  boundedCoverageExhausted: boolean;
+  retryEligible: boolean;
+  excludedCandidateCount: number;
+};
+
+function autonomyDiscoveryProgress(value: unknown): AutonomyDiscoveryProgress | null {
+  const row = asObject(value);
+  if (
+    !Number.isInteger(row.page) ||
+    !Number.isInteger(row.pageCount) ||
+    Number(row.page) < 1 ||
+    Number(row.pageCount) > 16 ||
+    Number(row.page) > Number(row.pageCount) ||
+    typeof row.advanced !== "boolean" ||
+    typeof row.boundedCoverageExhausted !== "boolean" ||
+    typeof row.retryEligible !== "boolean" ||
+    !Number.isInteger(row.excludedCandidateCount) ||
+    Number(row.excludedCandidateCount) < 0
+  )
+    return null;
+  return row as AutonomyDiscoveryProgress;
+}
+
 const IDEATION_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_ideation_system_prompt.md",
 ).trim();
@@ -298,6 +327,8 @@ const IDEATION_RETRY_MAX_TOKENS = 900;
 const IDEATION_NORMAL_MAX_CANDIDATES = 5;
 const STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 const STARTUP_FAST_TICK_MAX_DELAY_MS = 15_000;
+const DISCOVERY_FOLLOWUP_DELAY_MS = 30_000;
+const DISCOVERY_FOLLOWUP_MAX_ATTEMPTS = 16;
 const STARTUP_STALE_LOCK_AFTER_MS = 30_000;
 const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_SECTION_CHARS = 1_200;
@@ -6381,9 +6412,16 @@ export class RemoteBuddyAutonomousEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private startupGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupFastTickTimer: ReturnType<typeof setTimeout> | null = null;
+  private discoveryFollowupTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
   private nextTickAtMs = 0;
+  private baselineNextTickAtMs = 0;
+  private startupGraceAtMs = 0;
+  private startupFastTickAtMs = 0;
+  private discoveryFollowupAtMs = 0;
+  private schedulingGeneration = 0;
+  private discoveryFollowupAttemptsRemaining = 0;
   private startupFastTickAttemptsRemaining = 0;
   private currentRunId: string | null = null;
   private currentPhase = "idle";
@@ -6448,6 +6486,7 @@ export class RemoteBuddyAutonomousEngine {
     const wasEnabled = this.runtimeEnabled;
     this.runtimeEnabled = Boolean(enabled);
     if (!this.runtimeEnabled) {
+      this.schedulingGeneration += 1;
       this.activeCycle?.controller.abort(
         new Error("Autonomy cycle cancelled because autonomy was disabled"),
       );
@@ -6455,9 +6494,12 @@ export class RemoteBuddyAutonomousEngine {
         new Error("RepositoryAgent ideation cancelled because autonomy was disabled"),
       );
       this.nextTickAtMs = 0;
+      this.baselineNextTickAtMs = 0;
+      this.discoveryFollowupAttemptsRemaining = 0;
       this.startupFastTickAttemptsRemaining = 0;
       this.clearStartupGraceTimer();
       this.clearStartupFastTickTimer();
+      this.clearDiscoveryFollowupTimer();
       if (this.timer) {
         clearInterval(this.timer);
         this.timer = null;
@@ -6511,7 +6553,10 @@ export class RemoteBuddyAutonomousEngine {
     }
 
     const hasScheduledTick = Boolean(
-      this.timer || this.startupGraceTimer || this.startupFastTickTimer,
+      this.timer ||
+      this.startupGraceTimer ||
+      this.startupFastTickTimer ||
+      this.discoveryFollowupTimer,
     );
     const nextTickInMs =
       hasScheduledTick && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
@@ -6591,6 +6636,8 @@ export class RemoteBuddyAutonomousEngine {
       clearTimeout(this.startupGraceTimer);
       this.startupGraceTimer = null;
     }
+    this.startupGraceAtMs = 0;
+    this.refreshNextTickAt();
   }
 
   private clearStartupFastTickTimer(): void {
@@ -6598,6 +6645,69 @@ export class RemoteBuddyAutonomousEngine {
       clearTimeout(this.startupFastTickTimer);
       this.startupFastTickTimer = null;
     }
+    this.startupFastTickAtMs = 0;
+    this.refreshNextTickAt();
+  }
+
+  private refreshNextTickAt(): void {
+    const times = [
+      this.timer ? this.baselineNextTickAtMs : 0,
+      this.startupGraceTimer ? this.startupGraceAtMs : 0,
+      this.startupFastTickTimer ? this.startupFastTickAtMs : 0,
+      this.discoveryFollowupTimer ? this.discoveryFollowupAtMs : 0,
+    ].filter((time) => time > 0);
+    this.nextTickAtMs = times.length ? Math.min(...times) : 0;
+  }
+
+  private clearDiscoveryFollowupTimer(): void {
+    if (this.discoveryFollowupTimer) clearTimeout(this.discoveryFollowupTimer);
+    this.discoveryFollowupTimer = null;
+    this.discoveryFollowupAtMs = 0;
+    this.refreshNextTickAt();
+  }
+
+  private scheduleDiscoveryFollowup(progress: AutonomyDiscoveryProgress, generation: number): void {
+    if (
+      generation !== this.schedulingGeneration ||
+      this.stopped ||
+      !this.runtimeEnabled ||
+      !this.startRequested ||
+      !this.timer ||
+      this.inFlight ||
+      this.cfg.killSwitchEnabled ||
+      this.discoveryFollowupTimer ||
+      this.discoveryFollowupAttemptsRemaining <= 0 ||
+      Date.now() < this.dispatchBackoffUntilMs ||
+      !progress.retryEligible ||
+      !progress.advanced ||
+      progress.boundedCoverageExhausted ||
+      progress.page >= progress.pageCount
+    )
+      return;
+    const dueAt = Date.now() + DISCOVERY_FOLLOWUP_DELAY_MS;
+    // The regular interval already supplies an earlier/equal opportunity.
+    if (this.baselineNextTickAtMs <= dueAt) return;
+    this.discoveryFollowupAttemptsRemaining -= 1;
+    this.discoveryFollowupAtMs = dueAt;
+    const timer = setTimeout(() => {
+      if (this.discoveryFollowupTimer !== timer || generation !== this.schedulingGeneration) return;
+      this.clearDiscoveryFollowupTimer();
+      if (this.stopped || !this.runtimeEnabled || !this.timer) return;
+      void this.tick(true, generation);
+    }, DISCOVERY_FOLLOWUP_DELAY_MS);
+    this.discoveryFollowupTimer = timer;
+    this.refreshNextTickAt();
+    console.log(
+      `[RemoteBuddyAutonomousEngine] discoveryFollowup=${JSON.stringify({
+        event: "scheduled",
+        delayMs: DISCOVERY_FOLLOWUP_DELAY_MS,
+        page: progress.page,
+        pageCount: progress.pageCount,
+        advanced: progress.advanced,
+        excludedCandidateCount: progress.excludedCandidateCount,
+        remaining: this.discoveryFollowupAttemptsRemaining,
+      })}`,
+    );
   }
 
   private scheduleStartupFastTick(reason: string): void {
@@ -6605,16 +6715,21 @@ export class RemoteBuddyAutonomousEngine {
     if (this.startupFastTickAttemptsRemaining <= 0) return;
     const delayMs = this.startupFastTickDelayMs();
     this.startupFastTickAttemptsRemaining -= 1;
-    this.nextTickAtMs = Date.now() + delayMs;
+    this.startupFastTickAtMs = Date.now() + delayMs;
+    const generation = this.schedulingGeneration;
     console.log(
       `[RemoteBuddyAutonomousEngine] startup fast tick scheduled in ${delayMs}ms after ${reason} (remaining=${this.startupFastTickAttemptsRemaining}).`,
     );
-    this.startupFastTickTimer = setTimeout(() => {
+    const timer = setTimeout(() => {
+      if (this.startupFastTickTimer !== timer || generation !== this.schedulingGeneration) return;
       this.startupFastTickTimer = null;
-      if (!this.runtimeEnabled || !this.timer) return;
-      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+      this.startupFastTickAtMs = 0;
+      this.refreshNextTickAt();
+      if (this.stopped || !this.runtimeEnabled || !this.timer) return;
       void this.tick();
     }, delayMs);
+    this.startupFastTickTimer = timer;
+    this.refreshNextTickAt();
   }
 
   private cycleBudgetMs(): number {
@@ -6850,7 +6965,22 @@ export class RemoteBuddyAutonomousEngine {
         autonomyAdmission?: WorkerLoadSnapshot["autonomyAdmission"];
       };
       if (!data.ok || !data.workers || !data.jobs) return null;
+      const publication = asObject(data.publication);
       return {
+        discoveryCapacityVerified:
+          [
+            data.workers.online,
+            data.workers.idle,
+            data.workers.busy,
+            data.jobs.pending,
+            data.jobs.autoscalablePending,
+            publication.backlog,
+            publication.oldestPendingAgeMs,
+            publication.oldestFinalizingAgeMs,
+            publication.expiredClaims,
+          ].every((value) => typeof value === "number" && Number.isInteger(value) && value >= 0) &&
+          typeof publication.unhealthy === "boolean" &&
+          typeof data.autonomyAdmission?.allowed === "boolean",
         ...(typeof data.autonomyAdmission?.allowed === "boolean"
           ? { autonomyAdmission: data.autonomyAdmission }
           : {}),
@@ -6916,6 +7046,35 @@ export class RemoteBuddyAutonomousEngine {
       return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
     }
     return null;
+  }
+
+  private hasIdleDiscoveryCapacity(snapshot: WorkerLoadSnapshot | null): boolean {
+    if (!snapshot || snapshot.discoveryCapacityVerified !== true) return false;
+    const { online, idle, busy } = snapshot.workers;
+    const { pending, autoscalablePending } = snapshot.jobs;
+    return (
+      [online, idle, busy, pending, autoscalablePending].every(
+        (value) => typeof value === "number" && Number.isInteger(value) && value >= 0,
+      ) &&
+      online > 0 &&
+      idle > 0 &&
+      idle + busy <= online &&
+      pending === 0 &&
+      autoscalablePending === 0 &&
+      snapshot.publication.expiredClaims === 0 &&
+      this.deferReasonForWorkerLoad(snapshot) === null
+    );
+  }
+
+  private discoveryBudgetDeferReason(snapshot: Snapshot): string | null {
+    if (snapshot.dispatch_budget.global_count_last_hour >= this.cfg.maxDispatchPerHour)
+      return "discovery_followup_global_dispatch_budget";
+    const active = snapshot.open_objectives.filter((objective) =>
+      ["proposed", "gated", "dispatched", "running", "blocked", "needs_clarification"].includes(
+        objective.status,
+      ),
+    ).length;
+    return active >= this.cfg.maxConcurrentObjectives ? "discovery_followup_max_concurrent" : null;
   }
 
   private async fetchInspirationPatterns(limit = 60): Promise<unknown[]> {
@@ -7245,6 +7404,7 @@ export class RemoteBuddyAutonomousEngine {
     json: Record<string, unknown>;
     llmCall: Record<string, unknown>;
     result: RepositoryAgentResult | null;
+    discoveryProgress: AutonomyDiscoveryProgress | null;
   } | null> {
     if (!this.repositoryAgent) return null;
     const startedAt = Date.now();
@@ -7264,13 +7424,14 @@ export class RemoteBuddyAutonomousEngine {
       return {
         json: response,
         result: null,
+        discoveryProgress: null,
         llmCall: {
           id: randomUUID(),
           runId: params.runId,
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v8-admission-aware",
+          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7395,6 +7556,30 @@ export class RemoteBuddyAutonomousEngine {
             "Return data.candidates=[] when evidence does not establish unfinished, actionable work. A desired outcome or matching filename alone is not evidence of a defect.",
           ],
         },
+        discoveryExclusions: {
+          // These are transient scheduling hints, not structural cache inputs.
+          // Never broaden an objective's exact targets into its write globs.
+          targetPaths: [
+            ...new Set(
+              [
+                ...params.snapshot.open_objectives.filter((objective) =>
+                  isActiveWorkDiversityStatus(objective.status),
+                ),
+                ...(params.snapshot.recent_objectives ?? []).filter((objective) =>
+                  isRecentWorkDiversityObjective(objective),
+                ),
+              ]
+                .flatMap((objective) => [
+                  ...asStringArray(objective.target_paths),
+                  ...asStringArray(objective.scope?.target_paths),
+                  ...asStringArray(objective.scope?.targetPaths),
+                ])
+                .filter((path) => !/[*?\[\]{}!]/.test(path))
+                .map(normalizeValidationTargetPath)
+                .filter(Boolean),
+            ),
+          ].slice(0, 128),
+        },
         runtimeSignals: {
           executedOutcomeWatermark: params.snapshot.executed_outcome_watermark ?? null,
           topSignals: params.snapshot.top_signals.slice(0, 5),
@@ -7453,6 +7638,15 @@ export class RemoteBuddyAutonomousEngine {
       }
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const discoveryProgress = Array.isArray(data.candidates)
+        ? autonomyDiscoveryProgress(
+            (result as RepositoryAgentResult & { discoveryProgress?: unknown }).discoveryProgress,
+          )
+        : null;
+      if (discoveryProgress)
+        console.log(
+          `[RemoteBuddyAutonomousEngine] repositoryDiscoveryProgress=${JSON.stringify({ runId: params.runId, ...discoveryProgress })}`,
+        );
       if (candidates.length === 0) {
         console.warn(
           `[RemoteBuddyAutonomousEngine] RepositoryAgent returned no grounded candidates for ${params.runId}; recording an empty planning cycle without inventing implementation work.`,
@@ -7468,13 +7662,14 @@ export class RemoteBuddyAutonomousEngine {
         // Evidence/memory from an empty RepositoryAgent answer must not be
         // attributed to a candidate synthesized by deterministic fallback.
         result: candidates.length > 0 ? result : null,
+        discoveryProgress,
         llmCall: {
           id: randomUUID(),
           runId: params.runId,
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v8-admission-aware",
+          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -8429,8 +8624,12 @@ export class RemoteBuddyAutonomousEngine {
     };
   }
 
-  async tick(): Promise<void> {
+  async tick(discoveryFollowup = false, generation = this.schedulingGeneration): Promise<void> {
+    if (generation !== this.schedulingGeneration) return;
     if (this.stopped || !this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
+    // Any actual tick consumes a pending followup; an interval/manual tick must
+    // not leave behind a second callback for the same discovery opportunity.
+    this.clearDiscoveryFollowupTimer();
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const cycleController = new AbortController();
@@ -8440,6 +8639,8 @@ export class RemoteBuddyAutonomousEngine {
     let lockAcquired = false;
     let outcome: "success" | "skipped" | "failed" = "skipped";
     let outcomeDetail = "not_dispatched";
+    let idleDiscoveryCapacity = false;
+    let followupProgress: AutonomyDiscoveryProgress | null = null;
     try {
       if (Date.now() < this.dispatchBackoffUntilMs) {
         this.setPhase("dispatch_backoff");
@@ -8516,9 +8717,23 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "resource_budget_runtime_exhausted";
         return;
       }
+      if (discoveryFollowup) {
+        const budgetReason = this.discoveryBudgetDeferReason(snapshot);
+        if (budgetReason) {
+          outcomeDetail = budgetReason;
+          return;
+        }
+      }
 
       this.setPhase("check_worker_load");
       const workerLoad = await this.fetchWorkerLoadSnapshot();
+      idleDiscoveryCapacity = this.hasIdleDiscoveryCapacity(workerLoad);
+      if (discoveryFollowup && !idleDiscoveryCapacity) {
+        outcomeDetail = workerLoad
+          ? (this.deferReasonForWorkerLoad(workerLoad) ?? "discovery_followup_no_idle_capacity")
+          : "discovery_followup_capacity_unavailable";
+        return;
+      }
       const workerLoadDeferReason = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) : null;
       if (workerLoad && workerLoadDeferReason) {
         console.log(
@@ -9241,13 +9456,16 @@ export class RemoteBuddyAutonomousEngine {
           `[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=${normalizedCandidates.length} distinct=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`,
         );
         this.setPhase("record_no_candidate_objective");
-        await this.postObjective({
+        const recorded = await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
           sessionId: this.sessionId,
           candidates: candidatesPayload,
           llmCalls,
         });
+        if (recorded && rawCandidates.length === 0 && !this.discoveryBudgetDeferReason(snapshot)) {
+          followupProgress = repositoryAgentPhase?.discoveryProgress ?? null;
+        }
         outcomeDetail = "no_eligible_candidates";
         return;
       }
@@ -9929,8 +10147,15 @@ export class RemoteBuddyAutonomousEngine {
       }
       this.inFlight = false;
       this.markTickDone(outcome, outcomeDetail);
-      if (!lockAcquired && outcomeDetail.startsWith("lock_not_acquired")) {
+      if (
+        generation === this.schedulingGeneration &&
+        !lockAcquired &&
+        outcomeDetail.startsWith("lock_not_acquired")
+      ) {
         this.scheduleStartupFastTick("dispatch lock contention");
+      }
+      if (outcome === "skipped" && idleDiscoveryCapacity && followupProgress) {
+        this.scheduleDiscoveryFollowup(followupProgress, generation);
       }
     }
   }
@@ -9980,41 +10205,63 @@ export class RemoteBuddyAutonomousEngine {
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
+    const generation = ++this.schedulingGeneration;
     this.startupFastTickAttemptsRemaining = STARTUP_FAST_TICK_MAX_ATTEMPTS;
+    this.discoveryFollowupAttemptsRemaining = DISCOVERY_FOLLOWUP_MAX_ATTEMPTS;
     const startInterval = () => {
-      if (this.timer) return;
-      this.timer = setInterval(() => {
-        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-        void this.tick();
+      if (
+        this.timer ||
+        generation !== this.schedulingGeneration ||
+        this.stopped ||
+        !this.runtimeEnabled
+      )
+        return;
+      this.baselineNextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+      const interval = setInterval(() => {
+        if (this.timer !== interval || generation !== this.schedulingGeneration) return;
+        this.baselineNextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        this.discoveryFollowupAttemptsRemaining = DISCOVERY_FOLLOWUP_MAX_ATTEMPTS;
+        this.clearDiscoveryFollowupTimer();
+        this.clearStartupFastTickTimer();
+        this.refreshNextTickAt();
+        void this.tick(false, generation);
       }, this.cfg.tickIntervalMs);
+      this.timer = interval;
+      this.refreshNextTickAt();
     };
     const firstTickDelayMs = this.startupGraceMs();
-    this.nextTickAtMs = Date.now() + firstTickDelayMs;
     this.heartbeatTimer = setInterval(() => {
+      if (generation !== this.schedulingGeneration) return;
       this.logHeartbeat();
     }, this.cfg.heartbeatLogMs);
-    this.logHeartbeat();
     if (firstTickDelayMs > 0) {
       console.log(
         `[RemoteBuddyAutonomousEngine] startup autonomy tick delayed by ${firstTickDelayMs}ms to leave cold-start capacity available for user work.`,
       );
-      this.startupGraceTimer = setTimeout(() => {
+      this.startupGraceAtMs = Date.now() + firstTickDelayMs;
+      const timer = setTimeout(() => {
+        if (this.startupGraceTimer !== timer || generation !== this.schedulingGeneration) return;
         this.startupGraceTimer = null;
-        if (!this.runtimeEnabled) return;
+        this.startupGraceAtMs = 0;
+        if (this.stopped || !this.runtimeEnabled) return;
         startInterval();
-        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-        void this.tick();
+        this.refreshNextTickAt();
+        void this.tick(false, generation);
       }, firstTickDelayMs);
+      this.startupGraceTimer = timer;
+      this.refreshNextTickAt();
+      this.logHeartbeat();
       return;
     }
     startInterval();
-    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-    void this.tick();
+    this.logHeartbeat();
+    void this.tick(false, generation);
   }
 
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.schedulingGeneration += 1;
     this.startRequested = false;
     this.runtimeEnabled = false;
     this.activeCycle?.controller.abort(
@@ -10025,6 +10272,7 @@ export class RemoteBuddyAutonomousEngine {
     );
     this.clearStartupGraceTimer();
     this.clearStartupFastTickTimer();
+    this.clearDiscoveryFollowupTimer();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -10034,6 +10282,8 @@ export class RemoteBuddyAutonomousEngine {
       this.heartbeatTimer = null;
     }
     this.startupFastTickAttemptsRemaining = 0;
+    this.discoveryFollowupAttemptsRemaining = 0;
+    this.baselineNextTickAtMs = 0;
     this.nextTickAtMs = 0;
   }
 }

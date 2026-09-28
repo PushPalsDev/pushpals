@@ -2024,6 +2024,49 @@ describe("workerpals validation command safety", () => {
     }
   });
 
+  test("keeps known Docker-dependent fast scripts out of parallel batches in socketless workers", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-parallel-deferral-"));
+    try {
+      mkdirSync(join(root, "scripts"));
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: {
+            lint: "docker run --rm lint-fixture",
+            typecheck: "bun run check:container",
+            "check:container": "node scripts/container-check.js",
+            "test:unit": "bun run check:container",
+            test: "bun test",
+          },
+        }),
+      );
+      writeFileSync(
+        join(root, "scripts", "container-check.js"),
+        'spawnSync("docker", ["run", "--rm", "check-fixture"]);\n',
+      );
+      const socketless = { PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable" };
+      const available = { PUSHPALS_WORKER_DOCKER_CAPABILITY: "available" };
+      for (const command of ["bun run lint", "bun run typecheck", "bun run test:unit"]) {
+        expect(validationCommandRequiresDockerDaemon(root, command)).toBe(true);
+        expect(isParallelSafeFastValidationCommand(root, command, socketless)).toBe(false);
+        expect(trustedEnvironmentValidationDeferralReason(root, command, socketless)).toContain(
+          "Run this command on the trusted host",
+        );
+        expect(isParallelSafeFastValidationCommand(root, command, available)).toBe(true);
+        expect(isParallelSafeFastValidationCommand(root, command, {})).toBe(true);
+      }
+      for (const command of [
+        "bun test ./tests/focused.test.ts",
+        "bun run test",
+        "bun x tsc --noEmit",
+      ]) {
+        expect(isParallelSafeFastValidationCommand(root, command, socketless)).toBe(true);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("infers Playwright channel installs from repo browser smoke scripts", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-channel-"));
     const scriptsDir = join(root, "scripts");

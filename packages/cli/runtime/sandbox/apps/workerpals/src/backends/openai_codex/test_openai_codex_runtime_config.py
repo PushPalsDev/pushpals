@@ -700,6 +700,43 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertNotIn("roughly 20 minutes", guidance)
             self.assertNotIn("discovery <=5m", guidance)
 
+    def test_initial_guidance_keeps_focused_checks_and_required_gates_with_known_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-initial-validation-guidance-") as temp_dir:
+            params = {
+                "instruction": "Correct the catalog label and its nearby regression test",
+                "planning": {
+                    "validationSteps": ["bun test tests/catalog.test.ts"],
+                    "requiredValidationSteps": ["bun run validate", "bun run deployment:check"],
+                },
+            }
+            payload = {"kind": "task.execute", "repo": temp_dir, "params": params}
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+            for capability in ("unavailable", "available", ""):
+                with self.subTest(capability=capability), mock.patch.dict(
+                    os.environ, {"PUSHPALS_WORKER_DOCKER_CAPABILITY": capability}, clear=False
+                ):
+                    task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+                    guidance = "\n".join(task.supplemental_guidance)
+                    prompt = _build_instruction(task.instruction, task.supplemental_guidance)
+                    self.assertIn("discover and run the focused checks needed", guidance)
+                    self.assertIn("Do not run the whole test suite or long aggregate validation", guidance)
+                    self.assertIn("PushPals ValidationGate runs those required gates after this turn", guidance)
+                    self.assertIn("smallest necessary reproduction once", guidance)
+                    self.assertIn("bun test tests/catalog.test.ts", prompt)
+                    self.assertIn("bun run validate", prompt)
+                    self.assertIn("bun run deployment:check", prompt)
+                    self.assertEqual(task.params["planning"], params["planning"])
+                    self.assertIn("Deferral is not a pass", prompt)
+                    self.assertIn("trusted host must validate the exact candidate SHA before publication", prompt)
+                    if capability == "unavailable":
+                        self.assertIn("Known worker capability: this sandbox intentionally has no Docker daemon/socket", guidance)
+                        self.assertIn("Do not run or retry validation commands known to require it", guidance)
+                        self.assertIn("Continue with runnable focused checks", guidance)
+                        self.assertIn("deferral is not a pass", guidance)
+                        self.assertIn("Do not alter tests or product code to bypass", guidance)
+                    else:
+                        self.assertNotIn("Known worker capability:", guidance)
+
     def test_parse_payload_accepts_file_backed_payload_transport(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-payload-file-") as temp_dir:
             repo = Path(temp_dir) / "repo"

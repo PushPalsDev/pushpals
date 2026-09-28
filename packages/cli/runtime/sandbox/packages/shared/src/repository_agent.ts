@@ -148,6 +148,16 @@ export interface RepositoryAgentMemoryRef {
   sourceRevision?: string;
 }
 
+/** Host-computed discovery progress, never model output or structural cache facts. */
+export interface RepositoryAgentDiscoveryProgress {
+  page: number;
+  pageCount: number;
+  advanced: boolean;
+  boundedCoverageExhausted: boolean;
+  retryEligible: boolean;
+  excludedCandidateCount: number;
+}
+
 export interface RepositoryAgentResult {
   schemaVersion: typeof REPOSITORY_AGENT_SCHEMA_VERSION;
   requestId: string;
@@ -162,6 +172,7 @@ export interface RepositoryAgentResult {
   validationProposals: RepositoryAgentValidationProposal[];
   cache: RepositoryAgentCacheMetadata;
   memoryRefs: RepositoryAgentMemoryRef[];
+  discoveryProgress?: RepositoryAgentDiscoveryProgress;
   completedAt: string;
 }
 
@@ -922,6 +933,34 @@ function sanitizeMemoryRef(value: unknown): RepositoryAgentMemoryRef | null {
   };
 }
 
+function sanitizeDiscoveryProgress(value: unknown): RepositoryAgentDiscoveryProgress | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) invalidResponse("result.discoveryProgress must be an object");
+  const integer = (key: string, min: number, max: number): number => {
+    const raw = value[key];
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max)
+      invalidResponse(`result.discoveryProgress.${key} is invalid`);
+    return raw;
+  };
+  const pageCount = integer("pageCount", 1, 16);
+  const page = integer("page", 1, pageCount);
+  for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
+    if (typeof value[key] !== "boolean")
+      invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  return {
+    page,
+    pageCount,
+    advanced: value.advanced === true,
+    boundedCoverageExhausted: value.boundedCoverageExhausted === true,
+    retryEligible:
+      value.retryEligible === true &&
+      value.advanced === true &&
+      value.boundedCoverageExhausted === false &&
+      page < pageCount,
+    excludedCandidateCount: integer("excludedCandidateCount", 0, 64),
+  };
+}
+
 export function sanitizeRepositoryAgentResult(
   value: unknown,
   expectedRequestId?: string,
@@ -968,6 +1007,13 @@ export function sanitizeRepositoryAgentResult(
     value.data === undefined
       ? undefined
       : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  const discoveryProgress = sanitizeDiscoveryProgress(value.discoveryProgress);
+  if (
+    discoveryProgress &&
+    (!isRecord(data) || !Array.isArray(data.candidates) || data.candidates.length > 0)
+  ) {
+    discoveryProgress.retryEligible = false;
+  }
   return {
     schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
     requestId,
@@ -1012,6 +1058,7 @@ export function sanitizeRepositoryAgentResult(
       .slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems)
       .map(sanitizeMemoryRef)
       .filter((entry): entry is RepositoryAgentMemoryRef => Boolean(entry)),
+    ...(discoveryProgress ? { discoveryProgress } : {}),
     completedAt,
   };
 }

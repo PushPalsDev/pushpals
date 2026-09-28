@@ -588,6 +588,7 @@ describe("RepositoryAgent autonomy ideation", () => {
     const expectedRepository = await resolveRepositorySnapshot(root);
 
     let submitted: Record<string, unknown> | null = null;
+    let returnEmpty = false;
     const repositoryAgent = {
       async ask(input: Record<string, unknown>) {
         submitted = input;
@@ -603,28 +604,38 @@ describe("RepositoryAgent autonomy ideation", () => {
           answer: "One grounded candidate",
           summary: "Startup is the highest vision priority.",
           data: {
-            candidates: [
-              {
-                id: "candidate-startup",
-                title: "Improve startup readiness",
-                objective_type: "feature_small",
-                problem_statement: "Make startup readiness explicit.",
-                trigger_type: "queue_health",
-                component_area: "service.ts",
-                target_paths: ["service.ts"],
-                scope: { read_anywhere: true, write_globs: ["service.ts"] },
-                risk_level: "low",
-                expected_validation: ["git diff --check"],
-                estimated_effort: "small",
-                why_now_signal_ids: ["sig_queue"],
-                confidence: 0.9,
-                vision_alignment_reason: "Directly supports the top priority.",
-                vision_section_refs: ["1"],
-                feature_hypotheses: ["Explicit readiness reduces startup failures."],
-              },
-            ],
+            candidates: returnEmpty
+              ? []
+              : [
+                  {
+                    id: "candidate-startup",
+                    title: "Improve startup readiness",
+                    objective_type: "feature_small",
+                    problem_statement: "Make startup readiness explicit.",
+                    trigger_type: "queue_health",
+                    component_area: "service.ts",
+                    target_paths: ["service.ts"],
+                    scope: { read_anywhere: true, write_globs: ["service.ts"] },
+                    risk_level: "low",
+                    expected_validation: ["git diff --check"],
+                    estimated_effort: "small",
+                    why_now_signal_ids: ["sig_queue"],
+                    confidence: 0.9,
+                    vision_alignment_reason: "Directly supports the top priority.",
+                    vision_section_refs: ["1"],
+                    feature_hypotheses: ["Explicit readiness reduces startup failures."],
+                  },
+                ],
           },
           confidence: 0.9,
+          discoveryProgress: {
+            page: 1,
+            pageCount: 3,
+            advanced: true,
+            boundedCoverageExhausted: false,
+            retryEligible: true,
+            excludedCandidateCount: 1,
+          },
           evidence: [
             { path: "service.ts", revision: repository.revision, rationale: "startup owner" },
           ],
@@ -647,7 +658,7 @@ describe("RepositoryAgent autonomy ideation", () => {
       config: makeConfig(),
     });
     (engine as any).autonomyRepo = root;
-    const result = await (engine as any).repositoryAgentIdeation({
+    const ideationInput = {
       runId: "run-repository-agent",
       snapshot: makeSnapshot(),
       visionContext: {
@@ -673,7 +684,8 @@ describe("RepositoryAgent autonomy ideation", () => {
         truncated: false,
       },
       cycleDeadline: Date.now() + 30_000,
-    });
+    };
+    const result = await (engine as any).repositoryAgentIdeation(ideationInput);
 
     expect(result?.json.candidates).toHaveLength(1);
     expect(result?.llmCall.provider).toBe("repository_agent");
@@ -695,6 +707,46 @@ describe("RepositoryAgent autonomy ideation", () => {
     expect(policy.notes[7]).toContain("data.candidates=[]");
     expect(String(submitted?.idempotencyKey)).toContain("snap_tick_1");
     expect(JSON.stringify(submitted)).not.toContain("repo_targets");
+
+    returnEmpty = true;
+    const empty = await (engine as any).repositoryAgentIdeation({
+      ...ideationInput,
+      snapshot: {
+        ...makeSnapshot(),
+        open_objectives: [
+          {
+            status: "running",
+            target_paths: ["src/active.ts", "src/**"],
+            scope: { write_globs: ["**"], targetPaths: ["src/scoped.ts"] },
+          },
+        ],
+        recent_objectives: [
+          {
+            status: "completed",
+            target_paths: ["src/recent.ts"],
+            updated_at: new Date().toISOString(),
+          },
+          {
+            status: "completed",
+            target_paths: ["src/old.ts"],
+            updated_at: "2000-01-01T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect((submitted?.context as Record<string, unknown>).discoveryExclusions).toEqual({
+      targetPaths: ["src/active.ts", "src/scoped.ts", "src/recent.ts"],
+    });
+    expect(empty.result).toBeNull();
+    expect(empty.llmCall.memoryRefs).toEqual([]);
+    expect(empty.discoveryProgress).toEqual({
+      page: 1,
+      pageCount: 3,
+      advanced: true,
+      boundedCoverageExhausted: false,
+      retryEligible: true,
+      excludedCandidateCount: 1,
+    });
   });
 
   test("cancels in-flight repository ideation when autonomy is disabled and returns deterministic fallback", async () => {
@@ -980,6 +1032,305 @@ afterEach(() => {
       // best-effort cleanup
     }
   }
+});
+
+const durableDiscoveryProgress = {
+  page: 1,
+  pageCount: 3,
+  advanced: true,
+  boundedCoverageExhausted: false,
+  retryEligible: true,
+  excludedCandidateCount: 0,
+};
+
+function healthyDiscoveryLoad(): any {
+  return {
+    discoveryCapacityVerified: true,
+    autonomyAdmission: { allowed: true },
+    workers: { total: 1, online: 1, busy: 0, idle: 1 },
+    jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+    publication: {
+      backlog: 0,
+      oldestPendingAgeMs: 0,
+      oldestFinalizingAgeMs: 0,
+      expiredClaims: 0,
+      unhealthy: false,
+    },
+    completions: { pending: 0, claimed: 0 },
+    prs: { openUnmerged: 0 },
+  };
+}
+
+async function withCapturedAutonomyTimers(
+  run: (clock: {
+    timers: Map<any, { callback: () => void; delay: number; interval: boolean }>;
+    fire: (id: any) => void;
+  }) => Promise<void> | void,
+): Promise<void> {
+  const saved = { setTimeout, clearTimeout, setInterval, clearInterval };
+  const timers = new Map<any, { callback: () => void; delay: number; interval: boolean }>();
+  let next = 1;
+  const install = (interval: boolean) =>
+    ((callback: () => void, delay: number) => {
+      const id = next++;
+      timers.set(id, { callback, delay, interval });
+      return id;
+    }) as any;
+  globalThis.setTimeout = install(false);
+  globalThis.setInterval = install(true);
+  globalThis.clearTimeout = ((id: any) => {
+    timers.delete(id);
+  }) as any;
+  globalThis.clearInterval = ((id: any) => {
+    timers.delete(id);
+  }) as any;
+  try {
+    await run({
+      timers,
+      fire(id) {
+        const timer = timers.get(id);
+        if (!timer) throw new Error("Expected scheduled timer");
+        if (!timer.interval) timers.delete(id);
+        timer.callback();
+      },
+    });
+  } finally {
+    Object.assign(globalThis, saved);
+  }
+}
+
+function discoveryTestEngine(): RemoteBuddyAutonomousEngine {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-discovery-scheduler-"));
+  tempDirs.push(root);
+  seedGenericAutonomyRepoLayout(root);
+  writeFileSync(
+    join(root, "vision.md"),
+    "# Vision\n\n## Priorities\n- Improve application reliability\n",
+  );
+  const engine = new RemoteBuddyAutonomousEngine({
+    server: "http://localhost:3001",
+    sessionId: "s_discovery_scheduler",
+    authToken: "tok",
+    repo: root,
+    llm: {
+      async generate() {
+        throw new Error("Empty discovery must not score or plan");
+      },
+    } as any,
+    comm: { async emit() {} } as any,
+    config: makeConfig(),
+  });
+  Object.assign(engine as any, {
+    autonomyRepo: root,
+    acquireDispatchLock: async () => ({ ok: true }),
+    renewDispatchLock: async () => true,
+    releaseDispatchLock: async () => undefined,
+    ensureAutonomyRepoReady: async () => true,
+    fetchSnapshot: async () => makeSnapshot(),
+    fetchWorkerLoadSnapshot: async () => healthyDiscoveryLoad(),
+    loadCommitHistoryHints: async () => [],
+    ingestAutoInspirationPatterns: async () => undefined,
+    fetchInspirationPatterns: async () => [],
+    fetchInspirationSourceInsights: async () => [],
+    repositoryAgentIdeation: async () => ({
+      json: { candidates: [] },
+      llmCall: {},
+      result: null,
+      discoveryProgress: durableDiscoveryProgress,
+    }),
+    postObjective: async () => true,
+  });
+  return engine;
+}
+
+describe("bounded autonomy discovery followups", () => {
+  test("schedules one 30s followup with earliest-next-tick telemetry and bounded attempts", async () => {
+    await withCapturedAutonomyTimers(({ timers, fire }) => {
+      const engine = discoveryTestEngine() as any;
+      const calls: unknown[][] = [];
+      engine.tick = async (...args: unknown[]) => {
+        calls.push(args);
+      };
+      engine.start();
+      const generation = engine.schedulingGeneration;
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
+      const first = engine.discoveryFollowupTimer;
+      expect(timers.get(first)?.delay).toBe(30_000);
+      expect(engine.nextTickAtMs).toBe(engine.discoveryFollowupAtMs);
+      expect(engine.nextTickAtMs).toBeLessThan(engine.baselineNextTickAtMs);
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
+      expect(engine.discoveryFollowupTimer).toBe(first);
+      expect(engine.discoveryFollowupAttemptsRemaining).toBe(15);
+      fire(first);
+      expect(calls.at(-1)).toEqual([true, generation]);
+      expect(engine.nextTickAtMs).toBe(engine.baselineNextTickAtMs);
+      for (let index = 0; index < 15; index++) {
+        engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
+        expect(engine.discoveryFollowupTimer).not.toBeNull();
+        fire(engine.discoveryFollowupTimer);
+      }
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
+      expect(engine.discoveryFollowupTimer).toBeNull();
+      expect(engine.discoveryFollowupAttemptsRemaining).toBe(0);
+      fire(engine.timer);
+      expect(engine.discoveryFollowupAttemptsRemaining).toBe(16);
+      engine.stop();
+      expect(timers.size).toBe(0);
+    });
+  });
+
+  test("baseline collision and pause/stop discard late followup callbacks", async () => {
+    await withCapturedAutonomyTimers(({ timers, fire }) => {
+      const engine = discoveryTestEngine() as any;
+      let ticks = 0;
+      engine.tick = async () => {
+        ticks++;
+      };
+      engine.start();
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, engine.schedulingGeneration);
+      const collision = timers.get(engine.discoveryFollowupTimer)!.callback;
+      fire(engine.timer);
+      const afterBaseline = ticks;
+      collision();
+      expect(ticks).toBe(afterBaseline);
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, engine.schedulingGeneration);
+      const paused = timers.get(engine.discoveryFollowupTimer)!.callback;
+      engine.setRuntimeEnabled(false);
+      expect(engine.nextTickAtMs).toBe(0);
+      engine.setRuntimeEnabled(true);
+      const afterResume = ticks;
+      paused();
+      expect(ticks).toBe(afterResume);
+      engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, engine.schedulingGeneration);
+      const stopped = timers.get(engine.discoveryFollowupTimer)!.callback;
+      engine.stop();
+      stopped();
+      engine.start();
+      expect(ticks).toBe(afterResume);
+      expect(timers.size).toBe(0);
+    });
+  });
+
+  test.each(["unadvanced", "exhausted", "ineligible", "backoff", "earlier_baseline", "manual"])(
+    "does not accelerate %s discovery",
+    async (scenario) => {
+      await withCapturedAutonomyTimers(() => {
+        const engine = discoveryTestEngine() as any;
+        engine.tick = async () => undefined;
+        if (scenario !== "manual") engine.start();
+        const progress = {
+          ...durableDiscoveryProgress,
+          ...(scenario === "unadvanced" ? { advanced: false } : {}),
+          ...(scenario === "exhausted" ? { boundedCoverageExhausted: true } : {}),
+          ...(scenario === "ineligible" ? { retryEligible: false } : {}),
+        };
+        if (scenario === "backoff") engine.dispatchBackoffUntilMs = Date.now() + 60_000;
+        if (scenario === "earlier_baseline") engine.baselineNextTickAtMs = Date.now() + 20_000;
+        engine.scheduleDiscoveryFollowup(progress, engine.schedulingGeneration);
+        expect(engine.discoveryFollowupTimer).toBeNull();
+        engine.stop();
+      });
+    },
+  );
+
+  test("real empty tick schedules only after lock release and fresh followup capacity can stop it", async () => {
+    mockGitSpawnForTest();
+    await withCapturedAutonomyTimers(async () => {
+      const engine = discoveryTestEngine() as any;
+      const actualTick = engine.tick.bind(engine);
+      engine.tick = async () => undefined;
+      engine.start();
+      engine.tick = actualTick;
+      let finishRelease!: () => void;
+      let releaseStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        releaseStarted = resolve;
+      });
+      engine.releaseDispatchLock = async () => {
+        releaseStarted();
+        await new Promise<void>((resolve) => {
+          finishRelease = resolve;
+        });
+      };
+      const pending = engine.tick();
+      await started;
+      expect(engine.inFlight).toBe(true);
+      expect(engine.discoveryFollowupTimer).toBeNull();
+      await engine.tick(true);
+      finishRelease();
+      await pending;
+      expect(engine.inFlight).toBe(false);
+      expect(engine.discoveryFollowupTimer).not.toBeNull();
+      engine.releaseDispatchLock = async () => undefined;
+      engine.fetchWorkerLoadSnapshot = async () => ({
+        ...healthyDiscoveryLoad(),
+        workers: { total: 1, online: 1, busy: 1, idle: 0 },
+      });
+      engine.repositoryAgentIdeation = async () => {
+        throw new Error("Busy followup must not analyze");
+      };
+      await engine.tick(true);
+      expect(engine.discoveryFollowupTimer).toBeNull();
+      expect(engine.lastDetail).toContain("worker_load_busy");
+      engine.stop();
+    });
+  });
+
+  test.each([
+    "unknown_load",
+    "offline",
+    "missing_publication",
+    "expired_claim",
+    "global_budget",
+    "max_concurrent",
+    "resource_budget",
+    "dispatch_backoff",
+  ])("fresh accelerated tick preserves %s gate", async (scenario) => {
+    mockGitSpawnForTest();
+    const engine = discoveryTestEngine() as any;
+    let analyses = 0;
+    engine.repositoryAgentIdeation = async () => {
+      analyses++;
+      throw new Error("Must not analyze");
+    };
+    const load = healthyDiscoveryLoad();
+    if (scenario === "offline") load.workers = { total: 1, online: 0, idle: 0, busy: 0 };
+    if (scenario === "missing_publication") load.discoveryCapacityVerified = false;
+    if (scenario === "expired_claim") load.publication.expiredClaims = 1;
+    engine.fetchWorkerLoadSnapshot = async () => (scenario === "unknown_load" ? null : load);
+    const snapshot: any = makeSnapshot();
+    if (scenario === "global_budget") snapshot.dispatch_budget.global_count_last_hour = 6;
+    if (scenario === "max_concurrent")
+      snapshot.open_objectives = [{ status: "running" }, { status: "dispatched" }];
+    if (scenario === "resource_budget") snapshot.resource_budget = { token_budget_exhausted: true };
+    if (scenario === "dispatch_backoff") engine.dispatchBackoffUntilMs = Date.now() + 60_000;
+    engine.fetchSnapshot = async () => snapshot;
+    await engine.tick(true);
+    expect(analyses).toBe(0);
+    expect(engine.discoveryFollowupTimer).toBeNull();
+    engine.stop();
+  });
+
+  test("raw missing or malformed capacity/publication fields never authorize fast discovery", async () => {
+    const engine = discoveryTestEngine() as any;
+    engine.fetchWorkerLoadSnapshot = (
+      RemoteBuddyAutonomousEngine.prototype as any
+    ).fetchWorkerLoadSnapshot.bind(engine);
+    const healthy = healthyDiscoveryLoad();
+    for (const payload of [
+      { ...healthy, publication: undefined },
+      { ...healthy, publication: { ...healthy.publication, backlog: "0" } },
+      { ...healthy, workers: { ...healthy.workers, idle: Number.NaN } },
+      { ...healthy, autonomyAdmission: undefined },
+    ]) {
+      engine.fetchControl = async () => jsonResponse(200, { ok: true, ...payload });
+      const snapshot = await engine.fetchWorkerLoadSnapshot();
+      expect(engine.hasIdleDiscoveryCapacity(snapshot)).toBe(false);
+    }
+    engine.fetchControl = async () => jsonResponse(200, { ok: true, ...healthy });
+    expect(engine.hasIdleDiscoveryCapacity(await engine.fetchWorkerLoadSnapshot())).toBe(true);
+    engine.stop();
+  });
 });
 
 describe("RemoteBuddyAutonomousEngine tick orchestration", () => {

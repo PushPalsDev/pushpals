@@ -20,6 +20,7 @@ import {
   type BoundedProcessResult,
   type RepositoryAgentClaim,
   type RepositoryAgentContext,
+  type RepositoryAgentDiscoveryProgress,
   type RepositoryAgentEvidence,
   type RepositoryAgentJsonValue,
   type RepositoryAgentRequest,
@@ -51,7 +52,7 @@ import {
   ValidationSnapshotUnavailableError,
 } from "./autonomy_validation_filesystem.js";
 
-const PROMPT_VERSION = "repository-agent-v8-admission-aware";
+const PROMPT_VERSION = "repository-agent-v9-resumable-discovery";
 const CACHE_NAMESPACE = "repository_agent_cache";
 const CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 const FACT_NAMESPACE = "repository_facts";
@@ -71,6 +72,7 @@ const MAX_SEED_PACKET_FILES = 6;
 const MAX_DISCOVERY_PATHS = 6;
 const MAX_AUTONOMY_DISCOVERY_PAGES = 16;
 const COVERAGE_KIND = "repository_autonomy_evidence_coverage";
+const MAX_REVIEWED_PAGE_FINGERPRINTS = MAX_AUTONOMY_DISCOVERY_PAGES * 4;
 const MAX_PACKET_FILE_BYTES = 16 * 1024;
 // Retain at most six seed and six discovered prefixes: 1.5 MiB in aggregate.
 const MAX_PACKET_SCAN_FILE_BYTES = 128 * 1024;
@@ -228,7 +230,12 @@ type AdvisoryMemory = {
 type AutonomyEvidenceCoverage = {
   key: string;
   analysisKey: string;
+  discoveryKey: string;
   planHash: string;
+  pageFingerprints: string[];
+  reviewedPageFingerprints: string[];
+  exclusionFingerprint: string | null;
+  deferredPageFingerprints: string[];
   observedRevision: number | null;
   page: number;
   pageCount: number;
@@ -1279,6 +1286,90 @@ function cacheKey(request: RepositoryAgentRequest, modelId: string, promptVersio
       promptVersion,
     }),
   );
+}
+
+function discoveryCoverageKey(
+  request: RepositoryAgentRequest,
+  modelId: string,
+  promptVersion: string,
+): string {
+  // This is visitation history, not an answer cache. Tree and executed-outcome
+  // changes still invalidate exact answers, but unchanged evidence pages need
+  // not lose their place. Vision/protocol/policy/model changes start a new pass.
+  return sha256(
+    canonicalJson({
+      schemaVersion: 2,
+      repositoryIdentity: request.repository.identity,
+      purpose: request.purpose,
+      visionFingerprint: autonomyVisionFingerprint(request),
+      questionProtocol: sha256(compactText(request.question, 32_000)),
+      deterministicPolicy: normalizedDeterministicPolicy(request),
+      modelId,
+      promptVersion,
+    }),
+  );
+}
+
+function discoveryExclusionPaths(request: RepositoryAgentRequest): string[] {
+  if (autonomyVisionFingerprint(request) == null) return [];
+  const exclusions = isRecord(request.context?.discoveryExclusions)
+    ? request.context.discoveryExclusions
+    : {};
+  return [
+    ...new Set(
+      boundedStrings(exclusions.targetPaths, 128, 1_000)
+        .map(normalizeRelativePath)
+        .filter((path): path is string => path != null)
+        .map(comparablePath),
+    ),
+  ].sort();
+}
+
+function discoveryRetrievalRequest(request: RepositoryAgentRequest): RepositoryAgentRequest {
+  // Executed outcomes still qualify exact answers and synthesis, but must not
+  // reshuffle seeds/pages whenever an unrelated objective finishes.
+  const { runtimeSignals: _outcomes, ...context } = request.context ?? {};
+  return { ...request, context };
+}
+
+function filterDiscoveryDelivery(
+  result: RepositoryAgentResult,
+  excludedPaths: readonly string[],
+): { result: RepositoryAgentResult; excludedCandidateCount: number } {
+  // Never return cached scheduling hints: these describe this delivery only.
+  const { discoveryProgress: _oldProgress, ...structural } = result;
+  if (!excludedPaths.length || !isRecord(result.data) || !Array.isArray(result.data.candidates))
+    return { result: structural, excludedCandidateCount: 0 };
+  const candidates = result.data.candidates.filter((candidate) => {
+    if (!isRecord(candidate) || !Array.isArray(candidate.target_paths)) return true;
+    return !candidate.target_paths.some((raw) => {
+      const path = normalizeRelativePath(raw);
+      if (!path) return false;
+      const comparable = comparablePath(path);
+      return excludedPaths.some(
+        (excluded) =>
+          comparable === excluded ||
+          comparable.startsWith(`${excluded}/`) ||
+          excluded.startsWith(`${comparable}/`),
+      );
+    });
+  });
+  const excludedCandidateCount = result.data.candidates.length - candidates.length;
+  return {
+    result: {
+      ...structural,
+      data: { ...result.data, candidates },
+      ...(excludedCandidateCount > 0 && candidates.length === 0
+        ? {
+            answer:
+              "The structurally valid candidates on this page overlap current work and are deferred for this delivery.",
+            summary:
+              "Current-work exclusions defer this page without changing its reusable structural analysis.",
+          }
+        : {}),
+    },
+    excludedCandidateCount,
+  };
 }
 
 function executedAutonomyOutcomes(request: RepositoryAgentRequest) {
@@ -2776,16 +2867,80 @@ export class RepositoryAgentWorker {
     analysisKey: string,
     signal: AbortSignal,
     deadlineMs: number,
+    excludedPaths: readonly string[],
   ): Promise<AutonomyEvidenceCoverage | null> {
     if (request.repository.dirty || autonomyVisionFingerprint(request) == null) return null;
-    const seedPaths = seedEvidencePacketPaths(tracked, request.question, request.context);
-    const rankedPaths = rankedAdditionalPaths(request, tracked, seedPaths, true);
+    const retrievalRequest = discoveryRetrievalRequest(request);
+    const seedPaths = seedEvidencePacketPaths(
+      tracked,
+      retrievalRequest.question,
+      retrievalRequest.context,
+    );
+    const rankedPaths = rankedAdditionalPaths(retrievalRequest, tracked, seedPaths, true);
     const pageCount = Math.max(
       1,
       Math.min(MAX_AUTONOMY_DISCOVERY_PAGES, Math.ceil(rankedPaths.length / MAX_DISCOVERY_PATHS)),
     );
-    const key = `coverage:${analysisKey}`;
-    const planHash = sha256(canonicalJson({ seedPaths, rankedPaths, pageCount }));
+    const discoveryKey = discoveryCoverageKey(request, this.modelId, this.promptVersion);
+    const key = `coverage:${discoveryKey}`;
+    // Inspect only this bounded plan, not a second full-tree inventory with
+    // larger rows than ls-files. Chunk unusually long paths below Windows argv
+    // limits; ordinary plans use one subprocess, never one per discovered file.
+    const inspectedPaths = [
+      ...new Set([...seedPaths, ...rankedPaths.slice(0, pageCount * MAX_DISCOVERY_PATHS)]),
+    ];
+    if (inspectedPaths.some((path) => path.length + 3 > 8_000)) {
+      this.logger.warn(
+        "[RepositoryAgent] evidence coverage disabled: path exceeds bounded Git argument size",
+      );
+      return null;
+    }
+    const blobs = new Map<string, string>();
+    for (let offset = 0; offset < inspectedPaths.length; ) {
+      const batch: string[] = [];
+      let chars = 0;
+      while (offset < inspectedPaths.length) {
+        const path = inspectedPaths[offset]!;
+        if (batch.length && chars + path.length + 3 > 8_000) break;
+        batch.push(path);
+        chars += path.length + 3;
+        offset++;
+      }
+      const tree = await runGit(
+        request.repository.root,
+        ["--literal-pathspecs", "ls-tree", "-r", "-z", request.repository.revision, "--", ...batch],
+        {
+          signal,
+          outputLimitBytes: MAX_TRACKED_PATH_BYTES,
+        },
+      );
+      for (const entry of tree.split("\0")) {
+        const match = /^(\d+) (?:blob|commit) ([a-f\d]{40,64})\t([\s\S]+)$/.exec(entry);
+        if (match) blobs.set(match[3]!, `${match[1]}:${match[2]}`);
+      }
+    }
+    if (inspectedPaths.some((path) => !blobs.has(path))) {
+      this.logger.warn(
+        "[RepositoryAgent] evidence coverage disabled: current blob inventory is incomplete",
+      );
+      return null;
+    }
+    const coordinates = (paths: string[]) => paths.map((path) => [path, blobs.get(path)!]);
+    // Shared seed evidence can alter every page's interpretation. Its content
+    // changes therefore invalidate page history, unlike unrelated file edits.
+    const seedFingerprint = sha256(canonicalJson(coordinates(seedPaths)));
+    const pageFingerprints = Array.from({ length: pageCount }, (_, page) =>
+      sha256(
+        canonicalJson({
+          seedFingerprint,
+          selected: coordinates(
+            rankedPaths.slice(page * MAX_DISCOVERY_PATHS, (page + 1) * MAX_DISCOVERY_PATHS),
+          ),
+        }),
+      ),
+    );
+    const planHash = sha256(canonicalJson({ seedPaths, pageFingerprints, pageCount }));
+    const exclusionFingerprint = excludedPaths.length ? sha256(canonicalJson(excludedPaths)) : null;
     let record: MemoryRecord | null = null;
     let observedRevision: number | null = null;
     try {
@@ -2812,19 +2967,39 @@ export class RepositoryAgentWorker {
       !isExpiredMemoryRecord(record) &&
       record.kind === COVERAGE_KIND &&
       isRecord(value) &&
-      value.schemaVersion === 1 &&
-      value.analysisKey === analysisKey &&
-      value.planHash === planHash &&
+      value.schemaVersion === 2 &&
+      value.discoveryKey === discoveryKey &&
       typeof value.nextPage === "number" &&
       Number.isInteger(value.nextPage) &&
       value.nextPage >= 0 &&
-      value.nextPage <= pageCount;
-    const nextPage = valid ? (value.nextPage as number) : 0;
-    const page = Math.min(nextPage, pageCount - 1);
+      value.nextPage <= MAX_AUTONOMY_DISCOVERY_PAGES &&
+      Array.isArray(value.reviewedPageFingerprints) &&
+      value.reviewedPageFingerprints.length <= MAX_REVIEWED_PAGE_FINGERPRINTS &&
+      value.reviewedPageFingerprints.every(
+        (entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry),
+      ) &&
+      Array.isArray(value.deferredPageFingerprints) &&
+      value.deferredPageFingerprints.length <= MAX_AUTONOMY_DISCOVERY_PAGES &&
+      value.deferredPageFingerprints.every(
+        (entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry),
+      );
+    const reviewedPageFingerprints = valid ? (value.reviewedPageFingerprints as string[]) : [];
+    const deferredPageFingerprints =
+      valid && exclusionFingerprint != null && value.exclusionFingerprint === exclusionFingerprint
+        ? (value.deferredPageFingerprints as string[])
+        : [];
+    const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
+    const nextPage = pageFingerprints.findIndex((fingerprint) => !visited.has(fingerprint));
+    const page = nextPage < 0 ? pageCount - 1 : nextPage;
     return {
       key,
       analysisKey,
+      discoveryKey,
       planHash,
+      pageFingerprints,
+      reviewedPageFingerprints,
+      exclusionFingerprint,
+      deferredPageFingerprints,
       observedRevision,
       page,
       pageCount,
@@ -2833,7 +3008,7 @@ export class RepositoryAgentWorker {
         page * MAX_DISCOVERY_PATHS,
         (page + 1) * MAX_DISCOVERY_PATHS,
       ),
-      boundedCoverageExhausted: nextPage >= pageCount,
+      boundedCoverageExhausted: nextPage < 0,
     };
   }
 
@@ -2842,6 +3017,7 @@ export class RepositoryAgentWorker {
     coverage: AutonomyEvidenceCoverage,
     cacheHit: boolean,
     advanced: boolean,
+    boundedCoverageExhausted: boolean,
   ): void {
     this.logger.log(
       `[RepositoryAgent] evidenceCoverage=${JSON.stringify({
@@ -2852,9 +3028,7 @@ export class RepositoryAgentWorker {
         rankedPathCount: coverage.rankedPathCount,
         selectedPathCount: coverage.selectedPaths.length,
         additionalPathsCapped: coverage.rankedPathCount > coverage.pageCount * MAX_DISCOVERY_PATHS,
-        boundedCoverageExhausted:
-          coverage.boundedCoverageExhausted ||
-          (advanced && coverage.page + 1 >= coverage.pageCount),
+        boundedCoverageExhausted,
         repositoryExhaustivenessEstablished: false,
         cacheHit,
         advanced,
@@ -2869,13 +3043,16 @@ export class RepositoryAgentWorker {
     successfulSynthesis: boolean,
     signal: AbortSignal,
     deadlineMs: number,
-  ): Promise<boolean> {
-    if (!coverage) return false;
+    excludedCandidateCount: number,
+    allCandidatesExcluded: boolean,
+  ): Promise<{ attempted: boolean; progress?: RepositoryAgentDiscoveryProgress }> {
+    if (!coverage) return { attempted: false };
     let advanced = false;
     let attempted = false;
+    let exhausted = coverage.boundedCoverageExhausted;
     if (
       successfulSynthesis &&
-      isGroundedEmptyAutonomyResult(result) &&
+      (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded) &&
       request.freshness !== "cache_only" &&
       !request.repository.dirty &&
       !coverage.boundedCoverageExhausted &&
@@ -2884,6 +3061,19 @@ export class RepositoryAgentWorker {
       throwIfAborted(signal);
       attempted = true;
       try {
+        const fingerprint = coverage.pageFingerprints[coverage.page]!;
+        const reviewedPageFingerprints = allCandidatesExcluded
+          ? coverage.reviewedPageFingerprints
+          : [...new Set([...coverage.reviewedPageFingerprints, fingerprint])].slice(
+              -MAX_REVIEWED_PAGE_FINGERPRINTS,
+            );
+        const deferredPageFingerprints = allCandidatesExcluded
+          ? [...new Set([...coverage.deferredPageFingerprints, fingerprint])].slice(
+              -MAX_AUTONOMY_DISCOVERY_PAGES,
+            )
+          : coverage.deferredPageFingerprints;
+        const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
+        const nextPage = coverage.pageFingerprints.findIndex((entry) => !visited.has(entry));
         await this.memoryPutWithinDeadline(
           "evidence coverage advance",
           signal,
@@ -2893,12 +3083,17 @@ export class RepositoryAgentWorker {
             key: coverage.key,
             kind: COVERAGE_KIND,
             subjectKey: request.purpose,
-            summary: "Bounded autonomous evidence coverage; not repository-wide exhaustion",
+            summary:
+              "Blob-scoped bounded discovery history; not reusable candidate facts or repository-wide exhaustion",
             value: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               analysisKey: coverage.analysisKey,
+              discoveryKey: coverage.discoveryKey,
               planHash: coverage.planHash,
-              nextPage: coverage.page + 1,
+              reviewedPageFingerprints,
+              exclusionFingerprint: coverage.exclusionFingerprint,
+              deferredPageFingerprints,
+              nextPage: nextPage < 0 ? coverage.pageCount : nextPage,
               pageCount: coverage.pageCount,
             },
             status: "active",
@@ -2916,6 +3111,7 @@ export class RepositoryAgentWorker {
           { expectedRevision: coverage.observedRevision },
         );
         advanced = true;
+        exhausted = nextPage < 0;
       } catch (error) {
         throwIfAborted(signal);
         // Do not retry a stale CAS against a newer page: concurrent completion
@@ -2923,8 +3119,55 @@ export class RepositoryAgentWorker {
         this.logger.warn(`[RepositoryAgent] evidence coverage advance skipped: ${String(error)}`);
       }
     }
-    this.logEvidenceCoverage(result.requestId, coverage, result.cache.hit, advanced);
-    return attempted;
+    this.logEvidenceCoverage(result.requestId, coverage, result.cache.hit, advanced, exhausted);
+    return {
+      attempted,
+      progress: {
+        page: coverage.page + 1,
+        pageCount: coverage.pageCount,
+        advanced,
+        boundedCoverageExhausted: exhausted,
+        retryEligible:
+          advanced &&
+          !exhausted &&
+          (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded),
+        excludedCandidateCount,
+      },
+    };
+  }
+
+  private async finalizeDiscoveryDelivery(
+    result: RepositoryAgentResult,
+    request: RepositoryAgentRequest,
+    coverage: AutonomyEvidenceCoverage | null,
+    excludedPaths: readonly string[],
+    successfulSynthesis: boolean,
+    repoRoot: string,
+    signal: AbortSignal,
+    deadlineMs: number,
+  ): Promise<RepositoryAgentResult> {
+    const delivery = filterDiscoveryDelivery(result, excludedPaths);
+    const allCandidatesExcluded =
+      delivery.excludedCandidateCount > 0 &&
+      isRecord(delivery.result.data) &&
+      Array.isArray(delivery.result.data.candidates) &&
+      delivery.result.data.candidates.length === 0;
+    const update = await this.advanceEvidenceCoverage(
+      request,
+      coverage,
+      result,
+      successfulSynthesis,
+      signal,
+      deadlineMs,
+      delivery.excludedCandidateCount,
+      allCandidatesExcluded,
+    );
+    if (update.attempted) await this.assertCurrentSnapshot(repoRoot, request, signal, deadlineMs);
+    throwIfAborted(signal);
+    return {
+      ...delivery.result,
+      ...(update.progress ? { discoveryProgress: update.progress } : {}),
+    };
   }
 
   private compactSynthesisContext(request: RepositoryAgentRequest): RepositoryAgentContext {
@@ -3077,12 +3320,13 @@ export class RepositoryAgentWorker {
     cacheable: boolean;
   }> {
     throwIfAborted(signal);
+    const retrievalRequest = coverage ? discoveryRetrievalRequest(request) : request;
     const seedPacket = await buildSeedEvidencePacket(
       repoRoot,
-      request,
+      retrievalRequest,
       tracked,
-      request.question,
-      request.context,
+      retrievalRequest.question,
+      retrievalRequest.context,
       signal,
     );
     throwIfAborted(signal);
@@ -3523,6 +3767,7 @@ export class RepositoryAgentWorker {
 
     try {
       throwIfAborted(controller.signal);
+      const excludedPaths = discoveryExclusionPaths(request);
       if (autonomyVisionFingerprint(request) != null) {
         // Retrieval must see the same keyed structural inputs as synthesis.
         // Otherwise unkeyed transient paths could silently change the packet.
@@ -3576,6 +3821,7 @@ export class RepositoryAgentWorker {
         analysisKey,
         controller.signal,
         preSynthesisMemoryDeadlineMs,
+        excludedPaths,
       );
       const key = coverage
         ? sha256(`${analysisKey}:coverage:${coverage.planHash}:${coverage.page}`)
@@ -3593,19 +3839,16 @@ export class RepositoryAgentWorker {
         );
         if (cached) {
           await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-          const coverageWriteAttempted = await this.advanceEvidenceCoverage(
+          return await this.finalizeDiscoveryDelivery(
+            cached,
             request,
             coverage,
-            cached,
+            excludedPaths,
             true,
+            exactRepoRoot,
             controller.signal,
             deadlineMs,
           );
-          if (coverageWriteAttempted) {
-            await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-          }
-          throwIfAborted(controller.signal);
-          return cached;
         }
       }
       if (request.freshness === "cache_only") {
@@ -3661,19 +3904,16 @@ export class RepositoryAgentWorker {
       );
       throwIfAborted(controller.signal);
       await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-      const coverageWriteAttempted = await this.advanceEvidenceCoverage(
+      return await this.finalizeDiscoveryDelivery(
+        learned,
         request,
         coverage,
-        learned,
+        excludedPaths,
         generated.cacheable,
+        exactRepoRoot,
         controller.signal,
         deadlineMs,
       );
-      if (coverageWriteAttempted) {
-        await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
-      }
-      throwIfAborted(controller.signal);
-      return learned;
     } finally {
       clearTimeout(deadlineTimer);
       upstreamSignal?.removeEventListener("abort", abortFromUpstream);
