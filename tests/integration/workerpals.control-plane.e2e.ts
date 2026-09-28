@@ -369,6 +369,47 @@ async function waitForCondition(
   throw new Error(message);
 }
 
+async function waitForWorkerCondition(
+  worker: { readonly exitCode: number | null },
+  predicate: () => boolean,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  await waitForCondition(
+    () => {
+      if (predicate()) return true;
+      if (worker.exitCode !== null) {
+        throw new Error(`${message}: worker exited early with code ${worker.exitCode}`);
+      }
+      return false;
+    },
+    timeoutMs,
+    message,
+  );
+}
+
+test("Docker integration wait reports an early worker exit instead of waiting for a job timeout", async () => {
+  await expect(
+    waitForWorkerCondition(
+      { exitCode: 1 },
+      () => false,
+      60_000,
+      "Docker execution did not complete",
+    ),
+  ).rejects.toThrow("Docker execution did not complete: worker exited early with code 1");
+});
+
+test("Docker integration wait accepts a terminal response before expected worker recycling", async () => {
+  await expect(
+    waitForWorkerCondition(
+      { exitCode: 86 },
+      () => true,
+      60_000,
+      "Docker policy failure did not arrive",
+    ),
+  ).resolves.toBeUndefined();
+});
+
 async function expectProcessRunning(proc: ReturnType<typeof Bun.spawn>, timeoutMs: number): Promise<void> {
   const outcome = await Promise.race([
     proc.exited.then((code) => ({ exited: true as const, code })),
@@ -2438,6 +2479,7 @@ test(
           "--workerId",
           workerId,
           "--docker",
+          "--require-docker",
           "--docker-image",
           dockerImage,
         ],
@@ -2455,7 +2497,8 @@ test(
       );
 
       try {
-        await waitForCondition(
+        await waitForWorkerCondition(
+          proc,
           () => completionSeen,
           10 * 60_000,
           "Timed out waiting for merge-conflict Docker job completion",
@@ -2605,6 +2648,7 @@ test(
           "--workerId",
           workerId,
           "--docker",
+          "--require-docker",
           "--docker-image",
           dockerImage,
         ],
@@ -2626,7 +2670,8 @@ test(
       );
 
       try {
-        await waitForCondition(
+        await waitForWorkerCondition(
+          proc,
           () => failurePayload !== null,
           2 * 60_000,
           "Timed out waiting for codex policy-violation failure",
