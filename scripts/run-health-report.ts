@@ -330,6 +330,13 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
     cohortIncomplete ||
     truncatedTables.includes("autonomy_pr_feedback") ||
     (data.missingTables ?? []).includes("autonomy_pr_feedback");
+  // Missing provider outcomes are unknown, not evidence that an approved PR failed to merge.
+  // Keep approval-only metrics independent of provider availability.
+  const providerIncomplete =
+    data.providers === undefined ||
+    missingTables.includes("pr_provider_outcomes") ||
+    truncatedTables.includes("pr_provider_outcomes") ||
+    unknown > 0;
   return {
     schemaVersion: 1,
     cohort: { ...cohort, jobs: jobs.length, boundary: "createdAt >= since AND createdAt < until" },
@@ -388,16 +395,14 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
       closedUnmerged,
       open,
       unknown,
-      mergedRate:
-        cohortIncomplete || unknown || truncatedTables.includes("pr_provider_outcomes")
-          ? null
-          : ratio(merged, prs.size),
+      mergedRate: cohortIncomplete || providerIncomplete ? null : ratio(merged, prs.size),
       reviewed,
       revisions,
       observedFirstPassApproved: firstPassApproved,
       observedFirstPassMerged: firstPassMerged,
       observedFirstPassApprovalRate: reviewIncomplete ? null : ratio(firstPassApproved, reviewed),
-      observedFirstPassMergeRate: reviewIncomplete ? null : ratio(firstPassMerged, reviewed),
+      observedFirstPassMergeRate:
+        reviewIncomplete || providerIncomplete ? null : ratio(firstPassMerged, reviewed),
     },
     uptime: { rate: null, reason: "No continuous health-sample evidence is read by this report." },
     notes: [

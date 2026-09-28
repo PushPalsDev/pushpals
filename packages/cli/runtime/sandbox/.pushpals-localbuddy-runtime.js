@@ -1976,12 +1976,16 @@ function sanitizeDiscoveryProgress(value) {
   for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
     if (typeof value[key] !== "boolean")
       invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  if (value.nextWindowAvailable !== undefined && typeof value.nextWindowAvailable !== "boolean")
+    invalidResponse("result.discoveryProgress.nextWindowAvailable must be boolean");
+  const nextWindowAvailable = value.nextWindowAvailable === true && page === pageCount && value.advanced === true && value.boundedCoverageExhausted === false;
   return {
     page,
     pageCount,
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
-    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
+    ...value.nextWindowAvailable === undefined ? {} : { nextWindowAvailable },
     excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
   };
 }

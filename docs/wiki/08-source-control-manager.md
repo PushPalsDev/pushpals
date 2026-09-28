@@ -87,6 +87,10 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
 
 ## PR Metadata and Traceability
 
+- Confirmed new/reused PR publication nudges the existing review lane after SCM
+  finishes checkout/ref cleanup. Requests coalesce; they do not overlap reviews,
+  change one-PR-per-poll fairness, or accelerate provider reconciliation. Disabled
+  or stopped review agents ignore nudges, and shutdown drains any active review.
 - SCM records the processed PR URL when marking completions processed (`/completions/:id/processed` with `prUrl`).
 - SCM emits pusher/status messages with created/reused PR URLs for operator visibility.
 - ReviewAgent fix jobs carry structured `reviewAgent` metadata (`prNumber`, `prUrl`, `prHeadRef`, previous score/summary, etc.).
@@ -208,6 +212,14 @@ receive bounded rejection, and subsequent ordinary pooled health
 requests remain usable; raising limits or hiding failed responses is not recovery.
 
 ## Debugging Checklist
+
+SCM `/health` includes bounded, process-local `diagnostics`: event-loop delay and
+slow `integration_maintenance`, `completion_claim`, and `completion_ref_gc`
+operation samples. Sampling uses monotonic time, retains the last 16 slow events,
+and emits at most one structured `runtimeDiagnostics` log per second. Healthy
+probes do not erase recent slow evidence. The health route reads this history
+without database or network calls. Slow I/O is not automatically event-loop
+blocking, and these measurements do not weaken existing stall/restart decisions.
 
 1. Confirm completion claim + check pass logs in SCM.
 2. Confirm PR was created or reused in ReviewAgent mode.

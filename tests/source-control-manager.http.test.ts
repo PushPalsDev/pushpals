@@ -3,8 +3,51 @@ import { MergeQueueDB } from "../apps/source_control_manager/src/db";
 import { createStatusServer } from "../apps/source_control_manager/src/http";
 import { createSourceControlManagerHealthTracker } from "../apps/source_control_manager/src/runtime_helpers";
 import { runProcessWithTreeTimeout } from "../apps/source_control_manager/src/trusted_validation";
+import { RuntimeDiagnostics } from "../packages/shared/src/runtime_diagnostics";
 
 describe("SourceControlManager status health", () => {
+  test("serves retained slow-stage history without a database read or changing liveness", async () => {
+    const db = new MergeQueueDB(":memory:");
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 120_000,
+      idleBacklogGraceMs: 30_000,
+    });
+    let now = 0;
+    const diagnostics = new RuntimeDiagnostics({
+      service: "source_control_manager",
+      now: () => now,
+    });
+    diagnostics.run("integration_maintenance", () => {
+      now += 1_500;
+    });
+    const server = createStatusServer(db, 0, () => ({
+      ...tracker.snapshot(),
+      diagnostics: diagnostics.snapshot(),
+    }));
+    // Health is an in-memory path even when the status database is unavailable.
+    db.close();
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/health`, {
+        signal: AbortSignal.timeout(1_000),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        healthy: true,
+        diagnostics: {
+          recentSlowEvents: [
+            expect.objectContaining({
+              event: "runtime_slow_operation",
+              stage: "integration_maintenance",
+              durationMs: 1_500,
+            }),
+          ],
+        },
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("serves health during validation output capture, timeout termination, and bounded draining", async () => {
     const db = new MergeQueueDB(":memory:");
     const tracker = createSourceControlManagerHealthTracker({

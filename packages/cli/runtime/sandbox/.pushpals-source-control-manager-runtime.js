@@ -1772,6 +1772,191 @@ async function resolveGitTokenForRemote(options) {
   return { backend, host, token: "", source: "none" };
 }
 
+// packages/shared/src/runtime_diagnostics.ts
+var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+function boundedInteger(value, name, maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
+  }
+  return value;
+}
+
+class RuntimeDiagnostics {
+  service;
+  now;
+  wallNow;
+  onEvent;
+  sampleIntervalMs;
+  slowThresholdMs;
+  maxSamples;
+  schedule;
+  running = false;
+  generation = 0;
+  cancelTimer = null;
+  lastEventLoopDelayMs = null;
+  maxEventLoopDelayMs = 0;
+  slowEventLoopSamples = 0;
+  slowOperationSamples = 0;
+  suppressedLogEvents = 0;
+  lastLoggedAt = -Infinity;
+  recentSlowEvents = [];
+  constructor(options) {
+    if (typeof options.service !== "string" || !LABEL.test(options.service)) {
+      throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
+    }
+    this.service = options.service;
+    this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
+    this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
+    this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
+    for (const name of ["now", "wallNow", "onEvent", "schedule"]) {
+      if (options[name] !== undefined && typeof options[name] !== "function") {
+        throw new TypeError(`${name} must be a function`);
+      }
+    }
+    this.now = options.now ?? (() => performance.now());
+    this.wallNow = options.wallNow ?? Date.now;
+    this.onEvent = options.onEvent;
+    this.schedule = options.schedule ?? ((callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return () => clearTimeout(timer);
+    });
+  }
+  start() {
+    if (this.running)
+      return;
+    this.running = true;
+    this.scheduleNext(++this.generation);
+  }
+  stop() {
+    this.running = false;
+    this.generation += 1;
+    const cancel = this.cancelTimer;
+    this.cancelTimer = null;
+    try {
+      cancel?.();
+    } catch {}
+  }
+  snapshot() {
+    return {
+      service: this.service,
+      running: this.running,
+      measurement: "Timer lateness is measured delay, not proof of root cause or service downtime.",
+      sampleIntervalMs: this.sampleIntervalMs,
+      slowThresholdMs: this.slowThresholdMs,
+      lastEventLoopDelayMs: this.lastEventLoopDelayMs,
+      maxEventLoopDelayMs: this.maxEventLoopDelayMs,
+      slowEventLoopSamples: this.slowEventLoopSamples,
+      slowOperationSamples: this.slowOperationSamples,
+      suppressedLogEvents: this.suppressedLogEvents,
+      recentSlowEvents: this.recentSlowEvents.map((event) => ({ ...event }))
+    };
+  }
+  run(stage, fn) {
+    const startedAt = this.readNow();
+    try {
+      return fn();
+    } finally {
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  async runAsync(stage, fn) {
+    const startedAt = this.readNow();
+    try {
+      return await fn();
+    } finally {
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  scheduleNext(generation) {
+    const startedAt = this.readNow();
+    if (startedAt === null) {
+      this.stop();
+      return;
+    }
+    const expectedAt = startedAt + this.sampleIntervalMs;
+    const callback = () => {
+      if (!this.running || this.generation !== generation)
+        return;
+      this.cancelTimer = null;
+      try {
+        const observed = this.readNow();
+        if (observed === null) {
+          this.stop();
+          return;
+        }
+        const delayMs = Math.max(0, observed - expectedAt);
+        if (Number.isFinite(delayMs)) {
+          this.lastEventLoopDelayMs = delayMs;
+          this.maxEventLoopDelayMs = Math.max(this.maxEventLoopDelayMs, delayMs);
+          if (delayMs >= this.slowThresholdMs) {
+            this.slowEventLoopSamples += 1;
+            this.record({
+              event: "runtime_event_loop_delay",
+              service: this.service,
+              observedAt: new Date(this.wallNow()).toISOString(),
+              delayMs,
+              sampleIntervalMs: this.sampleIntervalMs
+            }, observed);
+          }
+        }
+      } catch {}
+      if (this.running && this.generation === generation)
+        this.scheduleNext(generation);
+    };
+    try {
+      this.cancelTimer = this.schedule(callback, this.sampleIntervalMs);
+    } catch {
+      this.stop();
+    }
+  }
+  readNow() {
+    try {
+      const value = this.now();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  observeOperation(stage, startedAt) {
+    try {
+      if (startedAt === null)
+        return;
+      const observed = this.readNow();
+      if (observed === null)
+        return;
+      const durationMs = Math.max(0, observed - startedAt);
+      if (!Number.isFinite(durationMs) || durationMs < this.slowThresholdMs)
+        return;
+      this.slowOperationSamples += 1;
+      this.record({
+        event: "runtime_slow_operation",
+        service: this.service,
+        observedAt: new Date(this.wallNow()).toISOString(),
+        stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+        durationMs
+      }, observed);
+    } catch {}
+  }
+  record(event, observed) {
+    this.recentSlowEvents.push(event);
+    if (this.recentSlowEvents.length > this.maxSamples)
+      this.recentSlowEvents.shift();
+    if (!this.onEvent)
+      return;
+    if (observed - this.lastLoggedAt < 1000) {
+      this.suppressedLogEvents += 1;
+      return;
+    }
+    this.lastLoggedAt = observed;
+    try {
+      Promise.resolve(this.onEvent({ ...event })).catch(() => {
+        return;
+      });
+    } catch {}
+  }
+}
+
 // packages/shared/src/memory.ts
 import { createHash, randomUUID } from "crypto";
 var MEMORY_REINFORCEMENT_OUTCOMES = Object.freeze([
@@ -2826,12 +3011,16 @@ function sanitizeDiscoveryProgress(value) {
   for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
     if (typeof value[key] !== "boolean")
       invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  if (value.nextWindowAvailable !== undefined && typeof value.nextWindowAvailable !== "boolean")
+    invalidResponse("result.discoveryProgress.nextWindowAvailable must be boolean");
+  const nextWindowAvailable = value.nextWindowAvailable === true && page === pageCount && value.advanced === true && value.boundedCoverageExhausted === false;
   return {
     page,
     pageCount,
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
-    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
+    ...value.nextWindowAvailable === undefined ? {} : { nextWindowAvailable },
     excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
   };
 }
@@ -8439,6 +8628,8 @@ class ReviewAgent {
   reviewerMd = "";
   providerPollInFlight = false;
   reviewPollInFlight = false;
+  reviewPollRequested = false;
+  requestedReviewPoll = null;
   stopped = false;
   activePollRuns = new Set;
   deps;
@@ -8575,12 +8766,42 @@ class ReviewAgent {
       return;
     this.forceReReview.set(prNumber, normalizedSha);
   }
+  requestReviewPoll() {
+    if (this.stopped || !this.config.enabled)
+      return;
+    this.reviewPollRequested = true;
+    this.scheduleRequestedReviewPoll();
+  }
+  scheduleRequestedReviewPoll() {
+    if (this.stopped || !this.config.enabled || !this.reviewPollRequested || this.reviewPollInFlight || this.requestedReviewPoll) {
+      return;
+    }
+    let trackedPoll;
+    trackedPoll = Promise.resolve().then(async () => {
+      if (this.stopped || !this.config.enabled || !this.reviewPollRequested)
+        return;
+      if (this.reviewPollInFlight)
+        return;
+      this.reviewPollRequested = false;
+      await this.pollOpenPrReviews();
+    }).catch((error) => {
+      this.deps.logError(`[${ts()}] [ReviewAgent] Publication-triggered review poll failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      this.activePollRuns.delete(trackedPoll);
+      this.requestedReviewPoll = null;
+      this.scheduleRequestedReviewPoll();
+    });
+    this.requestedReviewPoll = trackedPoll;
+    this.activePollRuns.add(trackedPoll);
+  }
   updateRuntimeConfig(nextConfig) {
     if (this.stopped)
       return { becameEnabled: false };
     const becameEnabled = !this.config.enabled && nextConfig.enabled;
     const reviewerPathChanged = String(this.config.reviewerMdPath ?? "").trim() !== String(nextConfig.reviewerMdPath ?? "").trim();
     this.config = { ...nextConfig };
+    if (!this.config.enabled)
+      this.reviewPollRequested = false;
     if (reviewerPathChanged)
       this.reviewerMd = "";
     return { becameEnabled };
@@ -8636,6 +8857,7 @@ class ReviewAgent {
   }
   async stopAndDrain() {
     this.stopped = true;
+    this.reviewPollRequested = false;
     while (this.activePollRuns.size > 0) {
       await Promise.allSettled([...this.activePollRuns]);
     }
@@ -8868,6 +9090,7 @@ class ReviewAgent {
       }
     } finally {
       this.reviewPollInFlight = false;
+      this.scheduleRequestedReviewPoll();
     }
   }
   async reconcileRecentlyClosedPrFeedback(prs, nowMs, persistedMetadata = new Map, skipPrNumbers = new Set) {
@@ -12526,11 +12749,18 @@ var healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30000, config.pollIntervalSeconds * 3000)
 });
+var runtimeDiagnostics = new RuntimeDiagnostics({
+  service: "source_control_manager",
+  onEvent: (event) => console.warn(`[${ts2()}] runtimeDiagnostics=${JSON.stringify(event)}`)
+});
 var reviewAgentInstance = null;
 var blockedReviewProviderHealth = null;
 function sourceControlManagerHealthSnapshot() {
   const reviewProvider = reviewAgentInstance?.getProviderHealthSnapshot() ?? blockedReviewProviderHealth;
-  return withReviewProviderHealth(healthTracker.snapshot(), reviewProvider);
+  return {
+    ...withReviewProviderHealth(healthTracker.snapshot(), reviewProvider),
+    diagnostics: runtimeDiagnostics.snapshot()
+  };
 }
 var recovered = db.recoverStuckJobs();
 if (recovered > 0) {
@@ -12951,6 +13181,7 @@ async function reconcileRetainedCompletionRefs(runtimeConfig, headers) {
   }
 }
 async function tick() {
+  let publishedReviewAgent = null;
   healthTracker.beginTick("integration_maintenance");
   try {
     const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
@@ -12962,8 +13193,8 @@ async function tick() {
     const pusherId = sourceControlManagerPusherId;
     const response = await claimBeforeCompletionGc({
       claim: () => maintainIntegrationBeforeCompletionClaim({
-        maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
-        claimCompletion: async () => {
+        maintain: () => runtimeDiagnostics.runAsync("integration_maintenance", () => integrationMaintenanceRunner.run(runtimeConfig, headers)),
+        claimCompletion: () => runtimeDiagnostics.runAsync("completion_claim", async () => {
           const rawResponse = await fetchBufferedWithHardDeadline({
             input: `${runtimeConfig.serverUrl}/completions/claim`,
             init: {
@@ -12982,10 +13213,10 @@ async function tick() {
             status: rawResponse.status,
             data: rawResponse.ok ? await rawResponse.json() : null
           };
-        }
+        })
       }),
       isIdle: (claimResult) => claimResult.status === 404 || claimResult.ok && !claimResult.data?.completion,
-      reconcile: () => reconcileRetainedCompletionRefs(runtimeConfig, headers)
+      reconcile: () => runtimeDiagnostics.runAsync("completion_ref_gc", () => reconcileRetainedCompletionRefs(runtimeConfig, headers))
     });
     if (!response.ok) {
       if (response.status !== 404) {
@@ -13757,6 +13988,9 @@ async function tick() {
       } else {
         console.log(`[${ts2()}] Marked completion ${completion.id} as processed`);
         cleanupCompletionHandoff = true;
+        if (useReviewPublicationFlow && !skipValidationForDurableRecovery) {
+          publishedReviewAgent = reviewAgentForTick;
+        }
         const pushMessage = useReviewPublicationFlow ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.` : config.pushMainAfterMerge ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.` : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
@@ -13937,6 +14171,9 @@ async function tick() {
     console.error(`[${ts2()}] Poll error: ${err.message}`);
   } finally {
     healthTracker.completeTick();
+    if (running && publishedReviewAgent === reviewAgentInstance) {
+      publishedReviewAgent?.requestReviewPoll();
+    }
   }
 }
 async function runCheck(repoPath, check) {
@@ -14148,6 +14385,7 @@ async function shutdown() {
     if (!running)
       return;
     running = false;
+    runtimeDiagnostics.stop();
     startupStatusTracker.markShutdown();
     console.log(`
 [${ts2()}] Shutting down...`);
@@ -14200,6 +14438,8 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   shutdownAndExit(143);
 });
+runtimeDiagnostics.start();
+process.once("exit", () => runtimeDiagnostics.stop());
 main().catch(async (err) => {
   console.error(`[${ts2()}] Fatal: ${err.message}`);
   await shutdown();

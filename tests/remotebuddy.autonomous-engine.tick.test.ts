@@ -1144,6 +1144,38 @@ function discoveryTestEngine(): RemoteBuddyAutonomousEngine {
 }
 
 describe("bounded autonomy discovery followups", () => {
+  test("continues at a durable discovery-window boundary without bypassing followup budgets", async () => {
+    await withCapturedAutonomyTimers(({ timers, fire }) => {
+      const engine = discoveryTestEngine() as any;
+      engine.tick = async () => undefined;
+      engine.start();
+      const progress = { ...durableDiscoveryProgress, page: 16, pageCount: 16 };
+      engine.scheduleDiscoveryFollowup(progress, engine.schedulingGeneration);
+      expect(engine.discoveryFollowupTimer).toBeNull();
+      const nextWindow = { ...progress, nextWindowAvailable: true };
+      engine.scheduleDiscoveryFollowup(nextWindow, engine.schedulingGeneration);
+      expect(timers.get(engine.discoveryFollowupTimer)?.delay).toBe(30_000);
+      expect(engine.discoveryFollowupAttemptsRemaining).toBe(15);
+      fire(engine.discoveryFollowupTimer);
+      for (const override of [
+        { advanced: false },
+        { boundedCoverageExhausted: true },
+        { retryEligible: false },
+      ]) {
+        engine.scheduleDiscoveryFollowup(
+          { ...nextWindow, ...override },
+          engine.schedulingGeneration,
+        );
+        expect(engine.discoveryFollowupTimer).toBeNull();
+      }
+      engine.discoveryFollowupAttemptsRemaining = 0;
+      engine.scheduleDiscoveryFollowup(nextWindow, engine.schedulingGeneration);
+      expect(engine.discoveryFollowupTimer).toBeNull();
+      engine.stop();
+      expect(timers.size).toBe(0);
+    });
+  });
+
   test("schedules one 30s followup with earliest-next-tick telemetry and bounded attempts", async () => {
     await withCapturedAutonomyTimers(({ timers, fire }) => {
       const engine = discoveryTestEngine() as any;

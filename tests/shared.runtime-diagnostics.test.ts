@@ -1,0 +1,466 @@
+import { describe, expect, spyOn, test } from "bun:test";
+import {
+  RuntimeDiagnostics,
+  type RuntimeDiagnosticEvent,
+} from "../packages/shared/src/runtime_diagnostics";
+
+function fixture(
+  options: { maxSamples?: number; onEvent?: (event: RuntimeDiagnosticEvent) => void } = {},
+) {
+  let monotonic = 0;
+  let wall = Date.UTC(2026, 8, 28);
+  const pending = new Set<() => void>();
+  const scheduled: { callback: () => void; delayMs: number }[] = [];
+  const logged: RuntimeDiagnosticEvent[] = [];
+  const diagnostics = new RuntimeDiagnostics({
+    service: "fixture_service",
+    now: () => monotonic,
+    wallNow: () => wall,
+    onEvent: options.onEvent ?? ((event) => logged.push(event)),
+    maxSamples: options.maxSamples,
+    schedule(callback, delayMs) {
+      scheduled.push({ callback, delayMs });
+      pending.add(callback);
+      return () => {
+        pending.delete(callback);
+      };
+    },
+  });
+  return {
+    diagnostics,
+    pending,
+    scheduled,
+    logged,
+    advance(ms: number) {
+      monotonic += ms;
+      wall += ms;
+    },
+    setWall(ms: number) {
+      wall = ms;
+    },
+    tick() {
+      const callback = pending.values().next().value;
+      expect(callback).toBeDefined();
+      pending.delete(callback!);
+      callback!();
+    },
+  };
+}
+
+describe("bounded runtime diagnostics", () => {
+  test("production timers are unref'd and cancelled on stop", () => {
+    let unrefs = 0;
+    const timer = {
+      unref: () => {
+        unrefs += 1;
+      },
+    } as unknown as ReturnType<typeof setTimeout>;
+    const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(() => timer);
+    const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation(() => undefined);
+    try {
+      const diagnostics = new RuntimeDiagnostics({ service: "test" });
+      expect(setTimer).not.toHaveBeenCalled();
+      diagnostics.start();
+      expect(unrefs).toBe(1);
+      expect(setTimer).toHaveBeenCalledTimes(1);
+      diagnostics.stop();
+      expect(clearTimer).toHaveBeenCalledWith(timer);
+    } finally {
+      setTimer.mockRestore();
+      clearTimer.mockRestore();
+    }
+  });
+
+  test("construction is inert and start/stop are idempotent with one timer", () => {
+    const f = fixture();
+    expect(f.pending.size).toBe(0);
+    expect(f.diagnostics.snapshot().running).toBe(false);
+    f.diagnostics.stop();
+    f.diagnostics.start();
+    f.diagnostics.start();
+    expect(f.pending.size).toBe(1);
+    expect(f.scheduled).toHaveLength(1);
+    expect(f.scheduled[0].delayMs).toBe(1000);
+    f.diagnostics.stop();
+    f.diagnostics.stop();
+    expect(f.pending.size).toBe(0);
+    expect(f.diagnostics.snapshot().running).toBe(false);
+  });
+
+  test("measures late timer firing and rebases without catch-up drift", () => {
+    const f = fixture();
+    f.diagnostics.start();
+    f.advance(12_000);
+    f.tick();
+    expect(f.logged).toEqual([
+      {
+        event: "runtime_event_loop_delay",
+        service: "fixture_service",
+        delayMs: 11_000,
+        sampleIntervalMs: 1000,
+        observedAt: "2026-09-28T00:00:12.000Z",
+      },
+    ]);
+    expect(f.pending.size).toBe(1);
+    expect(f.scheduled).toHaveLength(2);
+    f.advance(1000);
+    f.tick();
+    expect(f.diagnostics.snapshot()).toMatchObject({
+      lastEventLoopDelayMs: 0,
+      maxEventLoopDelayMs: 11_000,
+      slowEventLoopSamples: 1,
+    });
+    expect(f.logged).toHaveLength(1);
+    f.diagnostics.stop();
+  });
+
+  test("stale callbacks cannot revive stopped or restarted samplers", () => {
+    const f = fixture();
+    f.diagnostics.start();
+    const oldCallback = f.scheduled[0].callback;
+    f.diagnostics.stop();
+    f.advance(40_000);
+    oldCallback();
+    expect(f.scheduled).toHaveLength(1);
+    f.diagnostics.start();
+    oldCallback();
+    expect(f.pending.size).toBe(1);
+    expect(f.scheduled).toHaveLength(2);
+    f.advance(1000);
+    f.tick();
+    expect(f.diagnostics.snapshot().lastEventLoopDelayMs).toBe(0);
+    expect(f.logged).toHaveLength(0);
+    f.diagnostics.stop();
+  });
+
+  test("sink may stop the sampler during notification without rescheduling", () => {
+    const f = fixture({ onEvent: () => f.diagnostics.stop() });
+    f.diagnostics.start();
+    f.advance(2000);
+    f.tick();
+    expect(f.pending.size).toBe(0);
+    expect(f.diagnostics.snapshot().running).toBe(false);
+  });
+
+  test("operation wrappers preserve exact return values and thrown values", () => {
+    const f = fixture();
+    const result = {};
+    expect(f.diagnostics.run("fast", () => result)).toBe(result);
+    expect(f.logged).toHaveLength(0);
+    const failure = { code: "PRIVATE_ERROR_MUST_NOT_BE_LOGGED" };
+    let caught: unknown;
+    try {
+      f.diagnostics.run("snapshot.build", () => {
+        f.advance(1500);
+        throw failure;
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(failure);
+    expect(f.logged[0]).toMatchObject({
+      event: "runtime_slow_operation",
+      stage: "snapshot.build",
+      durationMs: 1500,
+    });
+    expect(JSON.stringify(f.diagnostics.snapshot())).not.toContain(failure.code);
+  });
+
+  test("async wrappers record successful and rejected operations in finally", async () => {
+    const f = fixture();
+    const result = {};
+    expect(
+      await f.diagnostics.runAsync("publish", async () => {
+        f.advance(1000);
+        return result;
+      }),
+    ).toBe(result);
+    const error = new Error("private rejection");
+    await expect(
+      f.diagnostics.runAsync("validate", async () => {
+        f.advance(1500);
+        throw error;
+      }),
+    ).rejects.toBe(error);
+    expect(f.diagnostics.snapshot().slowOperationSamples).toBe(2);
+    expect(f.logged.map((event) => event.event)).toEqual([
+      "runtime_slow_operation",
+      "runtime_slow_operation",
+    ]);
+    expect(JSON.stringify(f.logged)).not.toContain(error.message);
+  });
+
+  test("operation wrappers record before sampler start and after stop", async () => {
+    const f = fixture();
+    f.diagnostics.run("startup", () => f.advance(1000));
+    f.diagnostics.start();
+    f.diagnostics.stop();
+    await f.diagnostics.runAsync("shutdown", async () => {
+      f.advance(1000);
+    });
+    expect(f.diagnostics.snapshot().slowOperationSamples).toBe(2);
+    expect(f.pending.size).toBe(0);
+  });
+
+  test("durations use monotonic time even when the wall clock moves backwards", () => {
+    const f = fixture();
+    f.diagnostics.run("database.query", () => {
+      f.advance(1500);
+      f.setWall(Date.UTC(2020, 0, 1));
+    });
+    expect(f.logged[0]).toMatchObject({ durationMs: 1500, observedAt: "2020-01-01T00:00:00.000Z" });
+  });
+
+  test("ring size is bounded and snapshots and sinks cannot mutate retained samples", () => {
+    const f = fixture({
+      maxSamples: 2,
+      onEvent: (event) => {
+        event.service = "sink_mutation";
+      },
+    });
+    for (let i = 0; i < 10; i += 1) f.diagnostics.run(`step${i}`, () => f.advance(1000));
+    const snapshot = f.diagnostics.snapshot();
+    expect(snapshot.recentSlowEvents).toHaveLength(2);
+    expect(snapshot.slowOperationSamples).toBe(10);
+    expect(snapshot.recentSlowEvents[0]).toMatchObject({
+      service: "fixture_service",
+      stage: "step8",
+    });
+    snapshot.recentSlowEvents[0].service = "snapshot_mutation";
+    snapshot.recentSlowEvents.length = 0;
+    expect(f.diagnostics.snapshot().recentSlowEvents).toHaveLength(2);
+    expect(f.diagnostics.snapshot().recentSlowEvents[0].service).toBe("fixture_service");
+  });
+
+  test("concurrent slow completions retain samples but rate-limit log emission", async () => {
+    const f = fixture();
+    let finish!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const operations = Array.from({ length: 30 }, () =>
+      f.diagnostics.runAsync("parallel", () => ready),
+    );
+    f.advance(1000);
+    finish();
+    await Promise.all(operations);
+    expect(f.logged).toHaveLength(1);
+    expect(f.diagnostics.snapshot()).toMatchObject({
+      slowOperationSamples: 30,
+      suppressedLogEvents: 29,
+    });
+    expect(f.diagnostics.snapshot().recentSlowEvents).toHaveLength(16);
+    f.diagnostics.run("next", () => f.advance(1000));
+    expect(f.logged).toHaveLength(2);
+  });
+
+  test("throwing and rejecting sinks do not change results, errors, or timer continuity", async () => {
+    const f = fixture({
+      onEvent: () => {
+        throw new Error("sink failed");
+      },
+    });
+    expect(
+      f.diagnostics.run("work", () => {
+        f.advance(1000);
+        return 42;
+      }),
+    ).toBe(42);
+    f.diagnostics.start();
+    f.advance(2000);
+    f.tick();
+    expect(f.pending.size).toBe(1);
+    f.diagnostics.stop();
+    const asyncSink = fixture({
+      onEvent: async () => {
+        throw new Error("async sink failed");
+      },
+    });
+    const original = new Error("original");
+    await expect(
+      asyncSink.diagnostics.runAsync("work", async () => {
+        asyncSink.advance(1000);
+        throw original;
+      }),
+    ).rejects.toBe(original);
+    await Promise.resolve();
+    expect(asyncSink.diagnostics.snapshot().slowOperationSamples).toBe(1);
+  });
+
+  test("failed or invalid clocks cannot prevent work or replace results and failures", async () => {
+    for (const now of [
+      () => {
+        throw new Error("clock failed");
+      },
+      () => NaN,
+      () => Infinity,
+    ]) {
+      const diagnostics = new RuntimeDiagnostics({ service: "test", now });
+      expect(diagnostics.run("work", () => 42)).toBe(42);
+      const failure = {};
+      let caught: unknown;
+      try {
+        diagnostics.run("work", () => {
+          throw failure;
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(failure);
+      expect(await diagnostics.runAsync("work", async () => 42)).toBe(42);
+      await expect(
+        diagnostics.runAsync("work", async () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      expect(() => diagnostics.start()).not.toThrow();
+      expect(diagnostics.snapshot().running).toBe(false);
+      expect(diagnostics.snapshot().recentSlowEvents).toHaveLength(0);
+    }
+  });
+
+  test("a completion clock failure does not mask successful or failed work", () => {
+    let broken = false;
+    const diagnostics = new RuntimeDiagnostics({
+      service: "test",
+      now: () => {
+        if (broken) throw new Error("clock failed");
+        return 0;
+      },
+    });
+    expect(
+      diagnostics.run("work", () => {
+        broken = true;
+        return 42;
+      }),
+    ).toBe(42);
+    broken = false;
+    const failure = new Error("original");
+    expect(() =>
+      diagnostics.run("work", () => {
+        broken = true;
+        throw failure;
+      }),
+    ).toThrow(failure);
+  });
+
+  test("a broken clock during sampling disables diagnostics without escaping the callback", () => {
+    let broken = false;
+    let callback!: () => void;
+    const diagnostics = new RuntimeDiagnostics({
+      service: "test",
+      now: () => {
+        if (broken) throw new Error("clock failed");
+        return 0;
+      },
+      schedule: (next) => {
+        callback = next;
+        return () => undefined;
+      },
+    });
+    diagnostics.start();
+    broken = true;
+    expect(() => callback()).not.toThrow();
+    expect(diagnostics.snapshot().running).toBe(false);
+  });
+
+  test("scheduler failures during start or rescheduling disable only diagnostics", () => {
+    const initialFailure = new RuntimeDiagnostics({
+      service: "test",
+      schedule: () => {
+        throw new Error("schedule failed");
+      },
+    });
+    expect(() => initialFailure.start()).not.toThrow();
+    expect(initialFailure.snapshot().running).toBe(false);
+    let callback!: () => void;
+    let schedules = 0;
+    const rescheduleFailure = new RuntimeDiagnostics({
+      service: "test",
+      now: () => 0,
+      schedule: (next) => {
+        schedules += 1;
+        if (schedules > 1) throw new Error("reschedule failed");
+        callback = next;
+        return () => undefined;
+      },
+    });
+    rescheduleFailure.start();
+    expect(() => callback()).not.toThrow();
+    expect(rescheduleFailure.snapshot().running).toBe(false);
+    expect(schedules).toBe(2);
+  });
+
+  test("throwing cancellation does not block shutdown or revive stale callbacks", () => {
+    let callback!: () => void;
+    let cancellations = 0;
+    const diagnostics = new RuntimeDiagnostics({
+      service: "test",
+      schedule: (next) => {
+        callback = next;
+        return () => {
+          cancellations += 1;
+          throw new Error("cancel failed");
+        };
+      },
+    });
+    diagnostics.start();
+    expect(() => diagnostics.stop()).not.toThrow();
+    expect(() => diagnostics.stop()).not.toThrow();
+    expect(() => callback()).not.toThrow();
+    expect(cancellations).toBe(1);
+    expect(diagnostics.snapshot().running).toBe(false);
+  });
+
+  test("invalid wall timestamps do not replace caller outcomes or break sampler continuity", () => {
+    let now = 0;
+    let callback!: () => void;
+    const diagnostics = new RuntimeDiagnostics({
+      service: "test",
+      now: () => now,
+      wallNow: () => NaN,
+      schedule: (next) => {
+        callback = next;
+        return () => undefined;
+      },
+    });
+    expect(
+      diagnostics.run("work", () => {
+        now = 1000;
+        return 42;
+      }),
+    ).toBe(42);
+    diagnostics.start();
+    now = 4000;
+    expect(() => callback()).not.toThrow();
+    expect(diagnostics.snapshot().running).toBe(true);
+    diagnostics.stop();
+  });
+
+  test("invalid stage labels are not recorded as raw request or error text", () => {
+    const f = fixture();
+    f.diagnostics.run("request body: secret password", () => f.advance(1000));
+    expect(f.logged[0]).toMatchObject({ stage: "operation" });
+    expect(JSON.stringify(f.logged)).not.toContain("secret");
+  });
+
+  test("strict options reject nonfinite, negative, fractional, and unsafe sizes", () => {
+    for (const name of ["sampleIntervalMs", "slowThresholdMs", "maxSamples"] as const) {
+      for (const value of [NaN, Infinity, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => new RuntimeDiagnostics({ service: "test", [name]: value })).toThrow(
+          RangeError,
+        );
+      }
+    }
+    expect(() => new RuntimeDiagnostics({ service: "test", sampleIntervalMs: 60_001 })).toThrow(
+      RangeError,
+    );
+    expect(() => new RuntimeDiagnostics({ service: "test", slowThresholdMs: 86_400_001 })).toThrow(
+      RangeError,
+    );
+    expect(() => new RuntimeDiagnostics({ service: "request body: secret" })).toThrow(TypeError);
+    const f = fixture({ maxSamples: 1000 });
+    for (let i = 0; i < 100; i += 1) f.diagnostics.run("work", () => f.advance(1000));
+    expect(f.diagnostics.snapshot().recentSlowEvents).toHaveLength(64);
+  });
+});

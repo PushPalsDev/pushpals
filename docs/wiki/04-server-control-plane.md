@@ -39,6 +39,17 @@ Publication-bearing jobs follow `pending -> claimed (pre-start) -> claimed (star
 
 ## Design Choices That Matter
 
+Server health (`/healthz`) and runtime status include bounded in-memory runtime
+diagnostics. A one-second monotonic sampler records event-loop delay; lifecycle
+reconciliation stages record operations lasting at least one second. The last 16
+slow samples survive subsequent healthy probes in the current process, and
+structured `runtimeDiagnostics` logs are rate-limited to one event per second.
+They contain fixed service/stage identifiers and timings, not request bodies,
+credentials, or error contents. Sampling does not change health verdicts or
+restart policy. A delay is evidence of late scheduling, not proof of a particular
+root cause or measured downtime; asynchronous operation durations also include
+awaited I/O. History resets on process restart; logs retain emitted evidence.
+
 ### 1) Event durability first
 
 Events are persisted before live broadcast. This keeps SSE/WS replay consistent across crashes.

@@ -195,6 +195,36 @@ function coverageRecords(memory: MemoryStore, request: RepositoryAgentRequest) {
   });
 }
 
+async function seedLastCoveragePage(
+  worker: RepositoryAgentWorker,
+  memory: MemoryStore,
+  request: RepositoryAgentRequest,
+) {
+  await worker.analyze("window-fixture-first", request);
+  const [first] = await coverageRecords(memory, request);
+  const paths = git(request.repository.root, ["ls-files", "-z"]).split("\0").filter(Boolean);
+  const coverage = await (worker as any).readEvidenceCoverage(
+    request,
+    { paths, pathByComparable: new Map(paths.map((path) => [path, path])) },
+    "fixture-analysis",
+    new AbortController().signal,
+    Date.parse(request.deadlineAt),
+    [],
+  );
+  expect(coverage.pageCount).toBe(16);
+  await memory.put(
+    {
+      ...first!,
+      value: {
+        ...(first!.value as any),
+        nextPage: 15,
+        reviewedPageFingerprints: coverage.pageFingerprints.slice(0, 15),
+      },
+    },
+    { expectedRevision: first!.revision },
+  );
+}
+
 function emptyAutonomyResponse(): Record<string, unknown> {
   return modelResponse({ data: { candidates: [] } });
 }
@@ -1165,7 +1195,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     ).rejects.toThrow("tracked inventory is incomplete");
   });
 
-  test("caps evidence pages and reports bounded exhaustion without claiming the repo is exhausted", async () => {
+  test("continues beyond the first 96 paths across restart with bounded evidence windows", async () => {
     const repo = createCoverageRepository(100);
     const request = await coverageRequest(repo);
     const memory = new InMemoryMemoryStore();
@@ -1177,42 +1207,57 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       llm,
       logger: { ...quietLogger, log: (line) => logs.push(String(line)) },
     });
-    await worker.analyze("coverage-cap-first", request);
-    const [first] = await coverageRecords(memory, request);
-    expect((first!.value as any).pageCount).toBe(16);
-    const paths = git(repo, ["ls-files", "-z"]).split("\0").filter(Boolean);
-    const coverage = await (worker as any).readEvidenceCoverage(
-      request,
-      { paths, pathByComparable: new Map(paths.map((path) => [path, path])) },
-      "fixture-analysis",
-      new AbortController().signal,
-      Date.parse(request.deadlineAt),
-      [],
+    await seedLastCoveragePage(worker, memory, request);
+    const boundary = await worker.analyze("coverage-cap-last", request);
+    expect(boundary.discoveryProgress).toMatchObject({
+      page: 16,
+      pageCount: 16,
+      advanced: true,
+      boundedCoverageExhausted: false,
+      nextWindowAvailable: true,
+      retryEligible: true,
+    });
+    expect(sanitizeRepositoryAgentResult(boundary).discoveryProgress).toEqual(
+      boundary.discoveryProgress,
     );
-    await memory.put(
-      {
-        ...first!,
-        value: {
-          ...(first!.value as any),
-          nextPage: 15,
-          reviewedPageFingerprints: coverage.pageFingerprints.slice(0, 15),
-        },
-      },
-      { expectedRevision: first!.revision },
-    );
-    await worker.analyze("coverage-cap-last", request);
     const [last] = await coverageRecords(memory, request);
-    expect((last!.value as any).nextPage).toBe(16);
-    const cached = await worker.analyze("coverage-cap-exhausted", request);
+    expect((last!.value as any).windowStartPage).toBe(16);
+    expect((last!.value as any).nextPage).toBe(0);
+    const restarted = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: { ...quietLogger, log: (line) => logs.push(String(line)) },
+    });
+    const tail = await restarted.analyze("coverage-next-window", request);
+    expect(tail.cache.hit).toBe(false);
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    expect(packets.at(-1).discoveryCoverage).toMatchObject({ window: 2, page: 1 });
+    expect(packets.at(-1).selectedPaths).toContain("src/coverage-099.ts");
+    expect(
+      packets.every((packet) => packet.selectedPaths.length <= 6 && packet.files.length <= 12),
+    ).toBe(true);
+    expect(packets.every((packet) => packet.seedPaths.includes("vision.md"))).toBe(true);
+    expect(tail.discoveryProgress).toMatchObject({
+      advanced: true,
+      boundedCoverageExhausted: true,
+      retryEligible: false,
+    });
+    const [exhausted] = await coverageRecords(memory, request);
+    const cached = await restarted.analyze("coverage-cap-exhausted", request);
     expect(cached.cache.hit).toBe(true);
-    expect(llm.analysisCalls).toHaveLength(2);
-    expect((await coverageRecords(memory, request))[0]!.revision).toBe(last!.revision);
+    expect(llm.analysisCalls).toHaveLength(3);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(exhausted!.revision);
     const reports = logs
       .filter((line) => line.includes("evidenceCoverage="))
       .map((line) => JSON.parse(line.split("evidenceCoverage=")[1]!));
     expect(reports.at(-1)).toMatchObject({
-      page: 16,
-      pageCount: 16,
+      page: 1,
+      pageCount: 1,
+      window: 2,
+      windowCount: 2,
       additionalPathsCapped: true,
       boundedCoverageExhausted: true,
       repositoryExhaustivenessEstablished: false,
@@ -1220,6 +1265,205 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       advanced: false,
     });
   }, 30_000);
+
+  test("after final-window exhaustion changed earlier evidence is revisited without resetting unchanged pages", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    await seedLastCoveragePage(worker, memory, request);
+    await worker.analyze("rewind-window-boundary", request);
+    await worker.analyze("rewind-final-window", request);
+    const [exhausted] = await coverageRecords(memory, request);
+    expect((exhausted!.value as any).windowStartPage).toBe(16);
+    expect((exhausted!.value as any).reviewedPageFingerprints).toHaveLength(17);
+    writeFileSync(
+      join(repo, "src", "coverage-000.ts"),
+      "export const changedEarlierEvidence = true;\n",
+    );
+    git(repo, ["add", "src/coverage-000.ts"]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "change previously reviewed early evidence",
+    ]);
+    const changedRequest = { ...request, repository: await resolveRepositorySnapshot(repo) };
+    const changed = await worker.analyze("rewind-earlier-window", changedRequest);
+    expect(changed.cache.hit).toBe(false);
+    expect(changed.discoveryProgress).toMatchObject({
+      page: 1,
+      advanced: true,
+      retryEligible: true,
+      boundedCoverageExhausted: false,
+    });
+    const packet = JSON.parse(llm.analysisCalls.at(-1)!.messages[0]!.content).evidencePacket;
+    expect(packet.discoveryCoverage).toMatchObject({ window: 1, page: 1 });
+    expect(packet.selectedPaths).toContain("src/coverage-000.ts");
+    expect(llm.analysisCalls).toHaveLength(4);
+    const [reconciled] = await coverageRecords(memory, changedRequest);
+    // All unchanged earlier pages stay visited, so this single changed page
+    // advances directly back to the tail window, not sixteen new model calls.
+    expect((reconciled!.value as any).windowStartPage).toBe(16);
+    expect((reconciled!.value as any).reviewedPageFingerprints).toHaveLength(18);
+    expect((reconciled!.value as any).repositoryRevision).toBe(changedRequest.repository.revision);
+  });
+
+  test("legacy exhausted first-window memory resumes from its cached final page without clearing state", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    await seedLastCoveragePage(worker, memory, request);
+    await worker.analyze("legacy-cache-final-page", request);
+    const [current] = await coverageRecords(memory, request);
+    const {
+      windowStartPage: _windowStartPage,
+      rankedPlanHash: _rankedPlanHash,
+      repositoryRevision: _repositoryRevision,
+      ...legacyValue
+    } = current!.value as Record<string, any>;
+    const legacy = await memory.put(
+      {
+        ...current!,
+        value: { ...legacyValue, nextPage: 16, pageCount: 16 },
+      },
+      { expectedRevision: current!.revision },
+    );
+    const restarted = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+
+    const migrated = await restarted.analyze("legacy-exhausted-resume", request);
+
+    expect(migrated.cache.hit).toBe(true);
+    expect(migrated.discoveryProgress).toMatchObject({
+      page: 16,
+      pageCount: 16,
+      advanced: true,
+      boundedCoverageExhausted: false,
+      nextWindowAvailable: true,
+      retryEligible: true,
+    });
+    expect(llm.analysisCalls).toHaveLength(2);
+    const [advanced] = await coverageRecords(memory, request);
+    expect(advanced!.revision).toBe(legacy.revision + 1);
+    expect(advanced!.value).toMatchObject({ windowStartPage: 16, nextPage: 0 });
+    await restarted.analyze("legacy-unseen-tail", request);
+    const packet = JSON.parse(llm.analysisCalls.at(-1)!.messages[0]!.content).evidencePacket;
+    expect(packet.discoveryCoverage).toMatchObject({ window: 2, page: 1 });
+    expect(packet.selectedPaths).toContain("src/coverage-099.ts");
+    expect(llm.analysisCalls).toHaveLength(3);
+  });
+
+  test("window-boundary CAS failure retries the cached page but cache_only cannot rotate", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const store = new InMemoryMemoryStore();
+    let rejectBoundary = true;
+    const memory = memoryWithHooks(store, {
+      put: async (input) => {
+        if (input.kind === coverageKind && input.value.windowStartPage === 16 && rejectBoundary)
+          throw new Error("window cursor persistence unavailable");
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    await seedLastCoveragePage(worker, memory, request);
+    const failed = await worker.analyze("boundary-cas-failed", request);
+    expect(failed.discoveryProgress).toMatchObject({ advanced: false, retryEligible: false });
+    expect(failed.discoveryProgress?.nextWindowAvailable).not.toBe(true);
+    expect((await coverageRecords(memory, request))[0]!.value).toMatchObject({
+      windowStartPage: 0,
+      nextPage: 15,
+    });
+    rejectBoundary = false;
+    const only = await worker.analyze("boundary-cache-only", {
+      ...request,
+      freshness: "cache_only",
+    });
+    expect(only.cache.hit).toBe(true);
+    expect(only.discoveryProgress).toMatchObject({ advanced: false, retryEligible: false });
+    expect((await coverageRecords(memory, request))[0]!.value).toMatchObject({
+      windowStartPage: 0,
+      nextPage: 15,
+    });
+    const retry = await worker.analyze("boundary-cas-retry", request);
+    expect(retry.cache.hit).toBe(true);
+    expect(retry.discoveryProgress).toMatchObject({
+      advanced: true,
+      nextWindowAvailable: true,
+      retryEligible: true,
+    });
+    expect(llm.analysisCalls).toHaveLength(2);
+    expect((await coverageRecords(memory, request))[0]!.value).toMatchObject({
+      windowStartPage: 16,
+      nextPage: 0,
+    });
+  });
+
+  test("removing an exclusion restores an earlier-window positive without another model call", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() => (++calls === 1 ? emptyAutonomyResponse() : modelResponse()));
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    await seedLastCoveragePage(worker, memory, request);
+    const positive = await worker.analyze("boundary-positive", request);
+    expect((positive.data as any).candidates).toHaveLength(1);
+    const excluded = await worker.analyze("boundary-positive-excluded", {
+      ...request,
+      context: { ...request.context, discoveryExclusions: { targetPaths: ["src/index.ts"] } },
+    });
+    expect(excluded.cache.hit).toBe(true);
+    expect(excluded.discoveryProgress).toMatchObject({
+      page: 16,
+      advanced: true,
+      nextWindowAvailable: true,
+      excludedCandidateCount: 1,
+    });
+    expect((await coverageRecords(memory, request))[0]!.value).toMatchObject({
+      windowStartPage: 16,
+    });
+    const restored = await worker.analyze("boundary-exclusion-removed", request);
+    expect(restored.cache.hit).toBe(true);
+    expect((restored.data as any).candidates).toHaveLength(1);
+    expect(restored.discoveryProgress).toMatchObject({
+      page: 16,
+      advanced: false,
+      retryEligible: false,
+    });
+    expect(llm.analysisCalls).toHaveLength(2);
+  });
 
   test("retries failed cursor writes from cached empty pages but cache_only never advances", async () => {
     const repo = createCoverageRepository();

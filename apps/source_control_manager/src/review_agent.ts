@@ -1523,6 +1523,8 @@ export class ReviewAgent {
   private reviewerMd = "";
   private providerPollInFlight = false;
   private reviewPollInFlight = false;
+  private reviewPollRequested = false;
+  private requestedReviewPoll: Promise<void> | null = null;
   private stopped = false;
   private activePollRuns = new Set<Promise<void>>();
   private readonly deps: ReviewAgentDeps;
@@ -1708,6 +1710,47 @@ export class ReviewAgent {
     this.forceReReview.set(prNumber, normalizedSha);
   }
 
+  /** Wake the existing bounded review lane after a confirmed publication. */
+  requestReviewPoll(): void {
+    if (this.stopped || !this.config.enabled) return;
+    this.reviewPollRequested = true;
+    this.scheduleRequestedReviewPoll();
+  }
+
+  private scheduleRequestedReviewPoll(): void {
+    if (
+      this.stopped ||
+      !this.config.enabled ||
+      !this.reviewPollRequested ||
+      this.reviewPollInFlight ||
+      this.requestedReviewPoll
+    ) {
+      return;
+    }
+    let trackedPoll!: Promise<void>;
+    trackedPoll = Promise.resolve()
+      .then(async () => {
+        if (this.stopped || !this.config.enabled || !this.reviewPollRequested) return;
+        // A periodic poll may have started since this microtask was queued.
+        // Keep one pending request until that lane finishes, never overlap it.
+        if (this.reviewPollInFlight) return;
+        this.reviewPollRequested = false;
+        await this.pollOpenPrReviews();
+      })
+      .catch((error: unknown) => {
+        this.deps.logError(
+          `[${ts()}] [ReviewAgent] Publication-triggered review poll failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        this.activePollRuns.delete(trackedPoll);
+        this.requestedReviewPoll = null;
+        this.scheduleRequestedReviewPoll();
+      });
+    this.requestedReviewPoll = trackedPoll;
+    this.activePollRuns.add(trackedPoll);
+  }
+
   /**
    * Apply readiness-only runtime changes without replacing the reconciler.
    * Provider cursors, retry queues, review hashes, and fairness state belong to
@@ -1720,6 +1763,7 @@ export class ReviewAgent {
       String(this.config.reviewerMdPath ?? "").trim() !==
       String(nextConfig.reviewerMdPath ?? "").trim();
     this.config = { ...nextConfig };
+    if (!this.config.enabled) this.reviewPollRequested = false;
     if (reviewerPathChanged) this.reviewerMd = "";
     return { becameEnabled };
   }
@@ -1792,6 +1836,7 @@ export class ReviewAgent {
 
   async stopAndDrain(): Promise<void> {
     this.stopped = true;
+    this.reviewPollRequested = false;
     while (this.activePollRuns.size > 0) {
       await Promise.allSettled([...this.activePollRuns]);
     }
@@ -2101,6 +2146,7 @@ export class ReviewAgent {
       }
     } finally {
       this.reviewPollInFlight = false;
+      this.scheduleRequestedReviewPoll();
     }
   }
 

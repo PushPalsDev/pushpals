@@ -1,3 +1,5 @@
+import type { RuntimeDiagnostics } from "../../../packages/shared/src/runtime_diagnostics.js";
+
 export type ReconciliationHealth = {
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
@@ -9,11 +11,15 @@ export type ReconciliationHealth = {
 export class LifecycleReconciliationTracker {
   private readonly health = new Map<string, ReconciliationHealth>();
 
+  constructor(private readonly diagnostics?: Pick<RuntimeDiagnostics, "run">) {}
+
   run<T>(label: string, fallback: T, reconcile: () => T, onError?: (detail: string) => void): T {
     const attemptedAt = new Date().toISOString();
     const previous = this.health.get(label);
     try {
-      const result = reconcile();
+      const result = this.diagnostics
+        ? this.diagnostics.run(`reconciliation:${label.replace(/\s+/g, "_")}`, reconcile)
+        : reconcile();
       this.health.set(label, {
         lastAttemptAt: attemptedAt,
         lastSuccessAt: new Date().toISOString(),

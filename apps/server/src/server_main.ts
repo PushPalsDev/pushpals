@@ -43,6 +43,7 @@ import {
   isLoopbackOrigin,
   loadPushPalsConfig,
   runBoundedProcess,
+  RuntimeDiagnostics,
   sanitizeRepositoryAgentRequest,
   sanitizeRepositoryAgentResult,
   sanitizePushPalsConfigForLogging,
@@ -117,7 +118,11 @@ try {
   // never inherit a credential that can mint repair admission proofs.
   scrubScmRepairAuthoritySecretFromEnv(process.env);
 }
-const reconciliationTracker = new LifecycleReconciliationTracker();
+const runtimeDiagnostics = new RuntimeDiagnostics({
+  service: "server",
+  onEvent: (event) => console.warn(`[Server] runtimeDiagnostics=${JSON.stringify(event)}`),
+});
+const reconciliationTracker = new LifecycleReconciliationTracker(runtimeDiagnostics);
 function guardedReconciliation<T>(label: string, fallback: T, reconcile: () => T): T {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
     console.error(
@@ -1433,6 +1438,7 @@ export function createRequestHandler() {
       const initiateShutdown = (reason: string): void => {
         if (isShuttingDown) return;
         isShuttingDown = true;
+        runtimeDiagnostics.stop();
         console.warn(`[Server] Shutdown requested: ${reason}`);
         clearInterval(lifecycleWatchdogTimer);
         clearInterval(clientPresencePruneTimer);
@@ -1506,7 +1512,12 @@ export function createRequestHandler() {
 
       // GET /healthz
       if (pathname === "/healthz" && method === "GET") {
-        return makeJson({ ok: true, protocolVersion: PROTOCOL_VERSION });
+        // In-memory diagnostics only: liveness must not wait for DB work or another service.
+        return makeJson({
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          diagnostics: runtimeDiagnostics.snapshot(),
+        });
       }
 
       // POST /admin/shutdown (auth protected)
@@ -2690,6 +2701,7 @@ export function createRequestHandler() {
             startedAt: SERVER_STARTED_AT_ISO,
             uptimeMs: Math.max(0, Date.now() - SERVER_STARTED_AT_MS),
             reconciliation: reconciliationTracker.snapshot(),
+            diagnostics: runtimeDiagnostics.snapshot(),
           },
           workers: {
             total: workers.length,
@@ -4688,5 +4700,7 @@ export {
 // If this file is executed directly, start the server.
 if (import.meta.main) {
   const server = createRequestHandler();
+  runtimeDiagnostics.start();
+  process.once("exit", () => runtimeDiagnostics.stop());
   console.log(`[Server] PushPals listening on ${server.url}`);
 }

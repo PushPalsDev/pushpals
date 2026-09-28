@@ -73,9 +73,11 @@ safe.
 Clean autonomy snapshots retain bounded evidence coverage in shared memory.
 After a grounded empty result, later ticks can examine the next ranked group of
 tracked files instead of replaying the same empty packet indefinitely. The host
-retains seed files, limits discovery to sixteen pages of at most six additional
-paths, and uses one synthesis stage per request. Reaching that cap means bounded
-coverage is exhausted, not that the repository has no useful work. Scope,
+retains seed files, groups discovery into windows of sixteen pages of at most six
+additional paths each, and uses one synthesis stage per request. A completed
+window advances durably to the next ranked window rather than pinning discovery
+to the first 96 paths. Exhausting the bounded tracked inventory still does not
+prove that the repository has no useful work. Scope,
 validation, and admission gates still apply; failures do not advance coverage.
 Explicit vision non-goals remain in the structural model context. Transient
 queue, objective, and cooldown state is applied by current downstream eligibility
@@ -94,6 +96,8 @@ resource/dispatch budgets, publication backpressure, and the dispatch lock.
 Unknown capacity, analysis failures, exhausted coverage, pause, and shutdown
 cannot start an accelerated loop. A successful dispatch retains the normal
 cadence because its planning request may not yet be visible as a worker job.
+The same follow-up budget applies at a window boundary, and only an explicit
+host-confirmed next-window transition makes a final page eligible for it.
 Discovery progress and scheduling logs distinguish useful coverage advancement
 from a cache replay; neither is counted as a completed coding job.
 

@@ -2940,12 +2940,16 @@ function sanitizeDiscoveryProgress(value) {
   for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
     if (typeof value[key] !== "boolean")
       invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  if (value.nextWindowAvailable !== undefined && typeof value.nextWindowAvailable !== "boolean")
+    invalidResponse("result.discoveryProgress.nextWindowAvailable must be boolean");
+  const nextWindowAvailable = value.nextWindowAvailable === true && page === pageCount && value.advanced === true && value.boundedCoverageExhausted === false;
   return {
     page,
     pageCount,
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
-    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
+    ...value.nextWindowAvailable === undefined ? {} : { nextWindowAvailable },
     excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
   };
 }
@@ -8387,7 +8391,7 @@ function canonicalizeInstructionTextForBun(text2) {
 // apps/remotebuddy/src/autonomous_engine.ts
 function autonomyDiscoveryProgress(value) {
   const row = asObject(value);
-  if (!Number.isInteger(row.page) || !Number.isInteger(row.pageCount) || Number(row.page) < 1 || Number(row.pageCount) > 16 || Number(row.page) > Number(row.pageCount) || typeof row.advanced !== "boolean" || typeof row.boundedCoverageExhausted !== "boolean" || typeof row.retryEligible !== "boolean" || !Number.isInteger(row.excludedCandidateCount) || Number(row.excludedCandidateCount) < 0)
+  if (!Number.isInteger(row.page) || !Number.isInteger(row.pageCount) || Number(row.page) < 1 || Number(row.pageCount) > 16 || Number(row.page) > Number(row.pageCount) || typeof row.advanced !== "boolean" || typeof row.boundedCoverageExhausted !== "boolean" || typeof row.retryEligible !== "boolean" || row.nextWindowAvailable !== undefined && typeof row.nextWindowAvailable !== "boolean" || !Number.isInteger(row.excludedCandidateCount) || Number(row.excludedCandidateCount) < 0)
     return null;
   return row;
 }
@@ -12606,7 +12610,7 @@ class RemoteBuddyAutonomousEngine {
     this.refreshNextTickAt();
   }
   scheduleDiscoveryFollowup(progress, generation) {
-    if (generation !== this.schedulingGeneration || this.stopped || !this.runtimeEnabled || !this.startRequested || !this.timer || this.inFlight || this.cfg.killSwitchEnabled || this.discoveryFollowupTimer || this.discoveryFollowupAttemptsRemaining <= 0 || Date.now() < this.dispatchBackoffUntilMs || !progress.retryEligible || !progress.advanced || progress.boundedCoverageExhausted || progress.page >= progress.pageCount)
+    if (generation !== this.schedulingGeneration || this.stopped || !this.runtimeEnabled || !this.startRequested || !this.timer || this.inFlight || this.cfg.killSwitchEnabled || this.discoveryFollowupTimer || this.discoveryFollowupAttemptsRemaining <= 0 || Date.now() < this.dispatchBackoffUntilMs || !progress.retryEligible || !progress.advanced || progress.boundedCoverageExhausted || progress.page >= progress.pageCount && progress.nextWindowAvailable !== true)
       return;
     const dueAt = Date.now() + DISCOVERY_FOLLOWUP_DELAY_MS;
     if (this.baselineNextTickAtMs <= dueAt)
@@ -12629,6 +12633,7 @@ class RemoteBuddyAutonomousEngine {
       page: progress.page,
       pageCount: progress.pageCount,
       advanced: progress.advanced,
+      nextWindowAvailable: progress.nextWindowAvailable === true,
       excludedCandidateCount: progress.excludedCandidateCount,
       remaining: this.discoveryFollowupAttemptsRemaining
     })}`);
@@ -15492,8 +15497,9 @@ var MAX_PACKET_FILES = 12;
 var MAX_SEED_PACKET_FILES = 6;
 var MAX_DISCOVERY_PATHS = 6;
 var MAX_AUTONOMY_DISCOVERY_PAGES = 16;
+var MAX_DISCOVERY_TOTAL_PAGES = Math.ceil(MAX_TRACKED_PATHS / MAX_DISCOVERY_PATHS);
 var COVERAGE_KIND = "repository_autonomy_evidence_coverage";
-var MAX_REVIEWED_PAGE_FINGERPRINTS = MAX_AUTONOMY_DISCOVERY_PAGES * 4;
+var MAX_REVIEWED_PAGE_FINGERPRINTS = MAX_DISCOVERY_TOTAL_PAGES + 64;
 var MAX_PACKET_FILE_BYTES = 16 * 1024;
 var MAX_PACKET_SCAN_FILE_BYTES = 128 * 1024;
 var MAX_PACKET_TOTAL_BYTES = 64000;
@@ -17423,12 +17429,62 @@ class RepositoryAgentWorker {
     const retrievalRequest = discoveryRetrievalRequest(request);
     const seedPaths = seedEvidencePacketPaths(tracked, retrievalRequest.question, retrievalRequest.context);
     const rankedPaths = rankedAdditionalPaths(retrievalRequest, tracked, seedPaths, true);
-    const pageCount = Math.max(1, Math.min(MAX_AUTONOMY_DISCOVERY_PAGES, Math.ceil(rankedPaths.length / MAX_DISCOVERY_PATHS)));
     const discoveryKey = discoveryCoverageKey(request, this.modelId, this.promptVersion);
     const key = `coverage:${discoveryKey}`;
-    const inspectedPaths = [
-      ...new Set([...seedPaths, ...rankedPaths.slice(0, pageCount * MAX_DISCOVERY_PATHS)])
-    ];
+    const exclusionFingerprint = excludedPaths.length ? sha2562(canonicalJson(excludedPaths)) : null;
+    let record = null;
+    let observedRevision = null;
+    try {
+      record = await this.memoryWithinDeadline("evidence coverage read", signal, this.memoryStageDeadline(deadlineMs), () => this.memory.get({ scope: cacheScope(request), key }, { includeExpired: true, statuses: ["active", "stale", "superseded", "invalid"] }));
+      observedRevision = record?.revision ?? 0;
+    } catch (error) {
+      throwIfAborted(signal);
+      this.logger.warn(`[RepositoryAgent] evidence coverage read skipped: ${String(error)}`);
+    }
+    const value = record?.value;
+    const valid = record?.status === "active" && !isExpiredMemoryRecord(record) && record.kind === COVERAGE_KIND && isRecord2(value) && value.schemaVersion === 2 && value.discoveryKey === discoveryKey && typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage >= 0 && value.nextPage <= MAX_AUTONOMY_DISCOVERY_PAGES && (value.windowStartPage === undefined || typeof value.windowStartPage === "number" && Number.isInteger(value.windowStartPage) && value.windowStartPage >= 0 && value.windowStartPage < MAX_DISCOVERY_TOTAL_PAGES && value.windowStartPage % MAX_AUTONOMY_DISCOVERY_PAGES === 0) && Array.isArray(value.reviewedPageFingerprints) && value.reviewedPageFingerprints.length <= MAX_REVIEWED_PAGE_FINGERPRINTS && value.reviewedPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry)) && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length <= MAX_DISCOVERY_TOTAL_PAGES && value.deferredPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry));
+    const rankedPlanHash = sha2562(canonicalJson({ seedPaths, rankedPaths }));
+    let windowStartPage = valid && typeof value.windowStartPage === "number" ? value.windowStartPage : 0;
+    if (windowStartPage * MAX_DISCOVERY_PATHS >= rankedPaths.length || valid && value.rankedPlanHash !== rankedPlanHash)
+      windowStartPage = 0;
+    if (windowStartPage > 0 && valid && value.deferredPageFingerprints.length > 0 && value.exclusionFingerprint !== exclusionFingerprint)
+      windowStartPage = 0;
+    if (windowStartPage > 0 && valid && value.repositoryRevision !== request.repository.revision) {
+      try {
+        if (typeof value.repositoryRevision !== "string" || !/^[a-f\d]{40,64}$/.test(value.repositoryRevision))
+          throw new Error("missing coverage revision");
+        const changed = await runGit(request.repository.root, [
+          "diff",
+          "--no-ext-diff",
+          "--no-renames",
+          "--name-only",
+          "-z",
+          value.repositoryRevision,
+          request.repository.revision,
+          "--"
+        ], { signal, outputLimitBytes: MAX_TRACKED_PATH_BYTES });
+        const seeds = new Set(seedPaths.map(comparablePath));
+        const rankByPath = new Map(rankedPaths.map((path, index) => [comparablePath(path), index]));
+        for (const path of changed.split("\x00").filter(Boolean)) {
+          const comparable = comparablePath(path);
+          if (seeds.has(comparable)) {
+            windowStartPage = 0;
+            break;
+          }
+          const rank = rankByPath.get(comparable);
+          if (rank !== undefined)
+            windowStartPage = Math.min(windowStartPage, Math.floor(rank / (MAX_DISCOVERY_PATHS * MAX_AUTONOMY_DISCOVERY_PAGES)) * MAX_AUTONOMY_DISCOVERY_PAGES);
+        }
+      } catch (error) {
+        throwIfAborted(signal);
+        this.logger.warn(`[RepositoryAgent] evidence window revision reconciliation unavailable; revisiting the first window: ${String(error)}`);
+        windowStartPage = 0;
+      }
+    }
+    const windowPaths = rankedPaths.slice(windowStartPage * MAX_DISCOVERY_PATHS, (windowStartPage + MAX_AUTONOMY_DISCOVERY_PAGES) * MAX_DISCOVERY_PATHS);
+    const pageCount = Math.max(1, Math.ceil(windowPaths.length / MAX_DISCOVERY_PATHS));
+    const hasMoreWindows = (windowStartPage + pageCount) * MAX_DISCOVERY_PATHS < rankedPaths.length;
+    const inspectedPaths = [...new Set([...seedPaths, ...windowPaths])];
     if (inspectedPaths.some((path) => path.length + 3 > 8000)) {
       this.logger.warn("[RepositoryAgent] evidence coverage disabled: path exceeds bounded Git argument size");
       return null;
@@ -17463,21 +17519,14 @@ class RepositoryAgentWorker {
     const seedFingerprint = sha2562(canonicalJson(coordinates(seedPaths)));
     const pageFingerprints = Array.from({ length: pageCount }, (_, page2) => sha2562(canonicalJson({
       seedFingerprint,
-      selected: coordinates(rankedPaths.slice(page2 * MAX_DISCOVERY_PATHS, (page2 + 1) * MAX_DISCOVERY_PATHS))
+      selected: coordinates(windowPaths.slice(page2 * MAX_DISCOVERY_PATHS, (page2 + 1) * MAX_DISCOVERY_PATHS))
     })));
-    const planHash = sha2562(canonicalJson({ seedPaths, pageFingerprints, pageCount }));
-    const exclusionFingerprint = excludedPaths.length ? sha2562(canonicalJson(excludedPaths)) : null;
-    let record = null;
-    let observedRevision = null;
-    try {
-      record = await this.memoryWithinDeadline("evidence coverage read", signal, this.memoryStageDeadline(deadlineMs), () => this.memory.get({ scope: cacheScope(request), key }, { includeExpired: true, statuses: ["active", "stale", "superseded", "invalid"] }));
-      observedRevision = record?.revision ?? 0;
-    } catch (error) {
-      throwIfAborted(signal);
-      this.logger.warn(`[RepositoryAgent] evidence coverage read skipped: ${String(error)}`);
-    }
-    const value = record?.value;
-    const valid = record?.status === "active" && !isExpiredMemoryRecord(record) && record.kind === COVERAGE_KIND && isRecord2(value) && value.schemaVersion === 2 && value.discoveryKey === discoveryKey && typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage >= 0 && value.nextPage <= MAX_AUTONOMY_DISCOVERY_PAGES && Array.isArray(value.reviewedPageFingerprints) && value.reviewedPageFingerprints.length <= MAX_REVIEWED_PAGE_FINGERPRINTS && value.reviewedPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry)) && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length <= MAX_AUTONOMY_DISCOVERY_PAGES && value.deferredPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry));
+    const planHash = sha2562(canonicalJson({
+      seedPaths,
+      pageFingerprints,
+      pageCount,
+      ...windowStartPage > 0 ? { windowStartPage } : {}
+    }));
     const reviewedPageFingerprints = valid ? value.reviewedPageFingerprints : [];
     const deferredPageFingerprints = valid && exclusionFingerprint != null && value.exclusionFingerprint === exclusionFingerprint ? value.deferredPageFingerprints : [];
     const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
@@ -17493,10 +17542,13 @@ class RepositoryAgentWorker {
       exclusionFingerprint,
       deferredPageFingerprints,
       observedRevision,
+      windowStartPage,
+      rankedPlanHash,
+      hasMoreWindows,
       page,
       pageCount,
       rankedPathCount: rankedPaths.length,
-      selectedPaths: rankedPaths.slice(page * MAX_DISCOVERY_PATHS, (page + 1) * MAX_DISCOVERY_PATHS),
+      selectedPaths: windowPaths.slice(page * MAX_DISCOVERY_PATHS, (page + 1) * MAX_DISCOVERY_PATHS),
       boundedCoverageExhausted: nextPage < 0
     };
   }
@@ -17505,6 +17557,9 @@ class RepositoryAgentWorker {
       requestId,
       page: coverage.page + 1,
       pageCount: coverage.pageCount,
+      window: Math.floor(coverage.windowStartPage / MAX_AUTONOMY_DISCOVERY_PAGES) + 1,
+      windowCount: Math.max(1, Math.ceil(coverage.rankedPathCount / (MAX_DISCOVERY_PATHS * MAX_AUTONOMY_DISCOVERY_PAGES))),
+      firstRankedPath: coverage.windowStartPage * MAX_DISCOVERY_PATHS,
       pageLimit: MAX_AUTONOMY_DISCOVERY_PAGES,
       rankedPathCount: coverage.rankedPathCount,
       selectedPathCount: coverage.selectedPaths.length,
@@ -17520,16 +17575,18 @@ class RepositoryAgentWorker {
       return { attempted: false };
     let advanced = false;
     let attempted = false;
-    let exhausted = coverage.boundedCoverageExhausted;
-    if (successfulSynthesis && (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded) && request.freshness !== "cache_only" && !request.repository.dirty && !coverage.boundedCoverageExhausted && coverage.observedRevision != null) {
+    let exhausted = coverage.boundedCoverageExhausted && !coverage.hasMoreWindows;
+    let nextWindowAvailable = false;
+    if (successfulSynthesis && (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded) && request.freshness !== "cache_only" && !request.repository.dirty && (!coverage.boundedCoverageExhausted || coverage.hasMoreWindows) && coverage.observedRevision != null) {
       throwIfAborted(signal);
       attempted = true;
       try {
         const fingerprint = coverage.pageFingerprints[coverage.page];
         const reviewedPageFingerprints = allCandidatesExcluded ? coverage.reviewedPageFingerprints : [...new Set([...coverage.reviewedPageFingerprints, fingerprint])].slice(-MAX_REVIEWED_PAGE_FINGERPRINTS);
-        const deferredPageFingerprints = allCandidatesExcluded ? [...new Set([...coverage.deferredPageFingerprints, fingerprint])].slice(-MAX_AUTONOMY_DISCOVERY_PAGES) : coverage.deferredPageFingerprints;
+        const deferredPageFingerprints = allCandidatesExcluded ? [...new Set([...coverage.deferredPageFingerprints, fingerprint])].slice(-MAX_DISCOVERY_TOTAL_PAGES) : coverage.deferredPageFingerprints;
         const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
         const nextPage = coverage.pageFingerprints.findIndex((entry) => !visited.has(entry));
+        const advanceWindow = nextPage < 0 && coverage.hasMoreWindows;
         await this.memoryPutWithinDeadline("evidence coverage advance", signal, this.memoryStageDeadline(deadlineMs - MIN_FINALIZATION_RESERVE_MS), {
           scope: cacheScope(request),
           key: coverage.key,
@@ -17544,7 +17601,10 @@ class RepositoryAgentWorker {
             reviewedPageFingerprints,
             exclusionFingerprint: coverage.exclusionFingerprint,
             deferredPageFingerprints,
-            nextPage: nextPage < 0 ? coverage.pageCount : nextPage,
+            windowStartPage: advanceWindow ? coverage.windowStartPage + coverage.pageCount : coverage.windowStartPage,
+            rankedPlanHash: coverage.rankedPlanHash,
+            repositoryRevision: request.repository.revision,
+            nextPage: advanceWindow ? 0 : nextPage < 0 ? coverage.pageCount : nextPage,
             pageCount: coverage.pageCount
           },
           status: "active",
@@ -17560,7 +17620,8 @@ class RepositoryAgentWorker {
           ttlMs: this.cacheTtlMs
         }, { expectedRevision: coverage.observedRevision });
         advanced = true;
-        exhausted = nextPage < 0;
+        exhausted = nextPage < 0 && !advanceWindow;
+        nextWindowAvailable = advanceWindow && coverage.page === coverage.pageCount - 1;
       } catch (error) {
         throwIfAborted(signal);
         this.logger.warn(`[RepositoryAgent] evidence coverage advance skipped: ${String(error)}`);
@@ -17574,6 +17635,7 @@ class RepositoryAgentWorker {
         pageCount: coverage.pageCount,
         advanced,
         boundedCoverageExhausted: exhausted,
+        ...nextWindowAvailable ? { nextWindowAvailable: true } : {},
         retryEligible: advanced && !exhausted && (isGroundedEmptyAutonomyResult(result) || allCandidatesExcluded),
         excludedCandidateCount
       }
@@ -17729,6 +17791,8 @@ class RepositoryAgentWorker {
         discoveryCoverage: {
           page: coverage.page + 1,
           pageCount: coverage.pageCount,
+          window: Math.floor(coverage.windowStartPage / MAX_AUTONOMY_DISCOVERY_PAGES) + 1,
+          windowCount: Math.max(1, Math.ceil(coverage.rankedPathCount / (MAX_DISCOVERY_PATHS * MAX_AUTONOMY_DISCOVERY_PAGES))),
           rankedPathCount: coverage.rankedPathCount,
           additionalPathLimit: MAX_AUTONOMY_DISCOVERY_PAGES * MAX_DISCOVERY_PATHS,
           repositoryExhaustivenessEstablished: false

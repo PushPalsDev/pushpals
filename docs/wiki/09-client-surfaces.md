@@ -51,6 +51,13 @@ slower. `--include-caches` is invalid without `--clear`. Neither mode purges Doc
 named volumes (including dependency snapshots and Codex state), installed runtime
 assets, or configuration.
 
+Windows directory cleanup partitions a bounded portion of each tree and removes
+up to four disjoint subtrees concurrently. It does not follow directory links,
+and it awaits all started removals before retrying or reporting completion.
+Configured clear targets stay sequential to handle overlapping paths safely;
+non-Windows platforms keep native recursive removal. Progress continues during
+cleanup; no deletion is detached to run after the command exits.
+
 An unconfirmed requested Docker cleanup (unavailable Docker or a timeout) still
 produces an incomplete summary and exit code `1`, after local cleanup runs. Normal
 clear requires confirmed warm-container cleanup; `--include-caches` additionally

@@ -170,6 +170,22 @@ describe("server runtime config route integration", () => {
     const server = spawnServer(root, port, authToken);
     await waitForHealth(server, port);
 
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    expect(health.status).toBe(200);
+    const healthBody = await health.json();
+    expect(healthBody).toMatchObject({
+      ok: true,
+      diagnostics: {
+        running: true,
+        sampleIntervalMs: 1_000,
+        slowThresholdMs: 1_000,
+        recentSlowEvents: expect.any(Array),
+      },
+    });
+    expect(JSON.stringify(healthBody)).not.toContain(authToken);
+
     const response = await fetch(`http://127.0.0.1:${port}/config/runtime`, {
       method: "POST",
       headers: {

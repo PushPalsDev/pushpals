@@ -9,6 +9,7 @@ import {
   RepositoryAgentClientError,
   RepositoryAgentWorkerClient,
   reinforceRepositoryAgentMemory,
+  sanitizeRepositoryAgentResult,
   type RepositoryAgent,
   type RepositoryAgentResult,
   type RepositoryAgentSubmitInput,
@@ -116,6 +117,53 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
 }
 
 describe("RepositoryAgentClient", () => {
+  test("allows bounded continuation only after a confirmed transition beyond the final page", () => {
+    const response = { ...result(), data: { candidates: [] } };
+    const progress = {
+      page: 16,
+      pageCount: 16,
+      advanced: true,
+      boundedCoverageExhausted: false,
+      retryEligible: true,
+      nextWindowAvailable: true,
+      excludedCandidateCount: 0,
+    };
+    const parsed = sanitizeRepositoryAgentResult({ ...response, discoveryProgress: progress });
+    expect(parsed.discoveryProgress).toEqual(progress);
+    for (const override of [
+      { nextWindowAvailable: undefined },
+      { nextWindowAvailable: false },
+      { advanced: false },
+      { boundedCoverageExhausted: true },
+      { retryEligible: false },
+    ]) {
+      expect(
+        sanitizeRepositoryAgentResult({
+          ...response,
+          discoveryProgress: { ...progress, ...override },
+        }).discoveryProgress?.retryEligible,
+      ).toBe(false);
+    }
+    expect(() =>
+      sanitizeRepositoryAgentResult({
+        ...response,
+        discoveryProgress: { ...progress, nextWindowAvailable: "true" },
+      }),
+    ).toThrow("nextWindowAvailable must be boolean");
+    expect(
+      sanitizeRepositoryAgentResult({
+        ...response,
+        discoveryProgress: { ...progress, page: 1 },
+      }).discoveryProgress?.nextWindowAvailable,
+    ).toBe(false);
+    for (const data of [undefined, { candidates: [{}] }]) {
+      expect(
+        sanitizeRepositoryAgentResult({ ...response, data, discoveryProgress: progress })
+          .discoveryProgress?.retryEligible,
+      ).toBe(false);
+    }
+  });
+
   test("submits a versioned, caller-attributed request with auth and bounded fields", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const client = new RepositoryAgentClient({

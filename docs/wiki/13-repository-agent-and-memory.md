@@ -286,7 +286,11 @@ remain separately fenced to their current tree and outcome context, and every
 returned result still passes current-snapshot validation.
 
 The worker keeps seed evidence and examines at most six additional ranked tracked
-paths per page, for at most sixteen pages. Each page has its own exact cache. A
+paths per page, for at most sixteen pages per window. Each page has its own exact
+cache. Completing a window advances to the next part of the bounded ranked
+inventory, with a persisted window offset and bounded reviewed-blob history.
+Revisions that change earlier evidence rewind the relevant window; unrelated
+revisions need not restart the sweep. A
 validated, evidence-backed empty result advances the cursor once using
 compare-and-set, bounded memory I/O, and the existing deadline commit fence.
 Concurrent completions cannot skip a page. Cache-only calls, dirty worktrees,
@@ -299,7 +303,8 @@ This is not a structural-empty observation: removing the exclusion makes its
 valid candidates available again. Cursor expiry starts a new sweep.
 
 The `evidenceCoverage` log records request identity, page/count/limit, cache use,
-and advancement. Reaching the discovery cap reports bounded coverage exhaustion
+and advancement, including window position. Reaching the end of the bounded
+ranked inventory reports bounded coverage exhaustion
 and explicitly does **not** establish repository-wide exhaustion. This does not
 force candidates, add a second retrieval-model call, execute suggested checks,
 or bypass scope, validation, and review gates.
@@ -311,6 +316,12 @@ stopped autonomy cannot create a fast discovery loop. Successful dispatch keeps
 the ordinary cadence: a newly enqueued planning request may not yet appear in
 worker job counts. Faster discovery is not permission to fabricate work or
 reuse a stale answer.
+
+At a window boundary, `discoveryProgress.nextWindowAvailable` is a host-computed
+confirmation of durable advancement, not model output. It permits the existing
+bounded follow-up even on page sixteen; absent that confirmation, final-page
+replays cannot accelerate themselves. Follow-up budgets, capacity checks, and
+publication backpressure remain unchanged.
 
 ### Capability circuit
 

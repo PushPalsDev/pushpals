@@ -74,6 +74,7 @@ export {
   type MemoryValidationErrorCode,
 } from "./memory.js";
 export * from "./repository_agent.js";
+export { RuntimeDiagnostics } from "./runtime_diagnostics.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export {
   DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,

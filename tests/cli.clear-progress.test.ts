@@ -5,14 +5,16 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "fs";
 import { rm } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, parse, sep } from "path";
 import { completeCliStateClear, removeCliClearTarget } from "../scripts/pushpals-cli";
+import { removeCliTreeBounded } from "../scripts/cli_clear_remove";
 
 const tempDirs: string[] = [];
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -254,5 +256,331 @@ describe("CLI clear asynchronous deletion and progress", () => {
     ).toBe(0);
     await pause(30);
     expect(lines).toEqual(["[pushpals] Clear completed."]);
+  });
+});
+
+describe("CLI clear bounded subtree removal", () => {
+  function dependencyFixture() {
+    const target = fixture();
+    for (let index = 0; index < 12; index += 1) {
+      const packageRoot = join(
+        target.path,
+        "node_modules",
+        ".bun",
+        `dependency-${index}@1.0.0`,
+        "node_modules",
+        `dependency-${index}`,
+      );
+      mkdirSync(join(packageRoot, "dist", "nested"), { recursive: true });
+      writeFileSync(join(packageRoot, "package.json"), '{"version":"1.0.0"}\n');
+      writeFileSync(join(packageRoot, "dist", "nested", "index.js"), "export default 1;\n");
+    }
+    return target;
+  }
+
+  test("removes an actual deep dependency-shaped tree and its empty parents", async () => {
+    const target = dependencyFixture();
+    const outside = join(target.root, "keep.txt");
+    writeFileSync(outside, "unrelated fixture content\n");
+
+    await removeCliTreeBounded(target.path);
+
+    expect(existsSync(target.path)).toBe(false);
+    expect(readFileSync(outside, "utf8")).toBe("unrelated fixture content\n");
+  });
+
+  test("allows a preexisting parent-directory alias without removing the alias or siblings", async () => {
+    const target = dependencyFixture();
+    const physicalParent = join(target.root, "physical-parent");
+    mkdirSync(physicalParent);
+    const physicalTarget = join(physicalParent, "runtime-data");
+    renameSync(target.path, physicalTarget);
+    const sentinel = join(physicalParent, "preserve.txt");
+    writeFileSync(sentinel, "sibling contents survive parent alias resolution\n");
+    const alias = join(target.root, "parent-alias");
+    symlinkSync(physicalParent, alias, process.platform === "win32" ? "junction" : "dir");
+
+    await removeCliTreeBounded(join(alias, "runtime-data"));
+
+    expect(existsSync(physicalTarget)).toBe(false);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(readFileSync(sentinel, "utf8")).toBe(
+      "sibling contents survive parent alias resolution\n",
+    );
+  });
+
+  test("rejects a filesystem root before invoking native deletion", async () => {
+    const target = fixture();
+    let removalCalls = 0;
+    await expect(
+      removeCliTreeBounded(parse(target.path).root, {
+        removePath: async () => {
+          removalCalls += 1;
+        },
+      }),
+    ).rejects.toThrow("Refusing to clear filesystem root");
+    expect(removalCalls).toBe(0);
+    expect(existsSync(target.path)).toBe(true);
+  });
+
+  test("missing roots and empty directory trees are idempotent", async () => {
+    const target = fixture();
+    const empty = join(target.root, "empty-tree");
+    mkdirSync(join(empty, "nested", "empty"), { recursive: true });
+    let removalCalls = 0;
+    const options = {
+      removePath: async () => {
+        removalCalls += 1;
+      },
+    };
+
+    await removeCliTreeBounded(join(target.root, "never-created"), options);
+    await removeCliTreeBounded(empty, options);
+    await removeCliTreeBounded(empty, options);
+
+    expect(removalCalls).toBe(0);
+    expect(existsSync(empty)).toBe(false);
+    expect(readFileSync(join(target.path, "state.json"), "utf8")).toBe("{}\n");
+  });
+
+  test("refuses newly scheduled removals through an expanded parent replaced by a junction", async () => {
+    const target = fixture();
+    const expandedParent = join(target.path, "expanded-parent");
+    const outside = join(target.root, "external-substitution-target");
+    mkdirSync(expandedParent);
+    mkdirSync(outside);
+    for (let index = 0; index < 12; index += 1) {
+      const name = `entry-${index}.txt`;
+      writeFileSync(join(expandedParent, name), "original clear target\n");
+      writeFileSync(join(outside, name), "external content must survive\n");
+    }
+    const initialBatch = latch();
+    let started = 0;
+    let completedFilesystemWork = 0;
+    const pending = removeCliTreeBounded(target.path, {
+      removePath: async (path) => {
+        started += 1;
+        await rm(path, { recursive: true, force: true });
+        completedFilesystemWork += 1;
+        // Hold the first pool batch after its filesystem operations, before
+        // workers can schedule another path through the substituted ancestor.
+        await initialBatch.promise;
+      },
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    try {
+      await waitUntil(() => completedFilesystemWork === 4);
+      renameSync(expandedParent, join(target.root, "detached-original-parent"));
+      symlinkSync(outside, expandedParent, process.platform === "win32" ? "junction" : "dir");
+      initialBatch.release();
+
+      const failure = await pending;
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).toContain(
+        "Refusing to clear a directory whose type or resolved path changed",
+      );
+      expect(started).toBe(4);
+      expect(lstatSync(expandedParent).isSymbolicLink()).toBe(true);
+      for (let index = 0; index < 12; index += 1) {
+        expect(readFileSync(join(outside, `entry-${index}.txt`), "utf8")).toBe(
+          "external content must survive\n",
+        );
+      }
+    } finally {
+      initialBatch.release();
+      await pending;
+    }
+  });
+
+  test("nested live and dangling links never traverse outside the clear target", async () => {
+    const target = dependencyFixture();
+    const outside = join(target.root, "external-dependencies");
+    const vanished = join(outside, "vanished");
+    mkdirSync(vanished, { recursive: true });
+    const sentinel = join(outside, "keep.txt");
+    writeFileSync(sentinel, "linked contents must survive\n");
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    const deepParent = join(
+      target.path,
+      "node_modules",
+      ".bun",
+      "dependency-0@1.0.0",
+      "node_modules",
+    );
+    // Exercise links the shallow planner sees and links left to native subtree removal.
+    for (const parent of [target.path, deepParent]) {
+      symlinkSync(outside, join(parent, "live-link"), linkType);
+      symlinkSync(vanished, join(parent, "dangling-link"), linkType);
+    }
+    rmSync(vanished, { recursive: true });
+    expect(lstatSync(join(deepParent, "dangling-link")).isSymbolicLink()).toBe(true);
+
+    await removeCliTreeBounded(target.path);
+
+    expect(existsSync(target.path)).toBe(false);
+    expect(readFileSync(sentinel, "utf8")).toBe("linked contents must survive\n");
+  });
+
+  test("limits native deletion to four disjoint subtrees and awaits every deletion", async () => {
+    const target = dependencyFixture();
+    const deletion = latch();
+    const activePaths = new Set<string>();
+    let peakActive = 0;
+    let started = 0;
+    let settled = false;
+    const pending = removeCliTreeBounded(target.path, {
+      removePath: async (path) => {
+        for (const active of activePaths) {
+          expect(path).not.toBe(active);
+          expect(path.startsWith(`${active}${sep}`)).toBe(false);
+          expect(active.startsWith(`${path}${sep}`)).toBe(false);
+        }
+        started += 1;
+        activePaths.add(path);
+        peakActive = Math.max(peakActive, activePaths.size);
+        try {
+          await deletion.promise;
+          await rm(path, { recursive: true, force: true });
+        } finally {
+          activePaths.delete(path);
+        }
+      },
+    }).then(() => {
+      settled = true;
+    });
+    try {
+      await waitUntil(() => activePaths.size === 4);
+      await pause(20);
+      expect(started).toBe(4);
+      expect(peakActive).toBe(4);
+      expect(settled).toBe(false);
+      expect(existsSync(target.path)).toBe(true);
+      deletion.release();
+      await pending;
+      expect(started).toBeGreaterThan(4);
+      expect(peakActive).toBe(4);
+      expect(activePaths.size).toBe(0);
+      expect(existsSync(target.path)).toBe(false);
+    } finally {
+      deletion.release();
+      await pending.catch(() => {});
+    }
+  });
+
+  test("stops scheduling after a failure but drains in-flight removals before rejecting", async () => {
+    const target = dependencyFixture();
+    const failDeletion = latch();
+    const siblingDeletion = latch();
+    const failure = new Error("EACCES: injected subtree permission failure");
+    let active = 0;
+    let started = 0;
+    let failureThrown = false;
+    let settled = false;
+    const pending = removeCliTreeBounded(target.path, {
+      removePath: async (path) => {
+        const ordinal = ++started;
+        active += 1;
+        try {
+          if (ordinal === 1) {
+            await failDeletion.promise;
+            failureThrown = true;
+            throw failure;
+          }
+          await siblingDeletion.promise;
+          await rm(path, { recursive: true, force: true });
+        } finally {
+          active -= 1;
+        }
+      },
+    }).then(
+      () => {
+        settled = true;
+        return null;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    try {
+      await waitUntil(() => active === 4);
+      failDeletion.release();
+      await waitUntil(() => failureThrown && active === 3);
+      await pause(20);
+      expect(started).toBe(4);
+      expect(settled).toBe(false);
+      expect(existsSync(target.path)).toBe(true);
+      siblingDeletion.release();
+      expect(await pending).toBe(failure);
+      expect(active).toBe(0);
+      expect(started).toBe(4);
+      // Failure must leave expanded parents for the caller's bounded retry.
+      expect(existsSync(target.path)).toBe(true);
+    } finally {
+      failDeletion.release();
+      siblingDeletion.release();
+      await pending;
+    }
+  });
+
+  test("a transient lock retry starts only after all prior subtree deletions settle", async () => {
+    const target = dependencyFixture();
+    const failDeletion = latch();
+    const siblingDeletion = latch();
+    let attempts = 0;
+    let active = 0;
+    let firstAttemptStarted = 0;
+    let failureThrown = false;
+    const retryActiveCounts: number[] = [];
+    const delays: number[] = [];
+    const pending = removeCliClearTarget(target, {
+      maxAttempts: 2,
+      retryDelayMs: 7,
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      removePath: async (path) => {
+        const attempt = ++attempts;
+        retryActiveCounts.push(active);
+        await removeCliTreeBounded(path, {
+          removePath: async (subtree) => {
+            const ordinal = attempt === 1 ? ++firstAttemptStarted : 0;
+            active += 1;
+            try {
+              if (attempt === 1 && ordinal === 1) {
+                await failDeletion.promise;
+                failureThrown = true;
+                throw new Error(`EPERM: operation not permitted, rmdir '${subtree}'`);
+              }
+              if (attempt === 1) await siblingDeletion.promise;
+              await rm(subtree, { recursive: true, force: true });
+            } finally {
+              active -= 1;
+            }
+          },
+        });
+      },
+    });
+    try {
+      await waitUntil(() => active === 4);
+      failDeletion.release();
+      await waitUntil(() => failureThrown && active === 3);
+      await pause(20);
+      expect(attempts).toBe(1);
+      expect(delays).toEqual([]);
+      siblingDeletion.release();
+      expect(await pending).toBe("removed");
+      expect(attempts).toBe(2);
+      expect(retryActiveCounts).toEqual([0, 0]);
+      expect(delays).toEqual([7]);
+      expect(active).toBe(0);
+      expect(existsSync(target.path)).toBe(false);
+    } finally {
+      failDeletion.release();
+      siblingDeletion.release();
+      await pending;
+    }
   });
 });

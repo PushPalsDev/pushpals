@@ -3056,6 +3056,204 @@ describe("ReviewAgent", () => {
     expect(emittedCommandTypes).toEqual([]);
   });
 
+  describe("publication-triggered review polling", () => {
+    function gate() {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { promise, release };
+    }
+
+    function makeAgent(deps: NonNullable<ConstructorParameters<typeof ReviewAgent>[6]>) {
+      return new ReviewAgent(
+        baseConfig,
+        "http://localhost:3001",
+        "token",
+        "https://github.com/org/repo.git",
+        "main",
+        undefined,
+        { ...silentLogs, ...deps },
+      );
+    }
+
+    async function settlePolls(agent: ReviewAgent): Promise<void> {
+      // Drain the actual tracked promises, without a scheduler-speed assumption
+      // or an extra periodic poll that could hide a missing publication nudge.
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const polls = [...((agent as any).activePollRuns as Set<Promise<void>>)];
+        if (polls.length === 0) return;
+        await Promise.all(polls);
+      }
+      throw new Error("Publication review polling did not settle within its bounded follow-up.");
+    }
+
+    test("coalesces idle publication bursts while retaining one-review fairness and provider cooldown", async () => {
+      const reviewed: number[] = [];
+      let openCalls = 0;
+      let providerCalls = 0;
+      const prs = [1, 2, 3].map((number) => makePr({ number }));
+      const agent = makeAgent({
+        now: () => 1_000,
+        listOpenPullRequests: async () => {
+          openCalls += 1;
+          return prs;
+        },
+        listRecentlyClosedPullRequests: async () => {
+          providerCalls += 1;
+          return [];
+        },
+        getPullRequestDiff: async ({ prNumber }) => {
+          reviewed.push(prNumber);
+          throw new Error("Simulated bounded diff failure leaves the PR eligible.");
+        },
+      });
+      try {
+        await agent.poll();
+        expect(reviewed).toEqual([1]);
+        for (let index = 0; index < 20; index += 1) agent.requestReviewPoll();
+        expect(openCalls).toBe(1);
+        await settlePolls(agent);
+        expect(openCalls).toBe(2);
+        expect(reviewed).toEqual([1, 2]);
+        expect(providerCalls).toBe(1);
+
+        agent.requestReviewPoll();
+        await settlePolls(agent);
+        expect(reviewed).toEqual([1, 2, 3]);
+        expect(providerCalls).toBe(1);
+        expect(agent.getProviderHealthSnapshot().lastPollStartedAt).toBe(
+          new Date(1_000).toISOString(),
+        );
+      } finally {
+        await agent.stopAndDrain();
+      }
+    });
+
+    test.each(["periodic", "publication", "queued-publication-periodic-collision"])(
+      "coalesces one follow-up behind an active %s poll without overlapping the review lane",
+      async (mode) => {
+        const entered = gate();
+        const blocked = gate();
+        let openCalls = 0;
+        let active = 0;
+        let peakActive = 0;
+        const agent = makeAgent({
+          listOpenPullRequests: async () => {
+            const ordinal = ++openCalls;
+            active += 1;
+            peakActive = Math.max(peakActive, active);
+            try {
+              if (ordinal === 1) {
+                entered.release();
+                await blocked.promise;
+              }
+              return [];
+            } finally {
+              active -= 1;
+            }
+          },
+        });
+        let periodicPoll: Promise<void> | undefined;
+        try {
+          if (mode !== "periodic") agent.requestReviewPoll();
+          if (mode !== "publication") periodicPoll = agent.poll();
+          await entered.promise;
+          for (let index = 0; index < 20; index += 1) agent.requestReviewPoll();
+          await Promise.resolve();
+          expect(openCalls).toBe(1);
+          blocked.release();
+          await periodicPoll;
+          await settlePolls(agent);
+          expect(openCalls).toBe(2);
+          expect(peakActive).toBe(1);
+          expect(active).toBe(0);
+        } finally {
+          blocked.release();
+          await periodicPoll;
+          await agent.stopAndDrain();
+        }
+      },
+    );
+
+    test("disabling AI review drops a queued publication nudge without replay on readiness", async () => {
+      let openCalls = 0;
+      const agent = makeAgent({
+        listOpenPullRequests: async () => {
+          openCalls += 1;
+          return [];
+        },
+      });
+      try {
+        agent.requestReviewPoll();
+        agent.updateRuntimeConfig({ ...baseConfig, enabled: false });
+        agent.requestReviewPoll();
+        await settlePolls(agent);
+        expect(openCalls).toBe(0);
+        agent.updateRuntimeConfig(baseConfig);
+        await settlePolls(agent);
+        expect(openCalls).toBe(0);
+        agent.requestReviewPoll();
+        await settlePolls(agent);
+        expect(openCalls).toBe(1);
+      } finally {
+        await agent.stopAndDrain();
+      }
+    });
+
+    test("shutdown cancels a queued publication nudge and rejects later requests", async () => {
+      let openCalls = 0;
+      const agent = makeAgent({
+        listOpenPullRequests: async () => {
+          openCalls += 1;
+          return [];
+        },
+      });
+      agent.requestReviewPoll();
+      await agent.stopAndDrain();
+      agent.requestReviewPoll();
+      await settlePolls(agent);
+      expect(openCalls).toBe(0);
+    });
+
+    test("shutdown drains active publication review but cancels its pending follow-up", async () => {
+      const entered = gate();
+      const blocked = gate();
+      let openCalls = 0;
+      let stopped = false;
+      const agent = makeAgent({
+        listOpenPullRequests: async () => {
+          openCalls += 1;
+          entered.release();
+          await blocked.promise;
+          return [];
+        },
+      });
+      let draining: Promise<void> | undefined;
+      try {
+        agent.requestReviewPoll();
+        await entered.promise;
+        agent.requestReviewPoll();
+        draining = agent.stopAndDrain().then(() => {
+          stopped = true;
+        });
+        await Promise.resolve();
+        expect(stopped).toBe(false);
+        blocked.release();
+        await draining;
+        expect(stopped).toBe(true);
+        expect(openCalls).toBe(1);
+        agent.requestReviewPoll();
+        await settlePolls(agent);
+        expect(openCalls).toBe(1);
+      } finally {
+        blocked.release();
+        await draining;
+        await agent.stopAndDrain();
+      }
+    });
+  });
+
   test("skips overlapping poll ticks", async () => {
     let listCalls = 0;
 

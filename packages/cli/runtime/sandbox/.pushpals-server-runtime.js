@@ -10158,12 +10158,16 @@ function sanitizeDiscoveryProgress(value) {
   for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
     if (typeof value[key] !== "boolean")
       invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  if (value.nextWindowAvailable !== undefined && typeof value.nextWindowAvailable !== "boolean")
+    invalidResponse("result.discoveryProgress.nextWindowAvailable must be boolean");
+  const nextWindowAvailable = value.nextWindowAvailable === true && page === pageCount && value.advanced === true && value.boundedCoverageExhausted === false;
   return {
     page,
     pageCount,
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
-    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && page < pageCount,
+    retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
+    ...value.nextWindowAvailable === undefined ? {} : { nextWindowAvailable },
     excludedCandidateCount: integer("excludedCandidateCount", 0, 64)
   };
 }
@@ -10508,6 +10512,190 @@ function createRepositoryAgentServiceClients(options) {
       return closePromise;
     }
   });
+}
+// packages/shared/src/runtime_diagnostics.ts
+var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+function boundedInteger(value, name, maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
+  }
+  return value;
+}
+
+class RuntimeDiagnostics {
+  service;
+  now;
+  wallNow;
+  onEvent;
+  sampleIntervalMs;
+  slowThresholdMs;
+  maxSamples;
+  schedule;
+  running = false;
+  generation = 0;
+  cancelTimer = null;
+  lastEventLoopDelayMs = null;
+  maxEventLoopDelayMs = 0;
+  slowEventLoopSamples = 0;
+  slowOperationSamples = 0;
+  suppressedLogEvents = 0;
+  lastLoggedAt = -Infinity;
+  recentSlowEvents = [];
+  constructor(options) {
+    if (typeof options.service !== "string" || !LABEL.test(options.service)) {
+      throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
+    }
+    this.service = options.service;
+    this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
+    this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
+    this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
+    for (const name of ["now", "wallNow", "onEvent", "schedule"]) {
+      if (options[name] !== undefined && typeof options[name] !== "function") {
+        throw new TypeError(`${name} must be a function`);
+      }
+    }
+    this.now = options.now ?? (() => performance.now());
+    this.wallNow = options.wallNow ?? Date.now;
+    this.onEvent = options.onEvent;
+    this.schedule = options.schedule ?? ((callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return () => clearTimeout(timer);
+    });
+  }
+  start() {
+    if (this.running)
+      return;
+    this.running = true;
+    this.scheduleNext(++this.generation);
+  }
+  stop() {
+    this.running = false;
+    this.generation += 1;
+    const cancel = this.cancelTimer;
+    this.cancelTimer = null;
+    try {
+      cancel?.();
+    } catch {}
+  }
+  snapshot() {
+    return {
+      service: this.service,
+      running: this.running,
+      measurement: "Timer lateness is measured delay, not proof of root cause or service downtime.",
+      sampleIntervalMs: this.sampleIntervalMs,
+      slowThresholdMs: this.slowThresholdMs,
+      lastEventLoopDelayMs: this.lastEventLoopDelayMs,
+      maxEventLoopDelayMs: this.maxEventLoopDelayMs,
+      slowEventLoopSamples: this.slowEventLoopSamples,
+      slowOperationSamples: this.slowOperationSamples,
+      suppressedLogEvents: this.suppressedLogEvents,
+      recentSlowEvents: this.recentSlowEvents.map((event) => ({ ...event }))
+    };
+  }
+  run(stage, fn) {
+    const startedAt = this.readNow();
+    try {
+      return fn();
+    } finally {
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  async runAsync(stage, fn) {
+    const startedAt = this.readNow();
+    try {
+      return await fn();
+    } finally {
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  scheduleNext(generation) {
+    const startedAt = this.readNow();
+    if (startedAt === null) {
+      this.stop();
+      return;
+    }
+    const expectedAt = startedAt + this.sampleIntervalMs;
+    const callback = () => {
+      if (!this.running || this.generation !== generation)
+        return;
+      this.cancelTimer = null;
+      try {
+        const observed = this.readNow();
+        if (observed === null) {
+          this.stop();
+          return;
+        }
+        const delayMs = Math.max(0, observed - expectedAt);
+        if (Number.isFinite(delayMs)) {
+          this.lastEventLoopDelayMs = delayMs;
+          this.maxEventLoopDelayMs = Math.max(this.maxEventLoopDelayMs, delayMs);
+          if (delayMs >= this.slowThresholdMs) {
+            this.slowEventLoopSamples += 1;
+            this.record({
+              event: "runtime_event_loop_delay",
+              service: this.service,
+              observedAt: new Date(this.wallNow()).toISOString(),
+              delayMs,
+              sampleIntervalMs: this.sampleIntervalMs
+            }, observed);
+          }
+        }
+      } catch {}
+      if (this.running && this.generation === generation)
+        this.scheduleNext(generation);
+    };
+    try {
+      this.cancelTimer = this.schedule(callback, this.sampleIntervalMs);
+    } catch {
+      this.stop();
+    }
+  }
+  readNow() {
+    try {
+      const value = this.now();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  observeOperation(stage, startedAt) {
+    try {
+      if (startedAt === null)
+        return;
+      const observed = this.readNow();
+      if (observed === null)
+        return;
+      const durationMs = Math.max(0, observed - startedAt);
+      if (!Number.isFinite(durationMs) || durationMs < this.slowThresholdMs)
+        return;
+      this.slowOperationSamples += 1;
+      this.record({
+        event: "runtime_slow_operation",
+        service: this.service,
+        observedAt: new Date(this.wallNow()).toISOString(),
+        stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+        durationMs
+      }, observed);
+    } catch {}
+  }
+  record(event, observed) {
+    this.recentSlowEvents.push(event);
+    if (this.recentSlowEvents.length > this.maxSamples)
+      this.recentSlowEvents.shift();
+    if (!this.onEvent)
+      return;
+    if (observed - this.lastLoggedAt < 1000) {
+      this.suppressedLogEvents += 1;
+      return;
+    }
+    this.lastLoggedAt = observed;
+    try {
+      Promise.resolve(this.onEvent({ ...event })).catch(() => {
+        return;
+      });
+    } catch {}
+  }
 }
 // packages/shared/src/scm_repair_authority.ts
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
@@ -29037,12 +29225,16 @@ function extractAutonomyPayloadDetails(value) {
 
 // apps/server/src/lifecycle_reconciliation.ts
 class LifecycleReconciliationTracker {
+  diagnostics;
   health = new Map;
+  constructor(diagnostics) {
+    this.diagnostics = diagnostics;
+  }
   run(label, fallback, reconcile, onError) {
     const attemptedAt = new Date().toISOString();
     const previous = this.health.get(label);
     try {
-      const result = reconcile();
+      const result = this.diagnostics ? this.diagnostics.run(`reconciliation:${label.replace(/\s+/g, "_")}`, reconcile) : reconcile();
       this.health.set(label, {
         lastAttemptAt: attemptedAt,
         lastSuccessAt: new Date().toISOString(),
@@ -29221,7 +29413,11 @@ try {
 } finally {
   scrubScmRepairAuthoritySecretFromEnv(process.env);
 }
-var reconciliationTracker = new LifecycleReconciliationTracker;
+var runtimeDiagnostics = new RuntimeDiagnostics({
+  service: "server",
+  onEvent: (event) => console.warn(`[Server] runtimeDiagnostics=${JSON.stringify(event)}`)
+});
+var reconciliationTracker = new LifecycleReconciliationTracker(runtimeDiagnostics);
 function guardedReconciliation(label, fallback, reconcile) {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
     console.error(`[Server] ${label} reconciliation failed and will be retried by the lifecycle watchdog: ${detail}`);
@@ -30124,6 +30320,7 @@ function createRequestHandler() {
         if (isShuttingDown)
           return;
         isShuttingDown = true;
+        runtimeDiagnostics.stop();
         console.warn(`[Server] Shutdown requested: ${reason}`);
         clearInterval(lifecycleWatchdogTimer);
         clearInterval(clientPresencePruneTimer);
@@ -30180,7 +30377,11 @@ function createRequestHandler() {
         return null;
       };
       if (pathname === "/healthz" && method === "GET") {
-        return makeJson({ ok: true, protocolVersion: PROTOCOL_VERSION });
+        return makeJson({
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          diagnostics: runtimeDiagnostics.snapshot()
+        });
       }
       if (pathname === "/admin/shutdown" && method === "POST") {
         const denied = requireAuth();
@@ -31077,7 +31278,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           runtime: {
             startedAt: SERVER_STARTED_AT_ISO,
             uptimeMs: Math.max(0, Date.now() - SERVER_STARTED_AT_MS),
-            reconciliation: reconciliationTracker.snapshot()
+            reconciliation: reconciliationTracker.snapshot(),
+            diagnostics: runtimeDiagnostics.snapshot()
           },
           workers: {
             total: workers.length,
@@ -32664,6 +32866,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
 }
 if (import.meta.main) {
   const server = createRequestHandler();
+  runtimeDiagnostics.start();
+  process.once("exit", () => runtimeDiagnostics.stop());
   console.log(`[Server] PushPals listening on ${server.url}`);
 }
 export {

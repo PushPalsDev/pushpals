@@ -779,6 +779,108 @@ describe("read-only run health reporting", () => {
     });
   });
 
+  test.each([
+    { name: "omitted", providers: undefined },
+    { name: "empty", providers: [] },
+    {
+      name: "missing table",
+      providers: [],
+      missingTables: ["pr_provider_outcomes"],
+    },
+    { name: "unknown state", providers: [{ prUrl: pr, verdict: "unknown" }] },
+    {
+      name: "truncated table",
+      providers: [{ prUrl: pr, terminal: 1, merged: 1 }],
+      truncatedTables: ["pr_provider_outcomes"],
+    },
+  ])("keeps first-pass merge rate unknown with $name provider evidence", (providerEvidence) => {
+    const { name: _name, ...evidence } = providerEvidence;
+    const report = aggregateRunHealth(
+      {
+        jobs: [job("a", { prUrl: pr })],
+        reviews: [
+          {
+            pr_url: pr,
+            verdict: "approved_merged",
+            source: "review_agent",
+            review_score: 9,
+            review_threshold: 8,
+          },
+        ],
+        ...evidence,
+      },
+      window,
+    );
+    expect(report.pullRequests).toMatchObject({
+      unique: 1,
+      reviewed: 1,
+      observedFirstPassApproved: 1,
+      observedFirstPassApprovalRate: 1,
+      mergedRate: null,
+      observedFirstPassMergeRate: null,
+    });
+  });
+
+  test("partial provider coverage does not turn an unknown merge into a failed first pass", () => {
+    const second = `${pr}2`;
+    const report = aggregateRunHealth(
+      {
+        jobs: [job("a", { prUrl: pr }), job("b", { prUrl: second })],
+        providers: [{ prUrl: pr, terminal: 1, merged: 1 }],
+        reviews: [pr, second].map((pr_url) => ({
+          pr_url,
+          verdict: "approved_merged",
+          source: "review_agent",
+          review_score: 9,
+          review_threshold: 8,
+        })),
+      },
+      window,
+    );
+    expect(report.pullRequests).toMatchObject({
+      unique: 2,
+      merged: 1,
+      unknown: 1,
+      reviewed: 2,
+      observedFirstPassApproved: 2,
+      observedFirstPassMerged: 1,
+      observedFirstPassApprovalRate: 1,
+      mergedRate: null,
+      observedFirstPassMergeRate: null,
+    });
+  });
+
+  test.each([
+    { verdict: "approved_merged", terminal: 1, merged: 1, expectedRate: 1 },
+    { verdict: "closed_unmerged", terminal: 1, merged: 0, expectedRate: 0 },
+    { verdict: "open", terminal: 0, merged: 0, expectedRate: 0 },
+  ])("preserves known first-pass merge rate for $verdict provider outcomes", (outcome) => {
+    const { expectedRate, ...provider } = outcome;
+    const report = aggregateRunHealth(
+      {
+        jobs: [job("a", { prUrl: pr })],
+        providers: [{ prUrl: pr, ...provider }],
+        reviews: [
+          {
+            pr_url: pr,
+            verdict: "approved",
+            source: "review_agent",
+            review_score: 9,
+            review_threshold: 8,
+          },
+        ],
+      },
+      window,
+    );
+    expect(report.pullRequests).toMatchObject({
+      unknown: 0,
+      reviewed: 1,
+      observedFirstPassApprovalRate: 1,
+      mergedRate: expectedRate,
+      observedFirstPassMergeRate: expectedRate,
+    });
+  });
+
   test("unknown provider state and incomplete review evidence never imply perfect quality", () => {
     const report = aggregateRunHealth(
       {

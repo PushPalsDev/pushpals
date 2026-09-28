@@ -288,6 +288,7 @@ type AutonomyDiscoveryProgress = {
   advanced: boolean;
   boundedCoverageExhausted: boolean;
   retryEligible: boolean;
+  nextWindowAvailable?: boolean;
   excludedCandidateCount: number;
 };
 
@@ -302,6 +303,7 @@ function autonomyDiscoveryProgress(value: unknown): AutonomyDiscoveryProgress | 
     typeof row.advanced !== "boolean" ||
     typeof row.boundedCoverageExhausted !== "boolean" ||
     typeof row.retryEligible !== "boolean" ||
+    (row.nextWindowAvailable !== undefined && typeof row.nextWindowAvailable !== "boolean") ||
     !Number.isInteger(row.excludedCandidateCount) ||
     Number(row.excludedCandidateCount) < 0
   )
@@ -6681,7 +6683,7 @@ export class RemoteBuddyAutonomousEngine {
       !progress.retryEligible ||
       !progress.advanced ||
       progress.boundedCoverageExhausted ||
-      progress.page >= progress.pageCount
+      (progress.page >= progress.pageCount && progress.nextWindowAvailable !== true)
     )
       return;
     const dueAt = Date.now() + DISCOVERY_FOLLOWUP_DELAY_MS;
@@ -6704,6 +6706,7 @@ export class RemoteBuddyAutonomousEngine {
         page: progress.page,
         pageCount: progress.pageCount,
         advanced: progress.advanced,
+        nextWindowAvailable: progress.nextWindowAvailable === true,
         excludedCandidateCount: progress.excludedCandidateCount,
         remaining: this.discoveryFollowupAttemptsRemaining,
       })}`,

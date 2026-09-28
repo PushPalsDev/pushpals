@@ -9,6 +9,7 @@ import {
   resolveGitTokenForRemote,
 } from "../../../packages/shared/src/git_backend.js";
 import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
+import { RuntimeDiagnostics } from "../../../packages/shared/src/runtime_diagnostics.js";
 import { createRepositoryAgentServiceClients } from "../../../packages/shared/src/repository_agent.js";
 import {
   resolveScmRepairAuthoritySecret,
@@ -325,13 +326,20 @@ const healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30_000, config.pollIntervalSeconds * 3_000),
 });
+const runtimeDiagnostics = new RuntimeDiagnostics({
+  service: "source_control_manager",
+  onEvent: (event) => console.warn(`[${ts()}] runtimeDiagnostics=${JSON.stringify(event)}`),
+});
 let reviewAgentInstance: ReviewAgent | null = null;
 let blockedReviewProviderHealth: SourceControlManagerReviewProviderHealth | null = null;
 
 function sourceControlManagerHealthSnapshot() {
   const reviewProvider =
     reviewAgentInstance?.getProviderHealthSnapshot() ?? blockedReviewProviderHealth;
-  return withReviewProviderHealth(healthTracker.snapshot(), reviewProvider);
+  return {
+    ...withReviewProviderHealth(healthTracker.snapshot(), reviewProvider),
+    diagnostics: runtimeDiagnostics.snapshot(),
+  };
 }
 
 // Recover any jobs stuck in 'running' from a previous crash
@@ -959,6 +967,7 @@ async function reconcileRetainedCompletionRefs(
 }
 
 async function tick(): Promise<void> {
+  let publishedReviewAgent: ReviewAgent | null = null;
   healthTracker.beginTick("integration_maintenance");
   try {
     const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
@@ -973,27 +982,31 @@ async function tick(): Promise<void> {
     const response = await claimBeforeCompletionGc({
       claim: () =>
         maintainIntegrationBeforeCompletionClaim({
-          maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
-          claimCompletion: async () => {
-            const rawResponse = await fetchBufferedWithHardDeadline({
-              input: `${runtimeConfig.serverUrl}/completions/claim`,
-              init: {
-                method: "POST",
-                headers,
-                body: JSON.stringify({
-                  pusherId,
-                  leaseMs: COMPLETION_LEASE_MS,
-                }),
-              },
-              timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
-              timeoutMessage: `Completion claim timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
-            });
-            return {
-              ok: rawResponse.ok,
-              status: rawResponse.status,
-              data: rawResponse.ok ? await rawResponse.json() : null,
-            };
-          },
+          maintain: () =>
+            runtimeDiagnostics.runAsync("integration_maintenance", () =>
+              integrationMaintenanceRunner.run(runtimeConfig, headers),
+            ),
+          claimCompletion: () =>
+            runtimeDiagnostics.runAsync("completion_claim", async () => {
+              const rawResponse = await fetchBufferedWithHardDeadline({
+                input: `${runtimeConfig.serverUrl}/completions/claim`,
+                init: {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify({
+                    pusherId,
+                    leaseMs: COMPLETION_LEASE_MS,
+                  }),
+                },
+                timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+                timeoutMessage: `Completion claim timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+              });
+              return {
+                ok: rawResponse.ok,
+                status: rawResponse.status,
+                data: rawResponse.ok ? await rawResponse.json() : null,
+              };
+            }),
         }),
       isIdle: (claimResult) =>
         claimResult.status === 404 ||
@@ -1004,7 +1017,10 @@ async function tick(): Promise<void> {
               | null
               | undefined
           )?.completion),
-      reconcile: () => reconcileRetainedCompletionRefs(runtimeConfig, headers),
+      reconcile: () =>
+        runtimeDiagnostics.runAsync("completion_ref_gc", () =>
+          reconcileRetainedCompletionRefs(runtimeConfig, headers),
+        ),
     });
 
     if (!response.ok) {
@@ -2175,6 +2191,9 @@ async function tick(): Promise<void> {
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
         cleanupCompletionHandoff = true;
+        if (useReviewPublicationFlow && !skipValidationForDurableRecovery) {
+          publishedReviewAgent = reviewAgentForTick;
+        }
         const pushMessage = useReviewPublicationFlow
           ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
           : config.pushMainAfterMerge
@@ -2443,6 +2462,12 @@ async function tick(): Promise<void> {
     console.error(`[${ts()}] Poll error: ${err.message}`);
   } finally {
     healthTracker.completeTick();
+    // Review repair planning can read SCM worktree manifests. Nudge only after
+    // confirmed finalization and the awaited checkout/ref cleanup above, and
+    // never wake an instance replaced or stopped during this completion.
+    if (running && publishedReviewAgent === reviewAgentInstance) {
+      publishedReviewAgent?.requestReviewPoll();
+    }
   }
 }
 
@@ -2750,6 +2775,7 @@ async function shutdown(): Promise<void> {
   shutdownPromise = (async () => {
     if (!running) return;
     running = false;
+    runtimeDiagnostics.stop();
     startupStatusTracker.markShutdown();
     console.log(`\n[${ts()}] Shutting down...`);
     if (statusHeartbeatTimer) {
@@ -2824,6 +2850,8 @@ process.on("SIGTERM", () => {
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 
+runtimeDiagnostics.start();
+process.once("exit", () => runtimeDiagnostics.stop());
 main().catch(async (err) => {
   console.error(`[${ts()}] Fatal: ${err.message}`);
   await shutdown();

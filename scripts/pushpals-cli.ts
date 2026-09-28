@@ -40,6 +40,7 @@ import {
   type ManagedServiceSpec,
 } from "./start_runtime_services.js";
 import { forceDeleteWorktreePath } from "../apps/workerpals/src/common/worktree_cleanup.js";
+import { removeCliTreeBounded } from "./cli_clear_remove.js";
 import { isDirectWorkerWorktreePath } from "../apps/workerpals/src/common/direct_worktree.js";
 import {
   evaluateClientRuntimePreflight,
@@ -4658,9 +4659,10 @@ export function buildCliClearTargets(opts: {
 
 async function removeCliClearTargetOnce(
   target: CliClearTarget,
-  removePath: (pathValue: string) => void | Promise<void> = (pathValue) => {
-    return rm(pathValue, { recursive: true, force: true, maxRetries: 0 });
-  },
+  removePath: (pathValue: string) => void | Promise<void> = (pathValue) =>
+    process.platform === "win32"
+      ? removeCliTreeBounded(pathValue)
+      : rm(pathValue, { recursive: true, force: true, maxRetries: 0 }),
 ): Promise<CliClearRemoveResult> {
   try {
     // lstat does not follow a symlink and still detects dangling links. Only

@@ -155,6 +155,8 @@ export interface RepositoryAgentDiscoveryProgress {
   advanced: boolean;
   boundedCoverageExhausted: boolean;
   retryEligible: boolean;
+  /** The host durably advanced from this window's final page to another window. */
+  nextWindowAvailable?: boolean;
   excludedCandidateCount: number;
 }
 
@@ -947,6 +949,13 @@ function sanitizeDiscoveryProgress(value: unknown): RepositoryAgentDiscoveryProg
   for (const key of ["advanced", "boundedCoverageExhausted", "retryEligible"])
     if (typeof value[key] !== "boolean")
       invalidResponse(`result.discoveryProgress.${key} must be boolean`);
+  if (value.nextWindowAvailable !== undefined && typeof value.nextWindowAvailable !== "boolean")
+    invalidResponse("result.discoveryProgress.nextWindowAvailable must be boolean");
+  const nextWindowAvailable =
+    value.nextWindowAvailable === true &&
+    page === pageCount &&
+    value.advanced === true &&
+    value.boundedCoverageExhausted === false;
   return {
     page,
     pageCount,
@@ -956,7 +965,8 @@ function sanitizeDiscoveryProgress(value: unknown): RepositoryAgentDiscoveryProg
       value.retryEligible === true &&
       value.advanced === true &&
       value.boundedCoverageExhausted === false &&
-      page < pageCount,
+      (page < pageCount || nextWindowAvailable),
+    ...(value.nextWindowAvailable === undefined ? {} : { nextWindowAvailable }),
     excludedCandidateCount: integer("excludedCandidateCount", 0, 64),
   };
 }
