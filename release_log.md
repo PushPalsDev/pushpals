@@ -2,43 +2,43 @@
 
 ## Release Metadata
 
-- version: `v1.2.58`
-- start_commit: `c9d9dde6d0af13e519174f701d0f2226efc33e20`
-- end_commit: `5a9832ab91ebb179ca4c35a5e936731dac842e21`
-- commits_in_range: `3`
+- version: `v1.2.59`
+- start_commit: `bcfdffdebf131afe9419f6747304e35d771cb9dc`
+- end_commit: `8cda6b2f303139c678a17e98769762d4b1bcc881`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Distinguish health probes that fail while awaiting response headers, consuming the response body, or receiving an explicit unhealthy HTTP status. Preserve the received HTTP status when a response body stalls.
-- Record time to response headers and deadline overrun alongside existing probe duration and timeout metrics. These are client observations, not a diagnosis of CPU, garbage collection, database locking, or host contention.
-- Report each service's recovery explicitly, including whether a process restart was required, the failed-probe count, and the observed failure duration. Label recovery metrics as current-process measurements so a newly restarted process's zero counters cannot be mistaken for a zero-duration overall outage.
-- Add regression coverage for simultaneous service timeouts, staggered independent recovery, repeated healthy probes, fresh outage counters, and real restart recovery. Keep existing hard deadlines, bounded response bodies, failure classification, and restart policy unchanged.
-- Make the repeated-crash circuit regression deterministic: await the actual restart and advance the stability clock explicitly instead of assuming a loaded machine finishes timers within 100 ms. Assert that the restart-attempt counter really resets before the repeated-failure circuit opens.
-- Require actual container execution in the Docker control-plane end-to-end tests. A failed image build now reports the worker's early exit and startup diagnostics instead of silently falling back to host execution and producing misleading container-path failures.
+- Continue repository discovery beyond the first 96 ranked paths instead of replaying an exhausted final page indefinitely. Persist bounded window progress across restarts, migrate old exhausted-page cache state without clearing memory, and revisit earlier evidence when relevant files or temporary exclusions change. Preserve vision constraints, admission limits, and exact-snapshot checks.
+- Request review promptly after confirmed PR publication and awaited worktree cleanup. Coalesce publication notifications with the existing single-review lane, preserve fairness and provider cooldowns, and drain or cancel work safely during shutdown.
+- Speed up Windows `--clear` directory removal with at most four disjoint deletion tasks and bounded shallow partitioning. Keep physical-path and junction protections, sequential top-level targets, cache preservation, and draining before retries; do not leave detached cleanup running after completion.
+- Retain bounded Server/SCM event-loop-delay and slow-stage diagnostics after recovery. Use monotonic timing, a small copied history, fixed stage identifiers, and rate-limited structured logs. Diagnostic clock, timer, cancellation, and logging faults cannot replace task outcomes or alter existing stall/restart decisions.
+- Keep first-pass merge rates unknown when provider evidence is missing, partial, or truncated. Preserve approval-only metrics and confirmed observed counts instead of treating unknown merges as failures.
+- Add discovery/cache migration, review scheduling, safe cleanup, diagnostic lifecycle/fault isolation, health-route, and provider-evidence regression coverage. Regenerate the packaged runtime assets, including the new diagnostics source module.
 
 ## Validation
 
-- Full root suite: `2,902` passed, `12` platform/opt-in skips, `0` failures, and `16,315` assertions across `193` files (285.26 seconds). The initial run exposed the fixed 100-ms test assumption; the full rerun passed after its deterministic replacement.
-- Full `cli:bundle`, including monitoring UI export, and package-payload verification passed in the isolated Docker fixture limited to one CPU, 768 MiB memory, and 512 PIDs. The package contains `276` files with no external toolchains; tracked generated runtime assets remained unchanged.
-- The final focused CLI bootstrap suite passed all `201` tests. Both new Docker-wait helper regressions passed. Earlier focused health/CLI/HTTP validation passed all `259` tests.
-- Supervisor TypeScript check, CLI bundle/help smoke, health-diagnostic file formatting, and diff checks passed in the resource-limited Docker fixture.
-- Product commit `5a9832ab91ebb179ca4c35a5e936731dac842e21` passed [CLI E2E run `36381708629`](https://github.com/PushPalsDev/pushpals/actions/runs/36381708629): packaged CLI on Linux, real-Docker WorkerPal control-plane tests, and Windows worktree/recovery/trusted-validation/source-only startup contracts. The separate manual-only Windows-host Docker job was skipped as configured.
-- Earlier Linux image builds encountered an upstream Codex binary tarball HTTP 404. After registry availability recovered, the final-commit Docker suites passed without changing or bypassing the runtime installer; the tests now prohibit silent host fallback.
+- Full root suite: `2,955` passed, `12` platform/opt-in skips, `0` failures, and `16,635` assertions across `194` files (296.48 seconds).
+- Full `cli:bundle`, including monitoring UI export, and package-payload verification passed in a fresh Docker checkout limited to one CPU, 768 MiB memory, and 512 PIDs. The package contains `277` files with no external toolchains. New source-file permissions in the Linux copy were normalized to their non-executable Git modes before the successful check; no payload rule was bypassed.
+- Focused follow-up validation passed all `263` tests across ten files. Shared TypeScript checking and Server/SCM builds passed. Independent review and re-review findings were fixed and covered by regressions.
+- Earlier focused discovery, publication, and cleanup tests passed. A small Windows/Bun fixture benchmark reduced median deletion time from 228.73 ms to 104.59 ms; this is a synthetic measurement, not a prediction for a user's worktree.
+- Product commit `8cda6b2f303139c678a17e98769762d4b1bcc881` passed [CLI E2E run `36465914313`](https://github.com/PushPalsDev/pushpals/actions/runs/36465914313): packaged CLI and real-Docker WorkerPal control-plane tests on Linux, plus Windows worktree/recovery/trusted-validation/source-only startup contracts. The separate manual-only Windows-host Docker job was skipped as configured.
+- Eight-hour read-only observation of installed v1.2.58 recorded 96 cached empty discovery results, no new jobs, and one correlated transport stall that recovered without restarting. This informed the changes but is not a soak test of v1.2.59.
 
 ## Install
 
 ```bash
-npm install -g @pushpalsdev/cli@1.2.58
+npm install -g @pushpalsdev/cli@1.2.59
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.58
+bun install -g @pushpalsdev/cli@1.2.59
 ```
 
 For environments using a managed certificate store:
 
 ```bash
-bun install -g --use-system-ca @pushpalsdev/cli@1.2.58
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.59
 ```
 
 ## Artifacts
@@ -49,14 +49,15 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.58
 
 ## Compatibility Notes
 
-- No configuration migration is needed. Health timeouts and automatic restart policy are unchanged.
-- Recovery counters and observed failure duration describe the current process; pre-restart failures remain in earlier lifecycle events.
-- Existing v1.2.57 discovery, validation, and cache-preserving clear behavior is retained.
+- No configuration migration is required. Existing discovery memory is retained.
+- Required validation gates, health timeouts, and automatic restart policy are unchanged.
+- Runtime diagnostic history is bounded and process-local; emitted log records remain the cross-restart evidence. Slow asynchronous operations include awaited I/O, not just CPU time.
+- Non-Windows clear behavior remains unchanged. Reusable caches remain preserved unless explicitly requested for removal.
 
 ## Known Issues
 
-- This release improves health diagnostics; it does not establish or eliminate the cause of the transient v1.2.56 localhost stall. The inspected services recovered without restarting, and subsequent work published and merged. There is no evidence of a native crash in that incident.
-- The new metrics do not identify the underlying cause by themselves. Do not infer database locking, Bun garbage collection, or whole-host freezing from a transport timeout.
-- Linux preflight and bounded CI smoke tests do not substitute for a long deployed Windows-host Docker soak. The manual-only Windows-host Docker E2E job is not part of ordinary push-triggered gates. Development did not change the live installation or external repository.
+- The new diagnostics do not establish or eliminate the cause of the observed transient localhost stall. Timer lateness is not proof of database locking, garbage collection, host contention, or exact downtime.
+- The monitored old-version run generated no new jobs, so it cannot establish a new average execution time, first-pass PR quality, or the live effectiveness of these patches. No 100% success or uptime guarantee is claimed.
+- Linux preflight and bounded CI smoke tests do not substitute for a long deployed Windows-host Docker soak. The manual-only Windows-host Docker E2E job is not part of ordinary push-triggered gates. Development and monitoring did not modify the live installation or external repository.
 - The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Docker-backed WorkerPal execution requires Docker to be installed and running.
 - Some Windows environments require `--use-system-ca` for Bun installs or Schannel for Git remote operations.
