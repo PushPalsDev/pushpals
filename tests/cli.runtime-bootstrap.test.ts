@@ -737,6 +737,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         responseStatus: 200,
         probeDurationMs: 2,
         probeTimeoutMs: 2_500,
+        responseHeadersMs: 1,
+        probeDeadlineOverrunMs: 0,
       };
       const failed: ManagedServiceHealthResult = {
         ok: false,
@@ -744,6 +746,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         failureKind,
         probeDurationMs: failureKind === "transport_error" ? 2_507 : 7,
         probeTimeoutMs: 2_500,
+        failureStage: failureKind === "transport_error" ? "response_headers" : "http_status",
+        probeDeadlineOverrunMs: failureKind === "transport_error" ? 7 : 0,
         ...(failureKind === "unhealthy_response" ? { responseStatus: 503 } : {}),
       };
       const specs = ["server", "source_control_manager"].map((name) => ({
@@ -803,9 +807,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           failureDurationMs: 0,
           probeDurationMs: failed.probeDurationMs,
           probeTimeoutMs: 2_500,
+          failureStage: failed.failureStage,
+          probeDeadlineOverrunMs: failed.probeDeadlineOverrunMs,
         });
         expect(probeLogs.at(-1)).toContain("outageAgeMs=0");
         expect(probeLogs.at(-1)).toContain(`probeDurationMs=${failed.probeDurationMs}`);
+        expect(probeLogs.at(-1)).toContain(`failureStage=${failed.failureStage}`);
 
         responses.set(specs[1]!.healthCheck.url, healthy);
         await tick(11_000);
@@ -838,7 +845,15 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           probeDurationMs: 2,
           probeTimeoutMs: 2_500,
           failureDurationMs: 70_000,
+          responseHeadersMs: 1,
+          probeDeadlineOverrunMs: 0,
+          recoveryMetricsScope: "current_process",
+          recoveredAfterFailures: 3,
+          recoveredWithoutRestart: true,
         });
+        expect(
+          probeLogs.filter((line) => line.includes("health recovered without a process restart")),
+        ).toHaveLength(2);
         expect(events.some((event) => event.type === "exit" || event.type === "restarted")).toBe(
           false,
         );

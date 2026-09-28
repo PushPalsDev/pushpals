@@ -49,6 +49,11 @@ describe("start runtime service helpers", () => {
         expect(health.responseStatus).toBe(200);
         expect(health.probeDurationMs).toBeGreaterThanOrEqual(0);
         expect(health.probeTimeoutMs).toBe(250);
+        expect(health.failureStage).toBeUndefined();
+        expect(health.responseHeadersMs).toBeGreaterThanOrEqual(0);
+        expect(health.probeDeadlineOverrunMs).toBe(
+          Math.max(0, health.probeDurationMs! - health.probeTimeoutMs!),
+        );
       }
       expect(connections).toBe(4);
     } finally {
@@ -92,12 +97,43 @@ describe("start runtime service helpers", () => {
     await Bun.sleep(0);
     expect(health.ok).toBe(false);
     expect(health.failureKind).toBe("transport_error");
+    expect(health.failureStage).toBe("response_body");
+    expect(health.responseStatus).toBe(200);
+    expect(health.responseHeadersMs).toBeGreaterThanOrEqual(0);
+    expect(health.responseHeadersMs!).toBeLessThanOrEqual(health.probeDurationMs!);
     expect(health.detail).toContain("timed out after 250ms");
     expect(health.probeDurationMs).toBeGreaterThanOrEqual(200);
     expect(health.probeDurationMs).toBeLessThan(1_000);
     expect(health.probeTimeoutMs).toBe(250);
+    expect(health.probeDeadlineOverrunMs).toBe(
+      Math.max(0, health.probeDurationMs! - health.probeTimeoutMs!),
+    );
     expect(bodyCancelled).toBe(true);
     expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("health probes identify a headers timeout even when fetch ignores cancellation", async () => {
+    const probe: { signal?: AbortSignal | null } = {};
+    const health = await defaultProbeServiceHealth(
+      { url: "http://127.0.0.1/no-headers", timeoutMs: 250 },
+      async (_input, init) => {
+        probe.signal = init?.signal;
+        return await new Promise<Response>(() => {});
+      },
+    );
+    expect(health.ok).toBe(false);
+    expect(health.failureKind).toBe("transport_error");
+    expect(health.failureStage).toBe("response_headers");
+    expect(health.responseStatus).toBeUndefined();
+    expect(health.responseHeadersMs).toBeUndefined();
+    expect(health.detail).toContain("timed out after 250ms");
+    expect(health.probeDurationMs).toBeGreaterThanOrEqual(200);
+    expect(health.probeDurationMs).toBeLessThan(1_000);
+    expect(health.probeTimeoutMs).toBe(250);
+    expect(health.probeDeadlineOverrunMs).toBe(
+      Math.max(0, health.probeDurationMs! - health.probeTimeoutMs!),
+    );
+    expect(probe.signal?.aborted).toBe(true);
   });
 
   test("explicit unhealthy responses stay distinct from transport timeouts", async () => {
@@ -106,10 +142,16 @@ describe("start runtime service helpers", () => {
       async () => Response.json({ healthy: false, reason: "tick stalled" }, { status: 503 }),
     );
     expect(health.failureKind).toBe("unhealthy_response");
+    expect(health.failureStage).toBe("http_status");
     expect(health.responseStatus).toBe(503);
     expect(health.ok).toBe(false);
     expect(health.probeDurationMs).toBeGreaterThanOrEqual(0);
     expect(health.probeTimeoutMs).toBe(2_500);
+    expect(health.responseHeadersMs).toBeGreaterThanOrEqual(0);
+    expect(health.responseHeadersMs!).toBeLessThanOrEqual(health.probeDurationMs!);
+    expect(health.probeDeadlineOverrunMs).toBe(
+      Math.max(0, health.probeDurationMs! - health.probeTimeoutMs!),
+    );
   });
 
   test("three brief transport timeouts cannot kill validation, but sustained failure remains bounded", () => {
@@ -298,12 +340,14 @@ describe("start runtime service helpers", () => {
       failureKind: "transport_error",
     };
     const events: ManagedServiceLifecycleEvent[] = [];
+    const logs: string[] = [];
     const manager = new ServiceManager({
       now: () => now,
       pollMs: 1_000_000,
       computeRestartBackoffMs: () => 1,
       probeServiceHealth: async () => health,
       onLifecycleEvent: (event) => events.push(event),
+      onEvent: (_level, line) => logs.push(line),
       spawnService: (spec) => ({
         name: spec.name,
         proc: { kill() {} } as any,
@@ -343,6 +387,182 @@ describe("start runtime service helpers", () => {
       expect(events.some((event) => event.type === "health" && event.phase === "ready")).toBe(
         false,
       );
+      expect(
+        events.find((event) => event.type === "health" && event.phase === "recovered"),
+      ).toMatchObject({
+        recoveryMetricsScope: "current_process",
+        recoveredWithoutRestart: false,
+        recoveredAfterFailures: 1,
+      });
+      expect(logs.some((line) => line.includes("health recovered after a process restart"))).toBe(
+        true,
+      );
+      expect(logs.some((line) => line.includes("health recovered without a process restart"))).toBe(
+        false,
+      );
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test("two simultaneous transport timeouts report independent staggered recoveries without restarts", async () => {
+    let now = 1_000;
+    const events: ManagedServiceLifecycleEvent[] = [];
+    const logs: string[] = [];
+    const terminated: string[] = [];
+    const pending = new Map<string, (health: ManagedServiceHealthResult) => void>();
+    const healthy: ManagedServiceHealthResult = {
+      ok: true,
+      detail: "healthy",
+      responseStatus: 200,
+      probeDurationMs: 3,
+      probeTimeoutMs: 2_500,
+      responseHeadersMs: 2,
+      probeDeadlineOverrunMs: 0,
+    };
+    const timeout: ManagedServiceHealthResult = {
+      ok: false,
+      detail: "Managed service health probe timed out after 2500ms",
+      failureKind: "transport_error",
+      failureStage: "response_headers",
+      probeDurationMs: 2_508,
+      probeTimeoutMs: 2_500,
+      probeDeadlineOverrunMs: 8,
+    };
+    const names = ["server", "source_control_manager"];
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      probeServiceHealth: (spec) =>
+        new Promise<ManagedServiceHealthResult>((resolve) => {
+          const name = new URL(spec.url).pathname.slice(1);
+          expect(pending.has(name)).toBe(false);
+          pending.set(name, resolve);
+        }),
+      onLifecycleEvent: (event) => events.push(event),
+      onEvent: (_level, line) => logs.push(line),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async (service) => {
+        terminated.push(service.name);
+      },
+    });
+    const tick = (at: number) => {
+      now = at;
+      (manager as any).tick();
+    };
+    const resolveProbe = async (name: string, health: ManagedServiceHealthResult) => {
+      const resolve = pending.get(name);
+      expect(resolve).toBeDefined();
+      pending.delete(name);
+      resolve!(health);
+      await Bun.sleep(0);
+    };
+    const resolveBoth = async (health: ManagedServiceHealthResult) => {
+      for (const name of names) await resolveProbe(name, health);
+    };
+    try {
+      for (const name of names)
+        manager.startService({
+          name,
+          color: "",
+          command: ["fake"],
+          cwd: process.cwd(),
+          healthCheck: {
+            url: `http://127.0.0.1/${name}`,
+            intervalMs: 50,
+            restartOnFailure: name !== "server",
+          },
+        });
+      tick(1_000);
+      await resolveBoth(healthy);
+      tick(10_000);
+      await resolveBoth(timeout);
+      tick(15_000);
+      await resolveBoth(timeout);
+      expect(events.filter((event) => event.type === "health")).toHaveLength(4);
+      expect(events.at(-1)).toMatchObject({
+        type: "health",
+        healthy: false,
+        consecutiveFailures: 2,
+        failureDurationMs: 5_000,
+        failureStage: "response_headers",
+        responseHeadersMs: null,
+        responseStatus: null,
+        probeDeadlineOverrunMs: 8,
+      });
+
+      tick(17_500);
+      await resolveProbe("source_control_manager", healthy);
+      expect(manager.getHealth()?.detail).toContain("server:");
+      expect(manager.getHealth()?.detail).not.toContain("source_control_manager:");
+      expect(events.at(-1)).toMatchObject({
+        type: "health",
+        service: "source_control_manager",
+        phase: "recovered",
+        recoveryMetricsScope: "current_process",
+        recoveredAfterFailures: 2,
+        recoveredWithoutRestart: true,
+        failureDurationMs: 7_500,
+        failureStage: null,
+        responseHeadersMs: 2,
+        probeDeadlineOverrunMs: 0,
+      });
+      now = 18_500;
+      await resolveProbe("server", healthy);
+      expect(manager.getHealth()).toBeNull();
+      expect(events.at(-1)).toMatchObject({
+        type: "health",
+        service: "server",
+        phase: "recovered",
+        recoveredAfterFailures: 2,
+        recoveredWithoutRestart: true,
+        failureDurationMs: 8_500,
+      });
+      expect(logs).toContain(
+        "Managed source_control_manager health recovered without a process restart (metricsScope=current_process, failedProbes=2, observedFailureDurationMs=7500, probeDurationMs=3).",
+      );
+      expect(logs).toContain(
+        "Managed server health recovered without a process restart (metricsScope=current_process, failedProbes=2, observedFailureDurationMs=8500, probeDurationMs=3).",
+      );
+      const eventCount = events.length;
+      const logCount = logs.length;
+      tick(19_000);
+      await resolveBoth(healthy);
+      expect(events).toHaveLength(eventCount);
+      expect(logs).toHaveLength(logCount);
+
+      // A new outage must not inherit the previous failure count or start time.
+      tick(20_000);
+      await resolveBoth(timeout);
+      expect(events.at(-1)).toMatchObject({ consecutiveFailures: 1, failureDurationMs: 0 });
+      tick(21_000);
+      await resolveBoth(healthy);
+      expect(
+        events
+          .slice(-2)
+          .every(
+            (event) =>
+              event.type === "health" &&
+              event.recoveredAfterFailures === 1 &&
+              event.failureDurationMs === 1_000 &&
+              event.recoveredWithoutRestart === true,
+          ),
+      ).toBe(true);
+      expect(terminated).toEqual([]);
+      expect(events.some((event) => event.type === "restarted" || event.type === "exit")).toBe(
+        false,
+      );
+      expect(manager.getHealth()).toBeNull();
+      expect(pending.size).toBe(0);
     } finally {
       manager.stop();
     }
@@ -425,6 +645,21 @@ describe("start runtime service helpers", () => {
       expect(manager.getHealth()).not.toBeNull();
       health = { ok: true, detail: "healthy", responseStatus: 200 };
       await tick(85_000);
+      // The failed probes caused a restart; the new process answered on its
+      // first probe. Zero counters describe that process, not the whole outage.
+      expect(
+        events.findLast(
+          (event) =>
+            event.type === "health" &&
+            event.service === "source_control_manager" &&
+            event.phase === "recovered",
+        ),
+      ).toMatchObject({
+        recoveryMetricsScope: "current_process",
+        recoveredWithoutRestart: false,
+        recoveredAfterFailures: 0,
+        failureDurationMs: 0,
+      });
       expect(events.filter((event) => event.type === "recovered")).toEqual([
         expect.objectContaining({
           service: "source_control_manager",

@@ -91,6 +91,7 @@ type ServiceManagerState = {
 };
 
 export type ManagedServiceHealthFailureKind = "unhealthy_response" | "transport_error";
+export type ManagedServiceHealthFailureStage = "response_headers" | "response_body" | "http_status";
 export type ManagedServiceHealthResult = {
   ok: boolean;
   detail: string;
@@ -99,6 +100,11 @@ export type ManagedServiceHealthResult = {
   /** Client-observed elapsed time, including any local scheduling delay. */
   probeDurationMs?: number;
   probeTimeoutMs?: number;
+  /** A headers wait includes connection setup; it does not prove the listener is dead. */
+  failureStage?: ManagedServiceHealthFailureStage;
+  responseHeadersMs?: number;
+  /** Timer/transport scheduling overrun is evidence, not an attribution to service CPU or GC. */
+  probeDeadlineOverrunMs?: number;
 };
 
 export type ManagedServiceExitFingerprintContext = {
@@ -171,6 +177,13 @@ export type ManagedServiceLifecycleEvent =
       failureDurationMs: number;
       probeDurationMs: number | null;
       probeTimeoutMs: number | null;
+      failureStage?: ManagedServiceHealthFailureStage | null;
+      responseHeadersMs?: number | null;
+      probeDeadlineOverrunMs?: number | null;
+      /** Recovery counts/duration describe this process; pre-restart failures are in earlier events. */
+      recoveryMetricsScope?: "current_process";
+      recoveredAfterFailures?: number;
+      recoveredWithoutRestart?: boolean;
       lastHealthyAt: string | null;
       restartOnFailure: boolean;
       observedAt: string;
@@ -249,10 +262,18 @@ export async function defaultProbeServiceHealth(
 ): Promise<ManagedServiceHealthResult> {
   const timeoutMs = Math.max(250, spec.timeoutMs ?? DEFAULT_SERVICE_HEALTH_TIMEOUT_MS);
   const startedAt = performance.now();
-  const probeTiming = () => ({
-    probeDurationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-    probeTimeoutMs: timeoutMs,
-  });
+  let failureStage: ManagedServiceHealthFailureStage = "response_headers";
+  let responseHeadersMs: number | undefined;
+  let responseStatus: number | undefined;
+  const probeTiming = () => {
+    const probeDurationMs = Math.max(0, Math.round(performance.now() - startedAt));
+    return {
+      probeDurationMs,
+      probeTimeoutMs: timeoutMs,
+      probeDeadlineOverrunMs: Math.max(0, probeDurationMs - timeoutMs),
+      ...(responseHeadersMs === undefined ? {} : { responseHeadersMs }),
+    };
+  };
   try {
     const response = await fetchBufferedWithHardDeadline({
       input: spec.url,
@@ -261,7 +282,13 @@ export async function defaultProbeServiceHealth(
       init: { keepalive: false, headers: { Connection: "close" } },
       timeoutMs,
       maxResponseBytes: 1024 * 1024,
-      fetchImpl,
+      fetchImpl: async (input, init) => {
+        const response = await fetchImpl(input, init);
+        responseHeadersMs = Math.max(0, Math.round(performance.now() - startedAt));
+        responseStatus = response.status;
+        failureStage = "response_body";
+        return response;
+      },
       timeoutMessage: `Managed service health probe timed out after ${timeoutMs}ms`,
     });
     const detail = await response.text();
@@ -270,13 +297,17 @@ export async function defaultProbeServiceHealth(
       detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
       responseStatus: response.status,
       ...probeTiming(),
-      ...(!response.ok ? { failureKind: "unhealthy_response" as const } : {}),
+      ...(!response.ok
+        ? { failureKind: "unhealthy_response" as const, failureStage: "http_status" as const }
+        : {}),
     };
   } catch (error) {
     return {
       ok: false,
       detail: error instanceof Error ? error.message : String(error),
       failureKind: "transport_error",
+      failureStage,
+      ...(responseStatus === undefined ? {} : { responseStatus }),
       ...probeTiming(),
     };
   }
@@ -885,6 +916,15 @@ export class ServiceManager {
               !this.degradedServiceReasons.has(name);
             if (initiallyReady) {
               this.emitEvent("log", `Managed ${name} is ready (health probe confirmed).`);
+            } else {
+              const recoveryDurationMs =
+                state.firstHealthFailureAtMs === null
+                  ? 0
+                  : Math.max(0, observedAtMs - state.firstHealthFailureAtMs);
+              this.emitEvent(
+                "log",
+                `Managed ${name} health recovered ${state.awaitingRecoveryConfirmation ? "after" : "without"} a process restart (metricsScope=current_process, failedProbes=${state.consecutiveUnhealthyProbes}, observedFailureDurationMs=${recoveryDurationMs}${health.probeDurationMs === undefined ? "" : `, probeDurationMs=${health.probeDurationMs}`}).`,
+              );
             }
             this.onLifecycleEvent?.({
               type: "health",
@@ -901,6 +941,16 @@ export class ServiceManager {
                   : Math.max(0, observedAtMs - state.firstHealthFailureAtMs),
               probeDurationMs: health.probeDurationMs ?? null,
               probeTimeoutMs: health.probeTimeoutMs ?? null,
+              failureStage: null,
+              responseHeadersMs: health.responseHeadersMs ?? null,
+              probeDeadlineOverrunMs: health.probeDeadlineOverrunMs ?? null,
+              ...(!initiallyReady
+                ? {
+                    recoveryMetricsScope: "current_process" as const,
+                    recoveredAfterFailures: state.consecutiveUnhealthyProbes,
+                    recoveredWithoutRestart: !state.awaitingRecoveryConfirmation,
+                  }
+                : {}),
               lastHealthyAt: new Date(observedAtMs).toISOString(),
               restartOnFailure: healthCheck.restartOnFailure !== false,
               observedAt: new Date(observedAtMs).toISOString(),
@@ -959,6 +1009,13 @@ export class ServiceManager {
           ...(health.probeTimeoutMs === undefined
             ? []
             : [`probeTimeoutMs=${health.probeTimeoutMs}`]),
+          ...(health.failureStage === undefined ? [] : [`failureStage=${health.failureStage}`]),
+          ...(health.responseHeadersMs === undefined
+            ? []
+            : [`responseHeadersMs=${health.responseHeadersMs}`]),
+          ...(health.probeDeadlineOverrunMs === undefined
+            ? []
+            : [`probeDeadlineOverrunMs=${health.probeDeadlineOverrunMs}`]),
         ].join(", ");
         this.emitEvent(
           !starting && state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
@@ -976,6 +1033,9 @@ export class ServiceManager {
           failureDurationMs,
           probeDurationMs: health.probeDurationMs ?? null,
           probeTimeoutMs: health.probeTimeoutMs ?? null,
+          failureStage: health.failureStage ?? null,
+          responseHeadersMs: health.responseHeadersMs ?? null,
+          probeDeadlineOverrunMs: health.probeDeadlineOverrunMs ?? null,
           lastHealthyAt:
             state.lastHealthyAtMs === null ? null : new Date(state.lastHealthyAtMs).toISOString(),
           restartOnFailure: healthCheck.restartOnFailure !== false,

@@ -93,3 +93,44 @@ within ten minutes, or justify generating ungrounded work. Full publication
 validation and PR review remain real costs and quality requirements. Compare
 future runs using distinct merged PRs, worker utilization, discovery page/cache
 outcomes, first-review acceptance, and end-to-end latency, not job count alone.
+
+## Later transient health incident (01:24 UTC)
+
+Further read-only log inspection found two 2.5-second health timeouts each for
+the server and SourceControlManager between `2026-09-28T01:24:19Z` and
+`01:24:26Z`. Both recovered by `01:24:28Z`, with no process exit or restart.
+The runtime-services log header identifies this as v1.2.56, not v1.2.57.
+These were the only four failed health probes in the inspected log through
+approximately `04:46Z`.
+
+Worker claim requests and RepositoryAgent memory requests also timed out in
+this interval. One discovery caller skipped its tick after its ten-second
+deadline; the agent finished later. This was a real, temporary control-plane
+availability problem, not evidence that the processes died. A subsequent job
+completed publication at `01:51:20Z`, and its PR merged at `01:52:29Z`.
+
+The available logs cannot distinguish local transport trouble, per-process
+event-loop blockage, or host resource contention. The supervisor's timers
+continued to fire close to their deadlines, and SCM completed a tick at
+`01:24:16Z`; attributing the incident to a whole-host freeze, SQLite, or Bun GC
+would be speculation.
+
+The follow-up diagnostic change preserves existing health deadlines and
+restart policy. Probe failures now identify whether response headers never
+arrived, a response body failed to finish, or the service explicitly returned
+an unhealthy HTTP status. Logs include time to headers and deadline overrun
+when available. Neither metric is a CPU/GC diagnosis. Recovery messages state
+the failed-probe count, observed failure duration (from the first failed
+probe, not the unknown start of the outage), and whether a process restart
+was required. Recovery metrics explicitly describe the current process; a
+freshly restarted process may have zero failed probes even though earlier
+events record failures in its predecessor. Regression tests cover this case,
+brief simultaneous timeouts, independent
+recovery, and unchanged sustained-failure handling. This improves diagnosis;
+it does not claim to eliminate the unproven underlying stall.
+
+Follow-up validation ran in the one-CPU, 768-MiB Docker fixture: all 259 tests
+across runtime supervision, CLI bootstrap/invocation, and bounded HTTP suites
+passed. The supervisor TypeScript check, CLI bundle/help smoke, formatting,
+and diff checks also passed. The fixture was stopped afterward; live services
+and the user repository were not changed. This was not a Windows soak test.
