@@ -56,6 +56,8 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.60
 
 ## Known Issues
 
+- The Windows installed-package smoke observed a SourceControlManager singleton-lock collision during an immediate same-repository restart (`--status-once` followed by `--runtime-only`) in [release attempt 2](https://github.com/PushPalsDev/pushpals/actions/runs/36518343608/attempts/2). The first session passed readiness; the second reported another SCM instance and exited. Available logs cannot distinguish incomplete shutdown, stale PID reuse, or another lock-file acquisition error. This release does not fix that restart finding; a passing retry is not proof that it is resolved.
+- npm accepted this version before making it publicly installable. The first installed-package smoke attempts received version-not-found errors during registry processing and were retried after `1.2.60` became visible. No npm reauthentication or duplicate publication was needed.
 - These tests do not establish a production average job duration, first-pass PR merge rate, or a 100% success/uptime guarantee. A fresh isolated artifact cache can be colder than an operator's existing cache; the optional mode is not a proven universal speedup.
 - Regular-file inspection is byte-bounded and rejects special files, but this does not guarantee a wall-clock deadline for every operating-system or network-filesystem call. An unsafe or oversized existing `vision.md` now reports an explicit inspection failure.
 - Linux preflight and bounded CI smoke tests do not substitute for a long deployed Windows-host Docker soak. The manual-only Windows-host Docker E2E job is not part of ordinary push-triggered gates. Development and monitoring did not modify the live installation or external repository.
