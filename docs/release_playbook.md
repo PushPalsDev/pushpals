@@ -196,6 +196,14 @@ pushpals --clear
 - `release_log.md` was not updated, so the GitHub release body is stale.
 - `packages/cli/runtime` was not regenerated after runtime changes.
 - The npm package published, but a platform binary smoke failed.
+- npm accepted publication but the exact version still returns `404`: registry
+  metadata and tarballs can propagate several minutes later. Each published CLI
+  smoke first waits up to 15 minutes (at most 64 attempts, 30 seconds per request)
+  for anonymous exact-version metadata and a fully downloaded, hash-verified
+  tarball. Requests have fixed byte bounds and never log response bodies or auth
+  configuration. Failure stops that smoke; it does not retry publication or skip
+  validation. If propagation exceeds this bound, verify registry visibility and
+  rerun only the failed smoke jobs, not npm publication.
 - npm publish reports `ENEEDAUTH`; verify the npm trusted publisher matches
   `PushPalsDev/pushpals` and `release-cli.yml` exactly, including case and file
   extension, verify the publish job retains `id-token: write`, and verify its

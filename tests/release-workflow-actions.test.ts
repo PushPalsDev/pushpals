@@ -13,6 +13,27 @@ function workflowText(): string {
 }
 
 describe("release workflow action runtimes", () => {
+  test("published platform smokes wait for exact npm propagation without repeating publication", () => {
+    const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");
+    for (const platform of ["linux", "windows"]) {
+      const job =
+        release.split(`  smoke_published_cli_${platform}:`)[1]?.split(/\n  [a-z_]+:/)[0] ?? "";
+      const wait = job.indexOf("- name: Wait for exact published npm package");
+      const smoke = job.indexOf("- name: Run installed-package");
+      expect(wait).toBeGreaterThan(0);
+      expect(smoke).toBeGreaterThan(wait);
+      const step = job.slice(wait, smoke);
+      expect(step).toContain("timeout-minutes: 16");
+      expect(step).toContain("bun run scripts/release-wait-for-npm.ts");
+      expect(step).toContain('--package-name "@pushpalsdev/cli"');
+      expect(step).toContain('--version "${{ needs.meta.outputs.version }}"');
+      expect(step).not.toContain("continue-on-error");
+      expect(step).not.toContain("npm publish");
+      expect(job.slice(smoke)).toContain("scripts/release-installed-cli-smoke.ts");
+    }
+    expect(release.match(/bun run scripts\/release-wait-for-npm\.ts/g)).toHaveLength(2);
+  });
+
   test("gates aggregate health recovery in Linux/Windows CI and Windows release validation", () => {
     const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
     const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");

@@ -12349,6 +12349,13 @@ function emitTrustedValidationProgress(callback, event) {
     callback?.(event);
   } catch {}
 }
+function trustedValidationFailureTelemetry(result) {
+  return {
+    exitCode: result.exitCode,
+    failureClass: result.ok ? null : result.failureClass ?? "trusted_validation_failed",
+    failedTestCount: result.failedTests?.length ?? 0
+  };
+}
 function trustedValidationHealthPhase(event) {
   return `trusted_validation_${event.phase}_${event.boundary}_attempt_${event.attempt}`;
 }
@@ -12687,7 +12694,8 @@ async function runTrustedValidationCommands(options) {
       attempt: 1,
       ok: preparation.ok,
       durationMs: preparation.durationMs,
-      cached: Boolean(preparation.cached)
+      cached: Boolean(preparation.cached),
+      ...trustedValidationFailureTelemetry(preparation)
     });
     if (!preparation.ok && options.retryTransientFailures !== false && isTransientTrustedValidationFailure(preparation)) {
       results.push({
@@ -12700,7 +12708,8 @@ async function runTrustedValidationCommands(options) {
         phase: "dependency_install",
         command: preparationCommand,
         attempt: 2,
-        retryReason: "transient_infrastructure"
+        retryReason: "transient_infrastructure",
+        ...trustedValidationFailureTelemetry(preparation)
       });
       emitTrustedValidationProgress(options.onProgress, {
         boundary: "start",
@@ -12730,7 +12739,8 @@ async function runTrustedValidationCommands(options) {
         attempt: 2,
         ok: preparation.ok,
         durationMs: preparation.durationMs,
-        cached: Boolean(preparation.cached)
+        cached: Boolean(preparation.cached),
+        ...trustedValidationFailureTelemetry(preparation)
       });
     }
     results.push(preparation);
@@ -12785,7 +12795,8 @@ async function runTrustedValidationCommands(options) {
         attempt,
         ok: validationResult2.ok,
         durationMs: validationResult2.durationMs,
-        cached: Boolean(validationResult2.cached)
+        cached: Boolean(validationResult2.cached),
+        ...trustedValidationFailureTelemetry(validationResult2)
       });
       return {
         result: validationResult2,
@@ -12803,7 +12814,8 @@ async function runTrustedValidationCommands(options) {
         phase: "validation",
         command,
         attempt: 2,
-        retryReason: "transient_infrastructure"
+        retryReason: "transient_infrastructure",
+        ...trustedValidationFailureTelemetry(validationResult)
       });
       validationResult = {
         ...(await execute(2)).result,
@@ -12817,11 +12829,21 @@ async function runTrustedValidationCommands(options) {
   return results;
 }
 function isTransientTrustedValidationFailure(result) {
+  const plain = String(result.output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  if (hasDeterministicValidationDiagnostic(plain))
+    return false;
   if (result.failureClass === "timeout" || result.exitCode === 124)
     return true;
-  if (isExplicitTestRunnerTimeoutFailure(result.output))
+  if (isExplicitTestRunnerTimeoutFailure(plain))
     return true;
-  return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(String(result.output ?? ""));
+  const diagnostics = plain.split(/\r?\n/).filter((line) => !/^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(line));
+  return diagnostics.some((line) => /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(line));
+}
+function hasDeterministicValidationDiagnostic(output) {
+  return output.split(/\r?\n/).some((rawLine) => {
+    const line = rawLine.trim();
+    return /^(?:(?:AssertionError|assertion\s+failed)\b|(?:error:\s*)?expect\(|(?:Expected|Received|Actual):|error\s+TS\d+:|\d+:\d+\s+error\s)/i.test(line) || /^(?:.+?)(?:\(\d+,\d+\):|:\d+:\d+\s+-)\s+error\b/i.test(line);
+  });
 }
 function isExplicitTestRunnerTimeoutFailure(output) {
   const plain = String(output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");

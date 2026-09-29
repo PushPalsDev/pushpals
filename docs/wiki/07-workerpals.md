@@ -174,7 +174,10 @@ and commit-message pass. Terminal events retain the cumulative exact/estimated
 provenance even when a later pass times out or throws.
 
 Docs-only declared targets override incidental test terminology, and read-only
-discovery hints alone do not classify a job as test-focused. The local revision
+discovery hints alone do not classify a job as test-focused. Conditional maintenance
+such as "update tests if needed" does not require a test-file diff for otherwise
+non-test work. Explicit test targets and mandatory test-edit clauses still do;
+required validation commands and critic review remain unchanged. The local revision
 circuit compares failed-test identities and assertion context, so a changed
 failure cluster can receive another bounded repair while an exact repeat still
 stops.

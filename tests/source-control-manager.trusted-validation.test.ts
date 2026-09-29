@@ -525,6 +525,91 @@ describe("SourceControlManager trusted validation", () => {
     expect(outcome.terminalFailure).toBeNull();
   });
 
+  test.each([
+    {
+      name: "passing connection-refused fixture beside an assertion",
+      output:
+        "(pass) transport > handles connection refused [1ms]\n(fail) catalog > returns expected items\nAssertionError: expected 2 to be 3",
+    },
+    {
+      name: "passing ECONNRESET fixture beside a compiler diagnostic",
+      output:
+        "(pass) transport > retries ECONNRESET [1ms]\nsrc/value.ts(3,1): error TS2322: incompatible types",
+    },
+    {
+      name: "passing resource-busy fixture beside a lint diagnostic",
+      output:
+        "(pass) transport > handles resource busy [1ms]\nsrc/value.ts\n  3:1  error  Unexpected any  @typescript-eslint/no-explicit-any",
+    },
+    {
+      name: "real connection failure mixed with an independent assertion",
+      output:
+        "Error: connect ECONNRESET\n(fail) catalog > returns expected items\nExpected: 3\nReceived: 2",
+    },
+    {
+      name: "a network fixture name without an infrastructure diagnostic",
+      output:
+        "PASS tests/transport.test.ts > handles connection refused\nCommand failed with status 1",
+    },
+    {
+      name: "a failed test title mentioning infrastructure",
+      output: "(fail) transport > handles connection refused [1ms]\ncustom check failed",
+    },
+    {
+      name: "an ambiguous container reset error",
+      output:
+        "2758 pass\n0 fail\nResetting local database...\nerror running container: exit 1\nLocal database reset failed.",
+    },
+    {
+      name: "a timeout report mixed with a real compiler diagnostic",
+      output:
+        "Error: Hook timed out in 10000ms.\nsrc/value.ts:3:1 - error TS2322: incompatible types",
+    },
+  ])("does not retry $name as transient infrastructure", async ({ output }) => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => {
+        calls += 1;
+        return { ok: false, output, exitCode: 1 };
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ ok: false, attempt: 1 });
+    expect(results[0].retryReason).toBeUndefined();
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBe(results[0]);
+  });
+
+  test.each([
+    "Error: connect ECONNRESET",
+    "TypeError: fetch failed\n  cause: Error: connect ECONNRESET",
+    "connection refused",
+    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+    "Failed to connect to the Docker daemon at unix:///var/run/docker.sock",
+    "Error: Hook timed out in 10000ms.",
+  ])("retains one bounded retry for known infrastructure diagnostic %s", async (output) => {
+    let calls = 0;
+    const events: TrustedValidationProgressEvent[] = [];
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => {
+        calls += 1;
+        return { ok: false, output, exitCode: 1 };
+      },
+      onProgress: (event) => events.push(event),
+    });
+
+    expect(calls).toBe(2);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: false, attempt: 2 });
+    expect(events.filter((event) => event.boundary === "retry")).toHaveLength(1);
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBe(results[1]);
+  });
+
   test("keeps failed retry telemetry but blocks on the terminal attempt when retry also fails", () => {
     const firstAttempt = {
       ok: false,
@@ -594,6 +679,26 @@ describe("SourceControlManager trusted validation", () => {
         ["start", "validation", 1],
         ["complete", "validation", 1],
       ]);
+      expect(progress[1]).toMatchObject({
+        boundary: "complete",
+        phase: "dependency_install",
+        exitCode: 1,
+        failureClass: "dependency_setup_failed",
+        failedTestCount: 0,
+      });
+      expect(progress[2]).toMatchObject({
+        boundary: "retry",
+        phase: "dependency_install",
+        exitCode: 1,
+        failureClass: "dependency_setup_failed",
+        failedTestCount: 0,
+      });
+      expect(progress[4]).toMatchObject({
+        boundary: "complete",
+        exitCode: 0,
+        failureClass: null,
+        failedTestCount: 0,
+      });
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }
@@ -912,7 +1017,27 @@ describe("SourceControlManager trusted validation", () => {
         });
       }
       expect(events.at(-1)).toMatchObject({ command: "bun run second", boundary: "start" });
+      expect(events[1]).toMatchObject({
+        boundary: "complete",
+        exitCode: 1,
+        failureClass: "test_failure",
+        failedTestCount: 1,
+      });
+      expect(events[2]).toMatchObject({
+        boundary: "retry",
+        exitCode: 1,
+        failureClass: "test_failure",
+        failedTestCount: 1,
+      });
+      expect(events[4]).toMatchObject({
+        boundary: "complete",
+        exitCode: 0,
+        failureClass: null,
+        failedTestCount: 0,
+      });
       expect(lines.join("\n")).not.toContain("private command output");
+      expect(lines.join("\n")).not.toContain("tests/runner.vitest.ts");
+      expect(lines.join("\n")).not.toContain("Error: Test timed out");
     } finally {
       releaseRunner();
       await validation;

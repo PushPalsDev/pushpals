@@ -164,6 +164,12 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
 - trusted validation and configured checks terminate their Windows descendant
   trees on timeout and stop draining inherited output pipes after a bounded grace;
   trusted-host commands default to an eight-minute ceiling,
+- an immediate trusted-command retry is bounded to one known infrastructure
+  failure. Concrete assertion, compiler, or lint diagnostics veto that retry;
+  infrastructure phrases in test titles are not failure evidence. An ambiguous
+  container exit alone does not qualify. Completion/retry progress events include
+  the exit code, failure class, and failed-test count without copying child output
+  or test names into the streaming log,
 - retained candidates are automatically retried only once, and only after a
   same-command pass on the same baseline proves recovery from a transient host
   failure without named test evidence; test, lint, and typecheck failures stay

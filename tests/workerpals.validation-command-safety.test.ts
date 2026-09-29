@@ -2559,6 +2559,64 @@ describe("workerpals validation command safety", () => {
     ).toBe(true);
   });
 
+  test("conditional test maintenance does not force test-file churn for a lint-only change", () => {
+    const planning = planningFixture({
+      targetPaths: ["src/nativeAdapter.ts"],
+      scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["src/nativeAdapter.ts"] },
+      acceptanceCriteria: ["Preserve lazy loading and runtime behavior."],
+      validationSteps: ["bun run test", "git diff --check"],
+      requiredValidationSteps: ["bun run validate", "bun run lint"],
+    }) as any;
+    for (const guidance of [
+      "Update tests or documentation, including docs/context.md, if a durable behavior, architecture, or workflow fact changes.",
+      "Update relevant tests if necessary.",
+      "Add tests where appropriate.",
+      "- Update tests if needed.",
+      "1. Update relevant tests if necessary.",
+    ]) {
+      const instruction = `Move the narrow lint suppression above the intentional require statement. Run bun run test. ${guidance}`;
+      expect(isTestFocusedTask(instruction, planning)).toBe(false);
+      expect(
+        isTestFocusedTask("Move the lint suppression.", {
+          ...planning,
+          acceptanceCriteria: [guidance],
+        }),
+      ).toBe(false);
+      const commands = collectQualityGateValidationCommands({
+        instruction,
+        planning,
+        changedTestPaths: [],
+        isTestTask: false,
+      });
+      expect(commands.requiredRunnableSteps).toEqual(["bun run validate", "bun run lint"]);
+      expect(commands.commandsToRun).toContain("bun run test");
+    }
+    expect(isTestFocusedTask("Run tests. Update the lint suppression.", planning)).toBe(false);
+    expect(isTestFocusedTask("Add regression tests. Update tests if needed.", planning)).toBe(true);
+    expect(isTestFocusedTask("Add tests for requests if the token expires.", planning)).toBe(true);
+    expect(
+      isTestFocusedTask(
+        "Update tests if needed, but add regression tests for expired tokens.",
+        planning,
+      ),
+    ).toBe(true);
+    expect(
+      isTestFocusedTask(
+        "Update tests if needed and add regression tests for expired tokens.",
+        planning,
+      ),
+    ).toBe(true);
+    expect(
+      isTestFocusedTask("Update tests if needed.", planning, "tests/nativeAdapter.test.ts"),
+    ).toBe(true);
+    expect(
+      isTestFocusedTask("Update tests if needed.", {
+        ...planning,
+        acceptanceCriteria: ["Add regression coverage for lazy loading."],
+      }),
+    ).toBe(true);
+  });
+
   test("does not classify explicit docs-only work as test-focused from inspection language", () => {
     const teardownDocsInstruction =
       "Update `docs/codebase_context.md` to codify the repository's supported Bun test teardown contract. Read `vision.md` and verify relevant unit tests/configuration before documenting anything. Specify the supported teardown API and import/registration pattern, require deterministic cleanup of timers, listeners, servers, sockets, subscriptions, and pending async work, and describe assertions that expose lifecycle leaks instead of masking them. Include concise guidance for diagnosing suite-wide teardown failures and avoiding unsupported Bun APIs. Keep the guidance aligned with current implementation and tests; update other directly relevant documentation only if necessary. Run `bun run validate` and report the result, distinguishing any pre-existing failures from changes introduced by this work.";

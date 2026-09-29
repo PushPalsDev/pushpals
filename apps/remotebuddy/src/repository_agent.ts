@@ -239,6 +239,7 @@ type AutonomyEvidenceCoverage = {
   pageFingerprints: string[];
   reviewedPageFingerprints: string[];
   exclusionFingerprint: string | null;
+  exclusionPaths: string[];
   deferredPageFingerprints: string[];
   observedRevision: number | null;
   windowStartPage: number;
@@ -3047,6 +3048,32 @@ export class RepositoryAgentWorker {
         (entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry),
       );
     const rankedPlanHash = sha256(canonicalJson({ seedPaths, rankedPaths }));
+    // Exclusion fingerprints contain only canonical target paths. Adding more
+    // exclusions cannot make a previously excluded candidate eligible. Keep
+    // those deferrals instead of revisiting every earlier positive page.
+    // Legacy/malformed metadata and any removal retain conservative replay.
+    const previousExclusionPaths =
+      valid &&
+      Array.isArray(value.exclusionPaths) &&
+      value.exclusionPaths.length > 0 &&
+      value.exclusionPaths.length <= 128 &&
+      value.exclusionPaths.every(
+        (path) =>
+          typeof path === "string" &&
+          path.length <= 1_000 &&
+          normalizeRelativePath(path) === path &&
+          comparablePath(path) === path,
+      ) &&
+      sha256(canonicalJson(value.exclusionPaths)) === value.exclusionFingerprint
+        ? (value.exclusionPaths as string[])
+        : null;
+    const currentExclusions = new Set(excludedPaths);
+    const preserveDeferrals =
+      valid &&
+      exclusionFingerprint != null &&
+      (value.exclusionFingerprint === exclusionFingerprint ||
+        (previousExclusionPaths != null &&
+          previousExclusionPaths.every((path) => currentExclusions.has(path))));
     let windowStartPage =
       valid && typeof value.windowStartPage === "number" ? value.windowStartPage : 0;
     if (
@@ -3061,7 +3088,7 @@ export class RepositoryAgentWorker {
       valid &&
       Array.isArray(value.deferredPageFingerprints) &&
       value.deferredPageFingerprints.length > 0 &&
-      value.exclusionFingerprint !== exclusionFingerprint
+      !preserveDeferrals
     )
       windowStartPage = 0;
     if (windowStartPage > 0 && valid && value.repositoryRevision !== request.repository.revision) {
@@ -3181,10 +3208,9 @@ export class RepositoryAgentWorker {
       }),
     );
     const reviewedPageFingerprints = valid ? (value.reviewedPageFingerprints as string[]) : [];
-    const deferredPageFingerprints =
-      valid && exclusionFingerprint != null && value.exclusionFingerprint === exclusionFingerprint
-        ? (value.deferredPageFingerprints as string[])
-        : [];
+    const deferredPageFingerprints = preserveDeferrals
+      ? (value.deferredPageFingerprints as string[])
+      : [];
     const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
     const nextPage = pageFingerprints.findIndex((fingerprint) => !visited.has(fingerprint));
     const page = nextPage < 0 ? pageCount - 1 : nextPage;
@@ -3196,6 +3222,7 @@ export class RepositoryAgentWorker {
       pageFingerprints,
       reviewedPageFingerprints,
       exclusionFingerprint,
+      exclusionPaths: [...excludedPaths],
       deferredPageFingerprints,
       observedRevision,
       windowStartPage,
@@ -3302,6 +3329,7 @@ export class RepositoryAgentWorker {
               planHash: coverage.planHash,
               reviewedPageFingerprints,
               exclusionFingerprint: coverage.exclusionFingerprint,
+              exclusionPaths: coverage.exclusionPaths,
               deferredPageFingerprints,
               windowStartPage: advanceWindow
                 ? coverage.windowStartPage + coverage.pageCount

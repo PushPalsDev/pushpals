@@ -17521,10 +17521,13 @@ class RepositoryAgentWorker {
     const value = record?.value;
     const valid = record?.status === "active" && !isExpiredMemoryRecord(record) && record.kind === COVERAGE_KIND && isRecord2(value) && value.schemaVersion === 2 && value.discoveryKey === discoveryKey && typeof value.nextPage === "number" && Number.isInteger(value.nextPage) && value.nextPage >= 0 && value.nextPage <= MAX_AUTONOMY_DISCOVERY_PAGES && (value.windowStartPage === undefined || typeof value.windowStartPage === "number" && Number.isInteger(value.windowStartPage) && value.windowStartPage >= 0 && value.windowStartPage < MAX_DISCOVERY_TOTAL_PAGES && value.windowStartPage % MAX_AUTONOMY_DISCOVERY_PAGES === 0) && Array.isArray(value.reviewedPageFingerprints) && value.reviewedPageFingerprints.length <= MAX_REVIEWED_PAGE_FINGERPRINTS && value.reviewedPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry)) && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length <= MAX_DISCOVERY_TOTAL_PAGES && value.deferredPageFingerprints.every((entry) => typeof entry === "string" && /^[a-f\d]{64}$/.test(entry));
     const rankedPlanHash = sha2562(canonicalJson({ seedPaths, rankedPaths }));
+    const previousExclusionPaths = valid && Array.isArray(value.exclusionPaths) && value.exclusionPaths.length > 0 && value.exclusionPaths.length <= 128 && value.exclusionPaths.every((path) => typeof path === "string" && path.length <= 1000 && normalizeRelativePath(path) === path && comparablePath(path) === path) && sha2562(canonicalJson(value.exclusionPaths)) === value.exclusionFingerprint ? value.exclusionPaths : null;
+    const currentExclusions = new Set(excludedPaths);
+    const preserveDeferrals = valid && exclusionFingerprint != null && (value.exclusionFingerprint === exclusionFingerprint || previousExclusionPaths != null && previousExclusionPaths.every((path) => currentExclusions.has(path)));
     let windowStartPage = valid && typeof value.windowStartPage === "number" ? value.windowStartPage : 0;
     if (windowStartPage * MAX_DISCOVERY_PATHS >= rankedPaths.length || valid && value.rankedPlanHash !== rankedPlanHash)
       windowStartPage = 0;
-    if (windowStartPage > 0 && valid && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length > 0 && value.exclusionFingerprint !== exclusionFingerprint)
+    if (windowStartPage > 0 && valid && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length > 0 && !preserveDeferrals)
       windowStartPage = 0;
     if (windowStartPage > 0 && valid && value.repositoryRevision !== request.repository.revision) {
       try {
@@ -17605,7 +17608,7 @@ class RepositoryAgentWorker {
       ...windowStartPage > 0 ? { windowStartPage } : {}
     }));
     const reviewedPageFingerprints = valid ? value.reviewedPageFingerprints : [];
-    const deferredPageFingerprints = valid && exclusionFingerprint != null && value.exclusionFingerprint === exclusionFingerprint ? value.deferredPageFingerprints : [];
+    const deferredPageFingerprints = preserveDeferrals ? value.deferredPageFingerprints : [];
     const visited = new Set([...reviewedPageFingerprints, ...deferredPageFingerprints]);
     const nextPage = pageFingerprints.findIndex((fingerprint) => !visited.has(fingerprint));
     const page = nextPage < 0 ? pageCount - 1 : nextPage;
@@ -17617,6 +17620,7 @@ class RepositoryAgentWorker {
       pageFingerprints,
       reviewedPageFingerprints,
       exclusionFingerprint,
+      exclusionPaths: [...excludedPaths],
       deferredPageFingerprints,
       observedRevision,
       windowStartPage,
@@ -17677,6 +17681,7 @@ class RepositoryAgentWorker {
             planHash: coverage.planHash,
             reviewedPageFingerprints,
             exclusionFingerprint: coverage.exclusionFingerprint,
+            exclusionPaths: coverage.exclusionPaths,
             deferredPageFingerprints,
             windowStartPage: advanceWindow ? coverage.windowStartPage + coverage.pageCount : coverage.windowStartPage,
             rankedPlanHash: coverage.rankedPlanHash,

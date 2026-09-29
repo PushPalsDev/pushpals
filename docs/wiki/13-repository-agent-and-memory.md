@@ -316,9 +316,13 @@ cancellation, provider failures, and evidence-only fallback do not advance it.
 Structurally admissible positive answers remain reusable; an effective empty
 cache hit, including one whose proposals fail static admission, can recover a
 previously failed cursor write. If all admitted candidates overlap active/recent
-target exclusions, the worker can defer that page for that exclusion set only.
-This is not a structural-empty observation: removing the exclusion makes its
-valid candidates available again. Cursor expiry starts a new sweep.
+target exclusions, the worker can defer that page while those exclusions remain.
+Adding exclusions preserves deferred pages and the forward cursor; removing any
+exclusion conservatively revisits them. The bounded canonical path set is tied to
+its fingerprint in durable memory. Legacy or malformed path metadata retains
+conservative replay when exclusions change. This is not a structural-empty
+observation: removing the exclusion makes its valid candidates available again.
+Cursor expiry starts a new sweep.
 
 The `evidenceCoverage` log records request identity, page/count/limit, cache use,
 and advancement, including window position. Reaching the end of the bounded

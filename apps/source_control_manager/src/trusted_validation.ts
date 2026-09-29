@@ -36,6 +36,12 @@ export type TrustedValidationInvariantContext = {
   affectedPaths: readonly string[];
 };
 
+type TrustedValidationFailureTelemetry = {
+  exitCode: number;
+  failureClass: TrustedValidationCommandResult["failureClass"] | null;
+  failedTestCount: number;
+};
+
 export type TrustedValidationProgressEvent =
   | {
       boundary: "start";
@@ -43,7 +49,7 @@ export type TrustedValidationProgressEvent =
       command: string;
       attempt: number;
     }
-  | {
+  | ({
       boundary: "complete";
       phase: TrustedValidationCommandResult["phase"];
       command: string;
@@ -51,14 +57,14 @@ export type TrustedValidationProgressEvent =
       ok: boolean;
       durationMs: number;
       cached: boolean;
-    }
-  | {
+    } & TrustedValidationFailureTelemetry)
+  | ({
       boundary: "retry";
       phase: TrustedValidationCommandResult["phase"];
       command: string;
       attempt: number;
       retryReason: "transient_infrastructure";
-    };
+    } & TrustedValidationFailureTelemetry);
 
 export type TrustedValidationProgressCallback = (
   event: Readonly<TrustedValidationProgressEvent>,
@@ -137,6 +143,19 @@ function emitTrustedValidationProgress(
   } catch {
     // Health/telemetry observers must never change validation or publication.
   }
+}
+
+function trustedValidationFailureTelemetry(
+  result: TrustedValidationCommandResult,
+): TrustedValidationFailureTelemetry {
+  // No child text, failed-test names or paths enter streaming runtime logs.
+  // These scalar fields keep recovered failures visible without expanding the
+  // telemetry's content or granting it any validation authority.
+  return {
+    exitCode: result.exitCode,
+    failureClass: result.ok ? null : (result.failureClass ?? "trusted_validation_failed"),
+    failedTestCount: result.failedTests?.length ?? 0,
+  };
 }
 
 export function trustedValidationHealthPhase(event: TrustedValidationProgressEvent): string {
@@ -719,6 +738,7 @@ export async function runTrustedValidationCommands(options: {
       ok: preparation.ok,
       durationMs: preparation.durationMs,
       cached: Boolean(preparation.cached),
+      ...trustedValidationFailureTelemetry(preparation),
     });
     if (
       !preparation.ok &&
@@ -736,6 +756,7 @@ export async function runTrustedValidationCommands(options: {
         command: preparationCommand,
         attempt: 2,
         retryReason: "transient_infrastructure",
+        ...trustedValidationFailureTelemetry(preparation),
       });
       emitTrustedValidationProgress(options.onProgress, {
         boundary: "start",
@@ -766,6 +787,7 @@ export async function runTrustedValidationCommands(options: {
         ok: preparation.ok,
         durationMs: preparation.durationMs,
         cached: Boolean(preparation.cached),
+        ...trustedValidationFailureTelemetry(preparation),
       });
     }
     results.push(preparation);
@@ -834,6 +856,7 @@ export async function runTrustedValidationCommands(options: {
         ok: validationResult.ok,
         durationMs: validationResult.durationMs,
         cached: Boolean(validationResult.cached),
+        ...trustedValidationFailureTelemetry(validationResult),
       });
       return {
         result: validationResult,
@@ -856,6 +879,7 @@ export async function runTrustedValidationCommands(options: {
         command,
         attempt: 2,
         retryReason: "transient_infrastructure",
+        ...trustedValidationFailureTelemetry(validationResult),
       });
       validationResult = {
         ...(await execute(2)).result,
@@ -871,11 +895,37 @@ export async function runTrustedValidationCommands(options: {
 export function isTransientTrustedValidationFailure(
   result: Pick<TrustedValidationCommandResult, "failureClass" | "output" | "exitCode">,
 ): boolean {
+  const plain = String(result.output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  // Classify the full command output, before the report's bounded truncation.
+  // An expected negative-path fixture can mention ECONNRESET while a later
+  // assertion, compiler or lint failure requires a code change. Retrying that
+  // mixed aggregate spends minutes without repairing the candidate.
+  if (hasDeterministicValidationDiagnostic(plain)) return false;
   if (result.failureClass === "timeout" || result.exitCode === 124) return true;
-  if (isExplicitTestRunnerTimeoutFailure(result.output)) return true;
-  return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(
-    String(result.output ?? ""),
+  if (isExplicitTestRunnerTimeoutFailure(plain)) return true;
+  const diagnostics = plain.split(/\r?\n/).filter(
+    // Test titles are not infrastructure diagnostics, regardless of verdict.
+    (line) =>
+      !/^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(
+        line,
+      ),
   );
+  return diagnostics.some((line) =>
+    /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(
+      line,
+    ),
+  );
+}
+
+function hasDeterministicValidationDiagnostic(output: string): boolean {
+  return output.split(/\r?\n/).some((rawLine) => {
+    const line = rawLine.trim();
+    return (
+      /^(?:(?:AssertionError|assertion\s+failed)\b|(?:error:\s*)?expect\(|(?:Expected|Received|Actual):|error\s+TS\d+:|\d+:\d+\s+error\s)/i.test(
+        line,
+      ) || /^(?:.+?)(?:\(\d+,\d+\):|:\d+:\d+\s+-)\s+error\b/i.test(line)
+    );
+  });
 }
 
 function isExplicitTestRunnerTimeoutFailure(output: string): boolean {

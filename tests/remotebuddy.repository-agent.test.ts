@@ -956,6 +956,75 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     },
   );
 
+  test("changing delivery exclusions does not reseed or rewind reviewed discovery pages", async () => {
+    const repo = createCoverageRepository(19);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    // Recreate the worker each time so continuity depends on the durable
+    // cursor, not accidental process-local memoization.
+    const worker = () =>
+      new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger });
+    const exclusions = [[], ["src/coverage-018.ts"], ["src/coverage-017.ts"], []];
+    const planHashes: unknown[] = [];
+    for (const [index, targetPaths] of exclusions.entries()) {
+      const result = await worker().analyze(`stable-exclusion-page-${index}`, {
+        ...request,
+        context: { ...request.context, discoveryExclusions: { targetPaths } },
+      });
+      expect(result.discoveryProgress?.page).toBe(index + 1);
+      const [cursor] = await coverageRecords(memory, request);
+      planHashes.push((cursor!.value as any).rankedPlanHash);
+    }
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    expect(packets).toHaveLength(4);
+    expect(packets.map((packet) => packet.discoveryCoverage.page)).toEqual([1, 2, 3, 4]);
+    for (const packet of packets) {
+      expect(packet.seedPaths).toEqual(packets[0].seedPaths);
+      expect(packet.seedPaths).not.toContain("src/coverage-018.ts");
+      expect(packet.seedPaths).not.toContain("src/coverage-017.ts");
+    }
+    expect(new Set(planHashes).size).toBe(1);
+    const selected = packets.flatMap((packet) => packet.selectedPaths as string[]);
+    expect(new Set(selected).size).toBe(selected.length);
+    expect(selected).toHaveLength(20);
+    expect(selected).toContain("src/coverage-018.ts");
+    expect(selected).toContain("src/coverage-017.ts");
+    expect((await coverageRecords(memory, request))[0]!.value).toMatchObject({
+      nextPage: 4,
+    });
+  });
+
+  test("unrelated excluded paths do not invalidate a positive page's exact cache", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(() => modelResponse());
+    const worker = () =>
+      new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger });
+    const original = await worker().analyze("stable-positive-original", request);
+    const repeated = await worker().analyze("stable-positive-unrelated-exclusion", {
+      ...request,
+      context: {
+        ...request.context,
+        discoveryExclusions: { targetPaths: ["src/coverage-012.ts"] },
+      },
+    });
+    expect(repeated.cache.hit).toBe(true);
+    expect(repeated.cache.key).toBe(
+      original.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key,
+    );
+    expect(repeated.data).toEqual(original.data);
+    expect(repeated.discoveryProgress).toMatchObject({
+      page: 1,
+      advanced: false,
+      excludedCandidateCount: 0,
+    });
+    expect(llm.analysisCalls).toHaveLength(1);
+  });
+
   test("defers an excluded cached positive across workers without poisoning its reusable answer", async () => {
     const repo = createCoverageRepository();
     const request = await coverageRequest(repo);
@@ -1683,6 +1752,105 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       nextPage: 0,
     });
   });
+
+  test("adding exclusions preserves deferred pages across windows but removing one restores eligibility", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() => (++calls === 2 ? modelResponse() : emptyAutonomyResponse()));
+    const worker = () =>
+      new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger });
+    await seedLastCoveragePage(worker(), memory, request);
+    const original = await worker().analyze("monotonic-boundary-positive", request);
+    const excluding = (targetPaths: string[]) => ({
+      ...request,
+      context: { ...request.context, discoveryExclusions: { targetPaths } },
+    });
+    await worker().analyze("monotonic-boundary-deferred", excluding(["src/index.ts"]));
+    const [deferred] = await coverageRecords(memory, request);
+    expect(deferred!.value).toMatchObject({
+      windowStartPage: 16,
+      exclusionPaths: ["src/index.ts"],
+    });
+    const continued = await worker().analyze(
+      "monotonic-exclusions-added",
+      excluding(["src/index.ts", "src/coverage-098.ts"]),
+    );
+    expect(continued.discoveryProgress).toMatchObject({
+      page: 1,
+      excludedCandidateCount: 0,
+      boundedCoverageExhausted: true,
+    });
+    const nextPacket = JSON.parse(llm.analysisCalls.at(-1)!.messages[0]!.content).evidencePacket;
+    expect(nextPacket.discoveryCoverage).toMatchObject({ window: 2, page: 1 });
+    const [advanced] = await coverageRecords(memory, request);
+    expect((advanced!.value as any).deferredPageFingerprints).toEqual(
+      (deferred!.value as any).deferredPageFingerprints,
+    );
+    expect((advanced!.value as any).exclusionPaths).toEqual([
+      "src/coverage-098.ts",
+      "src/index.ts",
+    ]);
+    const restored = await worker().analyze(
+      "monotonic-exclusion-removed",
+      excluding(["src/coverage-098.ts"]),
+    );
+    expect(restored.cache.hit).toBe(true);
+    expect(restored.data).toEqual(original.data);
+    expect(restored.discoveryProgress).toMatchObject({ page: 16, advanced: false });
+    expect(llm.analysisCalls).toHaveLength(3);
+  });
+
+  for (const metadata of ["legacy", "oversized", "unbound", "invalid_path"] as const) {
+    test(`changed exclusions conservatively revisit deferrals with ${metadata} path metadata`, async () => {
+      const repo = createCoverageRepository(100);
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      let calls = 0;
+      const llm = new FakeLlm(() => (++calls === 1 ? emptyAutonomyResponse() : modelResponse()));
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      await seedLastCoveragePage(worker, memory, request);
+      await worker.analyze(`legacy-${metadata}-positive`, request);
+      await worker.analyze(`legacy-${metadata}-excluded`, {
+        ...request,
+        context: { ...request.context, discoveryExclusions: { targetPaths: ["src/index.ts"] } },
+      });
+      const [cursor] = await coverageRecords(memory, request);
+      const value = { ...(cursor!.value as Record<string, any>) };
+      if (metadata === "legacy") delete value.exclusionPaths;
+      if (metadata === "oversized") {
+        value.exclusionPaths = Array(129).fill("src/index.ts");
+        // Bind the malformed array so this case specifically tests the bound,
+        // not merely rejection of a mismatched fingerprint.
+        value.exclusionFingerprint = createHash("sha256")
+          .update(JSON.stringify(value.exclusionPaths))
+          .digest("hex");
+      }
+      if (metadata === "unbound") value.exclusionPaths = ["src/coverage-099.ts"];
+      if (metadata === "invalid_path") value.exclusionPaths = ["../outside.ts"];
+      await memory.put({ ...cursor!, value }, { expectedRevision: cursor!.revision });
+      const replayed = await worker.analyze(`legacy-${metadata}-changed`, {
+        ...request,
+        context: {
+          ...request.context,
+          discoveryExclusions: { targetPaths: ["src/index.ts", "src/coverage-099.ts"] },
+        },
+      });
+      expect(replayed.cache.hit).toBe(true);
+      expect(replayed.discoveryProgress).toMatchObject({
+        page: 16,
+        excludedCandidateCount: 1,
+        nextWindowAvailable: true,
+      });
+      expect(llm.analysisCalls).toHaveLength(2);
+    });
+  }
 
   test("removing an exclusion restores an earlier-window positive without another model call", async () => {
     const repo = createCoverageRepository(100);

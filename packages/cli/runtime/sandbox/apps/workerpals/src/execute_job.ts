@@ -6139,6 +6139,37 @@ function quoteValidationCommandArg(arg: string): string {
   return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function hasRequiredTestEditIntent(text: string): boolean {
+  // Validation instructions and conditional maintenance are not a requirement
+  // to manufacture a test-file diff. Keep explicit test targets authoritative
+  // below, and leave regression adequacy to validation and the critic.
+  const clauses = text.split(
+    /[.!?](?=\s|$)|[\r\n;]+|,?\s+(?:but|and)\s+(?=(?:also\s+)?(?:add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b)/i,
+  );
+  return clauses.some((clause) => {
+    const trimmed = clause.trim().replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, "");
+    if (
+      /^(?:also\s+)?(?:update|adjust|extend|add)\s+(?:(?:relevant|affected|existing|corresponding)\s+)*tests?\b/i.test(
+        trimmed,
+      ) &&
+      (/\b(?:if|when|where|as)\s+(?:needed|necessary|warranted|appropriate|applicable)\b/i.test(
+        trimmed,
+      ) ||
+        /\btests?\s+or\s+documentation\b[^;\n]*\bif\b/i.test(trimmed))
+    ) {
+      return false;
+    }
+    return (
+      /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(
+        trimmed,
+      ) ||
+      /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/i.test(
+        trimmed,
+      )
+    );
+  });
+}
+
 export function isTestFocusedTask(
   instruction: string,
   planning: TaskExecutePlanning,
@@ -6170,27 +6201,13 @@ export function isTestFocusedTask(
     return false;
   }
 
-  const lowerInstruction = instruction.toLowerCase();
-  if (
-    /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(
-      lowerInstruction,
-    ) ||
-    /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/.test(
-      lowerInstruction,
-    )
-  ) {
+  if (hasRequiredTestEditIntent(instruction)) {
     return true;
   }
   if (targetPath && isLikelyTestPath(targetPath)) return true;
   const pathHints = [...(planning.targetPaths ?? []), ...(planning.scope.writeGlobs ?? [])];
   if (pathHints.some((entry) => isLikelyTestPath(entry))) return true;
-  if (
-    planning.acceptanceCriteria.some((entry) =>
-      /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(
-        entry,
-      ),
-    )
-  ) {
+  if (planning.acceptanceCriteria.some(hasRequiredTestEditIntent)) {
     return true;
   }
   return false;
