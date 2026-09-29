@@ -3,9 +3,9 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve13 } from "path";
-import { mkdirSync as mkdirSync4 } from "fs";
-import { createHash as createHash7, randomUUID as randomUUID3 } from "crypto";
+import { isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve14 } from "path";
+import { mkdirSync as mkdirSync5 } from "fs";
+import { createHash as createHash8, randomUUID as randomUUID3 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -11371,6 +11371,146 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
   return resolve10(fallbackCwd);
 }
 
+// apps/source_control_manager/src/dependency_artifact_cache.ts
+import { createHash as createHash5 } from "crypto";
+import {
+  accessSync,
+  closeSync as closeSync2,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync as mkdirSync3,
+  openSync as openSync2,
+  readSync as readSync2,
+  statSync as statSync4
+} from "fs";
+import { basename as basename4, resolve as resolve11 } from "path";
+import { homedir } from "os";
+var MAX_INSTALL_CONFIG_BYTES = 128 * 1024;
+function readInstallConfig(path) {
+  let before;
+  try {
+    before = lstatSync(path);
+  } catch (error) {
+    return error.code === "ENOENT" ? "missing" : "unsafe";
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_INSTALL_CONFIG_BYTES)
+    return "unsafe";
+  let fd;
+  try {
+    fd = openSync2(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.size > MAX_INSTALL_CONFIG_BYTES || opened.dev !== before.dev || opened.ino !== before.ino)
+      return "unsafe";
+    const buffer = Buffer.alloc(MAX_INSTALL_CONFIG_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = readSync2(fd, buffer, length, buffer.length - length, length);
+      if (!count)
+        break;
+      length += count;
+    }
+    if (length > MAX_INSTALL_CONFIG_BYTES)
+      return "unsafe";
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length)) };
+  } catch {
+    return "unsafe";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync2(fd);
+      } catch {}
+    }
+  }
+}
+function npmrcOwnsCache(text) {
+  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const declaration = line.trim();
+    if (!declaration || /^[#;]/.test(declaration))
+      continue;
+    const equals = declaration.indexOf("=");
+    const rawKey = (equals < 0 ? declaration : declaration.slice(0, equals)).trim();
+    const key = rawKey.replace(/^(["'])(.*)\1$/, "$2").toLowerCase();
+    if (/^cache(?:\[\])?$/.test(key))
+      return true;
+    if (!/^[a-z0-9_@/.:~-]+(?:\[\])?$/.test(key))
+      return true;
+  }
+  return false;
+}
+function resolveTrustedDependencyArtifactCache(options) {
+  const env = options.env ?? process.env;
+  if (env.PUSHPALS_TRUSTED_ISOLATED_ARTIFACT_CACHE !== "1")
+    return null;
+  if (String(env.BUN_INSTALL_CACHE_DIR ?? "").trim())
+    return null;
+  if (Object.entries(env).some(([key, value]) => /^npm_config_(?:cache|userconfig|globalconfig)$/i.test(key) && String(value ?? "").trim()))
+    return null;
+  const npmrcPaths = [
+    resolve11(options.configRoot ?? options.repoRoot, ".npmrc"),
+    ...options.globalNpmrcPaths ?? [resolve11(homedir(), ".npmrc")],
+    ...env.XDG_CONFIG_HOME ? [resolve11(env.XDG_CONFIG_HOME, ".npmrc")] : []
+  ];
+  for (const path of npmrcPaths) {
+    const config = readInstallConfig(path);
+    if (config === "unsafe" || config !== "missing" && npmrcOwnsCache(config.text))
+      return null;
+  }
+  const configPaths = [
+    resolve11(options.configRoot ?? options.repoRoot, "bunfig.toml"),
+    ...options.globalConfigPaths ?? [
+      resolve11(homedir(), ".bunfig.toml"),
+      ...env.XDG_CONFIG_HOME ? [resolve11(env.XDG_CONFIG_HOME, ".bunfig.toml")] : []
+    ]
+  ];
+  for (const path of configPaths) {
+    try {
+      const read = readInstallConfig(path);
+      if (read === "missing")
+        continue;
+      if (read === "unsafe")
+        return null;
+      const config = Bun.TOML.parse(read.text);
+      const install = config.install;
+      if (install?.cache !== undefined || install?.backend !== undefined)
+        return null;
+    } catch {
+      return null;
+    }
+  }
+  const gitDir = resolveGitMetadataDir(options.repoRoot);
+  if (!gitDir)
+    return null;
+  const executable = options.bunExecutable || String(env.PUSHPALS_BUN_BIN ?? "").trim() || (/^bun(?:\.exe)?$/i.test(basename4(process.execPath)) ? process.execPath : "bun");
+  let executableStat = null;
+  try {
+    const stat = statSync4(executable);
+    executableStat = { size: stat.size, mtimeMs: stat.mtimeMs };
+  } catch {}
+  const identity = createHash5("sha256").update(JSON.stringify({
+    version: 1,
+    platform: options.platform ?? process.platform,
+    arch: options.arch ?? process.arch,
+    bun: options.bunVersion ?? (executable === process.execPath ? Bun.version : "external"),
+    executable,
+    executableStat,
+    searchPath: executableStat ? null : env.PATH ?? env.Path ?? ""
+  })).digest("hex");
+  const cacheDir = resolve11(gitDir, "pushpals", "dependencies", "trusted-packages", identity);
+  try {
+    mkdirSync3(cacheDir, { recursive: true });
+    accessSync(cacheDir, constants.W_OK);
+    return cacheDir;
+  } catch {
+    return null;
+  }
+}
+function withTrustedDependencyArtifacts(argv, cacheDir) {
+  if (!cacheDir)
+    return [...argv];
+  return [...argv, "--cache-dir", resolve11(cacheDir), "--backend", "copyfile"];
+}
+
 // apps/source_control_manager/src/completion_callback.ts
 async function parseCompletionPositiveAck(response) {
   const payload = await response.json().catch(() => null);
@@ -11427,13 +11567,13 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash as createHash5, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash6, randomUUID as randomUUID2 } from "crypto";
 import {
-  closeSync as closeSync2,
+  closeSync as closeSync3,
   existsSync as existsSync7,
   fsyncSync,
-  mkdirSync as mkdirSync3,
-  openSync as openSync2,
+  mkdirSync as mkdirSync4,
+  openSync as openSync3,
   readFileSync as readFileSync8,
   readdirSync as readdirSync2,
   renameSync,
@@ -11449,7 +11589,7 @@ var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
 var MAX_ADDITIONAL_VALIDATION_REFS = 24;
 function validationNamespace(completionId) {
-  const key = createHash5("sha256").update(completionId).digest("hex").slice(0, 32);
+  const key = createHash6("sha256").update(completionId).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function isSafePushpalsRef(value) {
@@ -11565,10 +11705,10 @@ class CompletionGcJournal {
   cursor = 0;
   constructor(stateDir) {
     this.directory = join7(stateDir, "completion-ref-gc");
-    mkdirSync3(this.directory, { recursive: true });
+    mkdirSync4(this.directory, { recursive: true });
   }
   pathFor(record) {
-    const key = createHash5("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    const key = createHash6("sha256").update(record.completionId).digest("hex").slice(0, 32);
     return join7(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
@@ -11584,17 +11724,17 @@ class CompletionGcJournal {
     const temporary = `${destination}.tmp-${process.pid}-${randomUUID2()}`;
     let fd = null;
     try {
-      fd = openSync2(temporary, "wx", 384);
+      fd = openSync3(temporary, "wx", 384);
       writeFileSync3(fd, `${JSON.stringify(record)}
 `, "utf8");
       fsyncSync(fd);
-      closeSync2(fd);
+      closeSync3(fd);
       fd = null;
       renameSync(temporary, destination);
       return record;
     } catch (error) {
       if (fd !== null)
-        closeSync2(fd);
+        closeSync3(fd);
       try {
         unlinkSync3(temporary);
       } catch {}
@@ -11956,9 +12096,238 @@ async function isValidationCheckpointPublished(options) {
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash7 } from "crypto";
 import { existsSync as existsSync8, readFileSync as readFileSync9, rmSync, writeFileSync as writeFileSync4 } from "fs";
-import { basename as basename4, resolve as resolve11 } from "path";
+import { basename as basename5, resolve as resolve12 } from "path";
+
+// packages/shared/src/validation_substeps.ts
+var VALIDATION_SUBSTEP_LIMITS = Object.freeze({
+  stages: 64,
+  lines: 65536,
+  lineChars: 4096,
+  labelChars: 512,
+  stageTokenChars: 128,
+  ordinal: 1e4,
+  durationMs: 24 * 60 * 60 * 1000,
+  ignoredLines: 1e6
+});
+
+// apps/source_control_manager/src/validation_substeps.ts
+function parseLine(raw) {
+  const line = raw.replace(/\u001b\[[0-9;]*m/g, "").replace(/\r$/, "");
+  if (/[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(line))
+    return null;
+  const text = line.trim();
+  const start = /^\[(?:([^\[\]]{1,96})[ \t]+)?([1-9]\d{0,4})\/([1-9]\d{0,4})\][ \t]+\[([^\[\]]+)\][ \t]+(.+)$/.exec(text);
+  if (start) {
+    const aggregatePrefix = (start[1] ?? "").trim().replace(/[ \t]+/g, " ");
+    const ordinal = Number(start[2]);
+    const total = Number(start[3]);
+    const label2 = start[5].trim();
+    if (ordinal > total || total > VALIDATION_SUBSTEP_LIMITS.ordinal || !start[4].trim() || !label2)
+      return null;
+    if (start[4].length > VALIDATION_SUBSTEP_LIMITS.stageTokenChars || label2.length > VALIDATION_SUBSTEP_LIMITS.labelChars)
+      return "limit";
+    return { kind: "start", ordinal, total, label: label2, aggregatePrefix };
+  }
+  const complete = /^\[(ok|fail|error)\][ \t]+/.exec(text);
+  if (!complete)
+    return null;
+  const durationOffset = text.lastIndexOf("(");
+  if (durationOffset <= complete[0].length || !/[ \t]/.test(text[durationOffset - 1]))
+    return null;
+  const duration = /^\((\d+(?:\.\d+)?) ms\)$/.exec(text.slice(durationOffset));
+  if (!duration)
+    return null;
+  const label = text.slice(complete[0].length, durationOffset).trim();
+  const reportedDurationMs = Number(duration[1]);
+  if (!label || !Number.isFinite(reportedDurationMs) || reportedDurationMs > VALIDATION_SUBSTEP_LIMITS.durationMs)
+    return null;
+  if (label.length > VALIDATION_SUBSTEP_LIMITS.labelChars)
+    return "limit";
+  return {
+    kind: "complete",
+    label,
+    marker: complete[1],
+    reportedDurationMs
+  };
+}
+function createValidationSubstepCollector(options = {}) {
+  const stages = new Map;
+  const labelUses = new Map;
+  const ignoredStartLabels = new Set;
+  let ignoredStartLabelsOverflowed = false;
+  let total = null;
+  let aggregatePrefix = null;
+  let observedLines = 0;
+  let ignoredLines = 0;
+  let truncated = false;
+  let finished = false;
+  const now = () => {
+    try {
+      const value = (options.nowMs ?? (() => performance.now()))();
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const elapsed = (startedAt, endedAt) => {
+    if (startedAt == null || endedAt == null)
+      return null;
+    const value = endedAt - startedAt;
+    return value >= 0 && value <= VALIDATION_SUBSTEP_LIMITS.durationMs ? value : null;
+  };
+  const ignore = () => {
+    ignoredLines = Math.min(VALIDATION_SUBSTEP_LIMITS.ignoredLines, ignoredLines + 1);
+  };
+  const observeIgnoredStart = (label) => {
+    if (labelUses.has(label)) {
+      labelUses.set(label, 2);
+    } else if (!ignoredStartLabels.has(label)) {
+      if (ignoredStartLabels.size < VALIDATION_SUBSTEP_LIMITS.stages) {
+        ignoredStartLabels.add(label);
+      } else {
+        ignoredStartLabelsOverflowed = true;
+        truncated = true;
+      }
+    }
+  };
+  const emit = (timing) => {
+    try {
+      const returned = options.onEvent?.(Object.freeze({ ...timing }));
+      if (returned != null && typeof returned.then === "function") {
+        Promise.resolve(returned).catch(() => {});
+      }
+    } catch {}
+  };
+  const onLine = (raw) => {
+    if (finished)
+      return;
+    if (observedLines >= VALIDATION_SUBSTEP_LIMITS.lines) {
+      truncated = true;
+      ignore();
+      return;
+    }
+    observedLines++;
+    if (typeof raw !== "string" || raw.length > VALIDATION_SUBSTEP_LIMITS.lineChars) {
+      truncated = true;
+      ignore();
+      return;
+    }
+    const parsed = parseLine(raw);
+    if (parsed === "limit") {
+      truncated = true;
+      ignore();
+      return;
+    }
+    if (!parsed) {
+      ignore();
+      return;
+    }
+    if (parsed.kind === "start") {
+      if (stages.has(parsed.ordinal) || total != null && total !== parsed.total || aggregatePrefix != null && aggregatePrefix !== parsed.aggregatePrefix) {
+        observeIgnoredStart(parsed.label);
+        ignore();
+        return;
+      }
+      if (stages.size >= VALIDATION_SUBSTEP_LIMITS.stages) {
+        observeIgnoredStart(parsed.label);
+        truncated = true;
+        ignore();
+        return;
+      }
+      total = parsed.total;
+      aggregatePrefix = parsed.aggregatePrefix;
+      const startedAtMs = now();
+      const timing = {
+        source: "aggregate_lines",
+        observationOnly: true,
+        stageId: `substep-${parsed.ordinal}`,
+        ordinal: parsed.ordinal,
+        total: parsed.total,
+        boundary: "start",
+        durationMs: null,
+        observedElapsedMs: startedAtMs == null ? null : 0,
+        reportedDurationMs: null
+      };
+      stages.set(parsed.ordinal, { label: parsed.label, startedAtMs, timing });
+      labelUses.set(parsed.label, labelUses.has(parsed.label) || ignoredStartLabels.has(parsed.label) || ignoredStartLabelsOverflowed ? 2 : 1);
+      emit(timing);
+      return;
+    }
+    const matching = [...stages.values()].filter((stage2) => stage2.timing.boundary === "start" && stage2.label === parsed.label);
+    if (matching.length !== 1 || labelUses.get(parsed.label) !== 1) {
+      ignore();
+      return;
+    }
+    const stage = matching[0];
+    const observedElapsedMs = elapsed(stage.startedAtMs, now());
+    stage.timing = {
+      ...stage.timing,
+      boundary: "complete",
+      durationMs: observedElapsedMs,
+      observedElapsedMs,
+      reportedDurationMs: parsed.reportedDurationMs,
+      completionMarker: parsed.marker
+    };
+    stage.label = "";
+    emit(stage.timing);
+  };
+  return {
+    onStdoutLine: onLine,
+    onStderrLine: onLine,
+    finish(reason = "command_finished") {
+      if (!finished) {
+        finished = true;
+        const endedAtMs = now();
+        const safeReason = [
+          "command_finished",
+          "timed_out",
+          "aborted",
+          "output_incomplete"
+        ].includes(reason) ? reason : "command_finished";
+        const terminalEvents = [];
+        for (const stage of stages.values()) {
+          if (stage.timing.boundary !== "start")
+            continue;
+          stage.timing = {
+            ...stage.timing,
+            boundary: "incomplete",
+            durationMs: null,
+            observedElapsedMs: elapsed(stage.startedAtMs, endedAtMs),
+            incompleteReason: truncated ? "observation_limit" : safeReason
+          };
+          stage.label = "";
+          terminalEvents.push(stage.timing);
+        }
+        labelUses.clear();
+        ignoredStartLabels.clear();
+        aggregatePrefix = null;
+        for (const event of terminalEvents)
+          emit(event);
+      }
+      return {
+        stages: [...stages.values()].map((stage) => ({ ...stage.timing })),
+        truncated,
+        ignoredLines
+      };
+    }
+  };
+}
+
+// apps/source_control_manager/src/trusted_validation.ts
+function createTrustedValidationSubstepLogger(identity, log = console.log) {
+  return (event) => {
+    const observedAt = new Date().toISOString();
+    log(`[${observedAt}] trustedValidationSubstep=${JSON.stringify({
+      event: "trusted_validation_substep",
+      observedAt,
+      ...identity,
+      ...event,
+      command: redactTrustedValidationProgressCommand(event.command)
+    })}`);
+  };
+}
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -12034,7 +12403,7 @@ function currentBunExecutable(explicit) {
   if (configured)
     return configured;
   const execPath = String(process.execPath ?? "").trim();
-  return /^(?:bun|bun\.exe)$/i.test(basename4(execPath)) ? execPath : "";
+  return /^(?:bun|bun\.exe)$/i.test(basename5(execPath)) ? execPath : "";
 }
 function resolveTrustedValidationArgv(argv, bunExecutable) {
   if (argv.length === 0)
@@ -12069,19 +12438,21 @@ function trustedValidationInstallFingerprint(options) {
   const baseSha = String(options.invariantContext?.baseSha ?? "").trim().toLowerCase();
   if (!candidateSha || !baseSha)
     return null;
-  const packagePath = resolve11(options.repoPath, "package.json");
+  const packagePath = resolve12(options.repoPath, "package.json");
   const lockPath = [
-    resolve11(options.repoPath, "bun.lock"),
-    resolve11(options.repoPath, "bun.lockb")
+    resolve12(options.repoPath, "bun.lock"),
+    resolve12(options.repoPath, "bun.lockb")
   ].find((path) => existsSync8(path));
   if (!existsSync8(packagePath) || !lockPath)
     return null;
-  const hash = createHash6("sha256");
+  const hash = createHash7("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
 `);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}
+`);
+  hash.update(`artifactPolicy=${options.artifactCacheDir ? `copyfile-v1:${resolve12(options.artifactCacheDir)}` : "inherited"}
 `);
   if (options.invariantContext) {
     hash.update(`candidate=${candidateSha}
@@ -12097,7 +12468,7 @@ function trustedValidationInstallFingerprint(options) {
   return hash.digest("hex");
 }
 function trustedInstallMarkerPath(repoPath) {
-  return resolve11(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+  return resolve12(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
 }
 function invalidateTrustedInstallMarker(repoPath) {
   const markerPath = trustedInstallMarkerPath(repoPath);
@@ -12159,7 +12530,7 @@ async function waitForTrustedInstallFlight(promise, timeoutMs, signal) {
 async function ensureTrustedValidationInstall(options) {
   const waitStartedAt = Date.now();
   const waitDeadline = waitStartedAt + Math.max(1, options.singleFlightWaitMs ?? options.timeoutMs + 1000);
-  const flightKey = resolve11(options.repoPath);
+  const flightKey = resolve12(options.repoPath);
   const requestedFingerprint = trustedValidationInstallFingerprint(options);
   let waitedForFlight = false;
   while (true) {
@@ -12202,7 +12573,7 @@ async function ensureTrustedValidationInstall(options) {
       invalidateTrustedInstallMarker(options.repoPath);
       let preparation;
       try {
-        preparation = await runTimed(options.runner, options.preparationArgv, {
+        preparation = await runTimed(options.runner, withTrustedDependencyArtifacts(options.preparationArgv, options.artifactCacheDir), {
           cwd: options.repoPath,
           timeoutMs: options.timeoutMs,
           signal: options.signal
@@ -12258,14 +12629,17 @@ async function runProcessWithTreeTimeout(argv, options) {
     timeoutMs: Math.max(1, options.timeoutMs),
     outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
     streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS,
-    signal: options.signal
+    signal: options.signal,
+    onStdoutLine: options.onStdoutLine,
+    onStderrLine: options.onStderrLine
   });
   return {
     ok: !result.timedOut && result.exitCode === 0,
     output: [result.stdout, result.stderr].filter(Boolean).join(`
 `),
     exitCode: result.exitCode,
-    ...result.timedOut ? { timedOut: true } : {}
+    ...result.timedOut ? { timedOut: true } : {},
+    ...result.drainTimedOut || result.stdoutReadError || result.stderrReadError || result.stdoutDecodeError || result.stderrDecodeError ? { outputIncomplete: true } : {}
   };
 }
 async function runTrustedValidationCommands(options) {
@@ -12300,6 +12674,7 @@ async function runTrustedValidationCommands(options) {
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
+      artifactCacheDir: options.artifactCacheDir,
       invariantContext: options.invariantContext,
       runner,
       signal: options.signal,
@@ -12339,6 +12714,7 @@ async function runTrustedValidationCommands(options) {
           preparationArgv,
           timeoutMs,
           bunExecutable: options.bunExecutable,
+          artifactCacheDir: options.artifactCacheDir,
           invariantContext: options.invariantContext,
           runner,
           signal: options.signal,
@@ -12370,11 +12746,23 @@ async function runTrustedValidationCommands(options) {
         command,
         attempt
       });
-      const result = await runTimed(runner, resolvedArgv, {
-        cwd: options.repoPath,
-        timeoutMs,
-        signal: options.signal
+      const collector = createValidationSubstepCollector({
+        onEvent: (event) => options.onSubstep?.({ ...event, command, phase: "validation", attempt })
       });
+      let result;
+      try {
+        result = await runTimed(runner, resolvedArgv, {
+          cwd: options.repoPath,
+          timeoutMs,
+          signal: options.signal,
+          onStdoutLine: collector.onStdoutLine,
+          onStderrLine: collector.onStderrLine
+        });
+      } catch (error) {
+        collector.finish(options.signal?.aborted ? "aborted" : "output_incomplete");
+        throw error;
+      }
+      const substeps = collector.finish(options.signal?.aborted ? "aborted" : result.timedOut ? "timed_out" : result.outputIncomplete ? "output_incomplete" : "command_finished");
       const evidence = result.ok ? null : extractTrustedValidationFailureEvidence({
         command,
         phase: "validation",
@@ -12387,6 +12775,7 @@ async function runTrustedValidationCommands(options) {
         output: truncateTrustedValidationOutput(result.output),
         phase: "validation",
         attempt,
+        ...substeps.stages.length > 0 || substeps.truncated ? { substeps } : {},
         ...evidence ?? {}
       };
       emitTrustedValidationProgress(options.onProgress, {
@@ -12486,7 +12875,7 @@ ${dirty}`, dirty);
 }
 
 // apps/source_control_manager/src/config.ts
-import { resolve as resolve12 } from "path";
+import { resolve as resolve13 } from "path";
 function buildDefaults(options = {}) {
   const pushConfig = loadPushPalsConfig({ reload: options.reload });
   const defaultLocalServer = resolveLocalServerConnection({
@@ -12495,7 +12884,7 @@ function buildDefaults(options = {}) {
     fallbackPort: pushConfig.server.port
   });
   return {
-    repoPath: resolve12(pushConfig.sourceControlManager.repoPath),
+    repoPath: resolve13(pushConfig.sourceControlManager.repoPath),
     serverUrl: defaultLocalServer.serverUrl,
     remote: pushConfig.sourceControlManager.remote,
     mainBranch: pushConfig.sourceControlManager.mainBranch,
@@ -12503,7 +12892,7 @@ function buildDefaults(options = {}) {
     branchPrefix: pushConfig.sourceControlManager.branchPrefix,
     pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
     checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
-    stateDir: resolve12(pushConfig.sourceControlManager.stateDir),
+    stateDir: resolve13(pushConfig.sourceControlManager.stateDir),
     port: pushConfig.sourceControlManager.port,
     deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
     maxAttempts: pushConfig.sourceControlManager.maxAttempts,
@@ -12604,7 +12993,7 @@ try {
   scrubScmRepairAuthoritySecretFromEnv(process.env);
 }
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
-var defaultSourceControlManagerRepoPath = resolve13(PUSH_CONFIG.sourceControlManager.repoPath);
+var defaultSourceControlManagerRepoPath = resolve14(PUSH_CONFIG.sourceControlManager.repoPath);
 var COMPLETION_LEASE_MS = 3 * 60000;
 var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
 var PUBLICATION_HEALTH_POLL_MS = 1e4;
@@ -12662,7 +13051,7 @@ if (typeof args.config === "string" && args.config.trim()) {
 var config = loadConfig();
 var cliOverrides = {};
 if (typeof args.repo === "string")
-  cliOverrides.repoPath = resolve13(args.repo);
+  cliOverrides.repoPath = resolve14(args.repo);
 if (typeof args.server === "string")
   cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -12690,14 +13079,14 @@ if (typeof args.interval === "string") {
   }
 }
 if (typeof args["state-dir"] === "string")
-  cliOverrides.stateDir = resolve13(args["state-dir"]);
+  cliOverrides.stateDir = resolve14(args["state-dir"]);
 if (args["delete-after-merge"])
   cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
-config.repoPath = resolve13(config.repoPath);
+config.repoPath = resolve14(config.repoPath);
 var integrationBaseBranch = config.integrationBaseBranch;
 var integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-var usingDefaultRepoPath = resolve13(config.repoPath) === resolve13(defaultSourceControlManagerRepoPath);
+var usingDefaultRepoPath = resolve14(config.repoPath) === resolve14(defaultSourceControlManagerRepoPath);
 try {
   validateConfig(config);
 } catch (err) {
@@ -12726,7 +13115,7 @@ if (skipCleanCheck) {
   const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "source_control_manager.skip_clean_check";
   console.log(`[${ts2()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
-mkdirSync4(config.stateDir, { recursive: true });
+mkdirSync5(config.stateDir, { recursive: true });
 var lock = new FileLock(config.stateDir);
 if (!lock.acquire()) {
   console.error(`[${ts2()}] Another source_control_manager instance is already running. Exiting.`);
@@ -12736,7 +13125,7 @@ console.log(`[${ts2()}] Lock acquired`);
 var dbPath = join8(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
-var sourceControlManagerPusherId = `source_control_manager-${createHash7("sha256").update(`${config.repoPath}
+var sourceControlManagerPusherId = `source_control_manager-${createHash8("sha256").update(`${config.repoPath}
 ${config.mainBranch}
 ${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID3().slice(0, 8)}`;
 var repositoryServices = createRepositoryAgentServiceClients({
@@ -13681,6 +14070,10 @@ async function tick() {
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: validationCommandsJson,
+            artifactCacheDir: resolveTrustedDependencyArtifactCache({
+              repoRoot,
+              configRoot: runtimeConfig.repoPath
+            }),
             invariantContext: trustedValidationBaselineSha && trustedValidationCandidateSha ? {
               baseSha: trustedValidationBaselineSha,
               candidateSha: trustedValidationCandidateSha,
@@ -13689,7 +14082,13 @@ async function tick() {
             onProgress: (event) => {
               healthTracker.progress(trustedValidationHealthPhase(event), completion.id);
               logValidationProgress(event);
-            }
+            },
+            onSubstep: createTrustedValidationSubstepLogger({
+              jobId: completion.jobId,
+              completionId: completion.id,
+              commitSha: completion.commitSha,
+              candidateSha: trustedValidationCandidateSha
+            })
           });
           const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
           const terminalResults = new Set(validationOutcome.terminalResults);
@@ -14260,7 +14659,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync4(resolve13(config.repoPath, ".."), { recursive: true });
+  mkdirSync5(resolve14(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,

@@ -864,6 +864,10 @@ def _looks_like_route_shell_task(params: Dict[str, Any]) -> bool:
 
 def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
     revision = bool(str(params.get("qualityRevisionHint") or "").strip())
+    automatic_validation = (
+        _has_executor_validation_ownership(params)
+        and params["executorValidationOwnership"]["owner"] == "pushpals_after_edit"
+    )
     raw_turn_budget = params.get("executorTurnBudgetMs")
     turn_budget_s = (
         max(1, int(raw_turn_budget // 1000))
@@ -878,17 +882,31 @@ def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
             "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration."
         ),
         (
-            "- This is a focused revision of an existing patch. Inspect the current diff and the supplied failure/critic evidence, spend at most 30s rediscovering context, make the smallest correction, and return after focused checks. Do not restart full repository discovery or run aggregate validation; PushPals owns the full gates after this turn."
+            (
+                "- This is a focused revision of an existing patch. Inspect the current diff and the supplied failure/critic evidence, spend at most 30s rediscovering context, make the smallest correction, and return after focused checks. Do not restart full repository discovery or run aggregate validation; PushPals owns the full gates after this turn."
+                if automatic_validation else
+                "- This is a focused revision of an existing patch. Inspect the diff and supplied failure/critic evidence, spend at most 30s rediscovering context, make the smallest correction, then perform the required validation or report the unmet requirement. Do not assume an automatic validation handoff."
+            )
             if revision else
             "- Allocate roughly 15% of this turn to discovery, 60% to editing, 20% to focused validation, and 5% to the final diff review. If a phase runs long, narrow scope rather than expanding the harness."
         ),
         "- No-edit checkpoint: if you have not made a patch after identifying the behavior-owning file, stop discovering and edit that file now. Do not spend the execution budget proving every adjacent assumption first.",
         "- Discovery command budget: for compact tasks, use at most 5-8 targeted read/search commands before editing. If that is not enough, state the blocker and patch the best behavior owner rather than widening discovery.",
-        "- Validation ownership: discover and run the focused checks needed for the changed behavior or failing-stage reproduction. Do not run the whole test suite or long aggregate validation merely to satisfy the required-validation list during editing; PushPals ValidationGate runs those required gates after this turn. If the task specifically requires reproducing an aggregate failure, use the smallest necessary reproduction once rather than repeating the whole suite.",
+        (
+            "- Validation ownership: discover and run the focused checks needed for the changed behavior or failing-stage reproduction. Do not run the whole test suite or long aggregate validation merely to satisfy the required-validation list during editing; PushPals ValidationGate runs those required gates after this turn. If the task specifically requires reproducing an aggregate failure, use the smallest necessary reproduction once rather than repeating the whole suite."
+            if automatic_validation else
+            "- Validation ownership: discover and run the focused checks needed for the changed behavior, then perform required validation yourself where available and report any unmet requirements. No automatic post-edit runner has been established; do not omit required checks by assuming another service will run them."
+        ),
     ]
     if str(os.environ.get("PUSHPALS_WORKER_DOCKER_CAPABILITY", "")).strip() == "unavailable":
         lines.append(
-            "- Known worker capability: this sandbox intentionally has no Docker daemon/socket. Do not run or retry validation commands known to require it, including aggregate commands containing a Docker-dependent stage. Continue with runnable focused checks and report the pending gate. ValidationGate preserves the required command for trusted-host validation against the exact candidate SHA before publication; deferral is not a pass and must not be reported as successful validation. Do not alter tests or product code to bypass this requirement."
+            "- Known worker capability: this sandbox intentionally has no Docker daemon/socket. Do not run or retry validation commands known to require it, including aggregate commands containing a Docker-dependent stage. Continue with runnable focused checks. "
+            + (
+                "Report the pending gate. ValidationGate preserves the required command for trusted-host validation against the exact candidate SHA before publication; deferral is not a pass and must not be reported as successful validation. "
+                if automatic_validation else
+                "Report the capability-blocked requirement explicitly; no automatic trusted-host handoff is established, and deferral is not a pass. "
+            )
+            + "Do not alter tests or product code to bypass this requirement."
         )
     route_shell_task = _looks_like_route_shell_task(params)
     visual_task = _looks_like_visual_derivation_task(params)
@@ -901,7 +919,11 @@ def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
             [
                 "- Route-entry/shell task rule: inspect the hinted route wrapper, then move immediately to the behavior-owning shell component when the route is thin. Do not keep re-reading navigation topology once the owner is found.",
                 "- Compact shell polish rule: make one small visual/affordance patch before chasing missing test infrastructure. If a referenced React Native mock or app/__tests__ path is absent, use existing nearby tests or a focused style/helper assertion instead of creating a broad render harness.",
-                "- Shell task deadline: by the first clear owner hypothesis, choose the home/settings/shop/help/game-over surface and patch it; ValidationGate can run long browser checks after your focused validation.",
+                (
+                    "- Shell task deadline: by the first clear owner hypothesis, choose the home/settings/shop/help/game-over surface and patch it; ValidationGate can run long browser checks after your focused validation."
+                    if automatic_validation else
+                    "- Shell task deadline: by the first clear owner hypothesis, choose the behavior-owning surface and patch it; perform required browser checks where available or report the blocker without assuming a later runner."
+                ),
             ]
         )
     if visual_task:
@@ -933,17 +955,26 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         summary_parts.append(f"priority={priority}")
     if summary_parts:
         lines.append(f"- Planning summary: {', '.join(summary_parts)}")
+    automatic_validation = (
+        _has_executor_validation_ownership(params)
+        and params["executorValidationOwnership"]["owner"] == "pushpals_after_edit"
+    )
     lines.append(
-        "- Worker phase contract: discovering -> editing -> focused validation -> full validation handoff -> final diff review."
+        "- Worker phase contract: discovering -> editing -> focused validation -> "
+        + ("full validation handoff" if automatic_validation else "required validation or explicit blocker")
+        + " -> final diff review."
     )
     lines.append(
         "  - discovering: inspect relevant files/artifacts and state the current hypothesis before editing."
     )
     lines.append("  - editing: make the smallest behavior-owning patch.")
     lines.append("  - focused validation: run targeted fast checks for the changed surface.")
-    lines.append(
-        "  - full validation: hand off the whole suite and long required/aggregate/browser checks to PushPals ValidationGate after focused validation; required gates are not waived."
-    )
+    if automatic_validation:
+        lines.append(
+            "  - full validation: hand off the whole suite and long required/aggregate/browser checks to PushPals ValidationGate after focused validation; required gates are not waived."
+        )
+    else:
+        lines.append("  - full validation: follow the configured validation ownership, verify required checks, and report any unmet requirements; no automatic handoff is established by this planning section.")
     lines.append("  - final diff review: remove unrelated churn before returning.")
     lines.append(
         "- Phase limits: follow the current executor-turn budget and revision guidance above; do not assume a fresh full-job budget. If test harness setup consumes that budget, reduce to focused coverage using the existing harness."
@@ -1005,21 +1036,126 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         "Acceptance criteria",
         _string_list(planning.get("acceptanceCriteria"), limit=10, max_chars=260),
     )
-    _append_list_guidance(
-        lines,
-        "Planned validation steps",
-        _string_list(planning.get("validationSteps"), limit=8, max_chars=260),
-    )
-    _append_list_guidance(
-        lines,
-        "Required vision.md validation steps",
-        _string_list(planning.get("requiredValidationSteps"), limit=8, max_chars=260),
-    )
-
     guidance = "\n".join(lines).strip()
     if len(guidance) > 4000:
         guidance = guidance[:4000].rstrip() + "\n- Planning guidance truncated to stay within worker prompt budget."
     return guidance
+
+
+def _has_executor_validation_ownership(params: Dict[str, Any]) -> bool:
+    contract = params.get("executorValidationOwnership")
+    return (
+        isinstance(contract, dict)
+        and contract.get("schemaVersion") == 1
+        and contract.get("owner") in ("pushpals_after_edit", "executor")
+        and isinstance(contract.get("focusedCommands"), list)
+        and isinstance(contract.get("postEditCommands"), list)
+        and isinstance(contract.get("requiredSteps"), list)
+    )
+
+
+def _render_complete_validation_requirements(
+    lines: List[str], entries: List[Tuple[str, Any]], omitted: int = 0,
+) -> str:
+    """Whole commands only, including fallback requirements without a contract."""
+    displayed_commands: Set[str] = set()
+    used_chars = sum(len(entry) + 1 for entry in lines)
+    for prefix, raw_command in entries:
+        if not isinstance(raw_command, str) or any(ord(char) < 32 for char in raw_command):
+            omitted += 1
+            continue
+        command = raw_command.strip()
+        if not command or len(command) > 1000:
+            omitted += 1
+            continue
+        if command in displayed_commands:
+            continue
+        line = prefix + command
+        if used_chars + len(line) > 31_500:
+            omitted += 1
+            continue
+        lines.append(line)
+        used_chars += len(line) + 1
+        displayed_commands.add(command)
+    if omitted:
+        lines.append(
+            f"- {omitted} validation requirement(s) could not be displayed completely within the command/prompt limits. This manifest is incomplete, not a waiver or a pass. Inspect the original planning/vision requirements and report any requirement you cannot recover; do not guess a clipped command."
+        )
+    return "\n".join(lines)
+
+
+def _build_executor_validation_guidance(params: Dict[str, Any]) -> str:
+    if not _has_executor_validation_ownership(params):
+        planning = params.get("planning")
+        if not isinstance(planning, dict):
+            return ""
+        entries: List[Tuple[str, Any]] = []
+        omitted = 0
+        for field, label, limit in (
+            ("validationSteps", "Planned validation steps", 16),
+            ("requiredValidationSteps", "Required vision.md validation steps", 12),
+        ):
+            values = planning.get(field)
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                omitted += 1
+                continue
+            omitted += max(0, len(values) - limit)
+            entries.extend((f"- {label} (executor-owned): ", value) for value in values[:limit])
+        if not entries and not omitted:
+            return ""
+        return _render_complete_validation_requirements([
+            "Validation requirements without an established automatic runner:",
+            "- Host-derived validation ownership is absent or malformed. Perform required checks where possible and report unmet requirements; no automatic post-edit or trusted-host handoff is established.",
+        ], entries, omitted)
+    contract = params["executorValidationOwnership"]
+    lines = ["Host-derived validation ownership for this editing turn:"]
+    if contract["owner"] == "executor":
+        lines.append(
+            "- Automatic post-edit ValidationGate is disabled. Do not assume PushPals will execute the listed commands; perform appropriate validation yourself and report unmet requirements honestly."
+        )
+    else:
+        lines.extend([
+            "- Edit-turn owner: you. Use focused checks for the changed behavior, then return the patch and validation observations.",
+            "- Post-edit owner: PushPals. The scheduled gate commands below are a handoff manifest, not a request to execute them during coding. This ownership also applies when supplemental planner prose says to run the full suite.",
+            "- Required vision.md commands remain required. PushPals recomputes and runs its gates after editing; the trusted host runs any deferred aggregate unchanged against the candidate. Do not split, omit, or claim a pending aggregate passed.",
+            "- A small full suite can be the smallest useful check. For an explicit validation-repair/reproduction task, run one necessary reproduction or failing subcommand. These exceptions do not authorize repeated long full-suite runs after focused checks answer the question.",
+            "- Executor-reported passes are observations, not reusable final-gate evidence. Only configured, enabled final gates run; validation and any enabled critic review use independent gate evidence.",
+        ])
+    # Commands are actionable suggestions, unlike prose. Never clip a command
+    # or collapse whitespace inside a quoted path/filter while rendering it.
+    focused: List[str] = []
+    for command in contract["focusedCommands"]:
+        if not isinstance(command, str) or any(ord(char) < 32 for char in command):
+            continue
+        complete_command = command.strip()
+        if not complete_command or len(complete_command) > 500:
+            continue
+        focused.append(complete_command)
+        if len(focused) >= 4:
+            break
+    _append_list_guidance(lines, "Suggested focused checks (verify current checkout relevance)", focused)
+    if not focused:
+        lines.append("- No focused command was established from current test targets. Inspect the relevant existing test/manifest and choose the smallest valid check; do not invent a test runner or automatically substitute the full suite.")
+    # Match the trusted-command length limit and preserve exact quoted argv.
+    # Budget the whole section, not a prefix of an executable-looking command.
+    omitted = max(0, len(contract["postEditCommands"]) - 16) + max(0, len(contract["requiredSteps"]) - 12)
+    entries = []
+    for node in contract["postEditCommands"][:16]:
+        if not isinstance(node, dict):
+            omitted += 1
+            continue
+        capability = node.get("capability")
+        if capability in ("worker", "trusted_host"):
+            label = "Scheduled after editing" if contract["owner"] == "pushpals_after_edit" else "Validation requirement (no automatic runner)"
+            entries.append((f"- {label} [{capability}]: ", node.get("command")))
+        else:
+            omitted += 1
+    for command in contract["requiredSteps"][:12]:
+        label = "Required gate criterion (not an extra edit-turn command)" if contract["owner"] == "pushpals_after_edit" else "Required validation criterion (executor-owned)"
+        entries.append((f"- {label}: ", command))
+    return _render_complete_validation_requirements(lines, entries, omitted)
 
 
 def parse_task_execute_payload(
@@ -1089,6 +1225,11 @@ def parse_task_execute_payload(
             "preserving canonical user instruction and applying additive guidance."
         )
         supplemental_guidance.append(quality_revision_hint)
+    # Keep ownership outside the truncated planning section and after planner
+    # prose/revision context, which often repeats a broad validation checklist.
+    validation_guidance = _build_executor_validation_guidance(params)
+    if validation_guidance:
+        supplemental_guidance.append(validation_guidance)
 
     return TaskExecutePayload(
         kind=kind,

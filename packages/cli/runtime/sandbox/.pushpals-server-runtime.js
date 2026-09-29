@@ -18937,6 +18937,89 @@ class RequestQueue {
 import { Database as Database4 } from "bun:sqlite";
 import { createHash as createHash6, randomUUID as randomUUID5 } from "crypto";
 
+// packages/shared/src/validation_substeps.ts
+var VALIDATION_SUBSTEP_LIMITS = Object.freeze({
+  stages: 64,
+  lines: 65536,
+  lineChars: 4096,
+  labelChars: 512,
+  stageTokenChars: 128,
+  ordinal: 1e4,
+  durationMs: 24 * 60 * 60 * 1000,
+  ignoredLines: 1e6
+});
+function record(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+function integer(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function duration(value) {
+  return value === null || typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= VALIDATION_SUBSTEP_LIMITS.durationMs;
+}
+function normalizeStage(value) {
+  if (!record(value) || value.source !== "aggregate_lines" || value.observationOnly !== true || !integer(value.ordinal, 1, VALIDATION_SUBSTEP_LIMITS.ordinal) || !integer(value.total, value.ordinal, VALIDATION_SUBSTEP_LIMITS.ordinal) || !duration(value.durationMs) || !duration(value.observedElapsedMs) || !duration(value.reportedDurationMs))
+    return null;
+  const stage = {
+    source: "aggregate_lines",
+    observationOnly: true,
+    stageId: `substep-${value.ordinal}`,
+    ordinal: value.ordinal,
+    total: value.total,
+    durationMs: value.durationMs,
+    observedElapsedMs: value.observedElapsedMs,
+    reportedDurationMs: value.reportedDurationMs
+  };
+  if (value.boundary === "complete") {
+    if (value.durationMs !== value.observedElapsedMs || typeof value.completionMarker !== "string" || !["ok", "fail", "error"].includes(value.completionMarker))
+      return null;
+    return {
+      ...stage,
+      boundary: "complete",
+      completionMarker: value.completionMarker
+    };
+  }
+  if (value.boundary === "incomplete") {
+    if (value.durationMs !== null || value.reportedDurationMs !== null || typeof value.incompleteReason !== "string" || ![
+      "command_finished",
+      "timed_out",
+      "aborted",
+      "output_incomplete",
+      "observation_limit"
+    ].includes(value.incompleteReason))
+      return null;
+    return {
+      ...stage,
+      boundary: "incomplete",
+      incompleteReason: value.incompleteReason
+    };
+  }
+  return null;
+}
+function normalizeValidationSubstepReport(value) {
+  try {
+    if (!record(value) || !Array.isArray(value.stages) || typeof value.truncated !== "boolean" || !integer(value.ignoredLines, 0, VALIDATION_SUBSTEP_LIMITS.ignoredLines))
+      return;
+    const stages = [];
+    const ordinals = new Set;
+    let truncated = value.truncated || value.stages.length > VALIDATION_SUBSTEP_LIMITS.stages;
+    let total = null;
+    for (const candidate of value.stages.slice(0, VALIDATION_SUBSTEP_LIMITS.stages)) {
+      const stage = normalizeStage(candidate);
+      if (!stage || ordinals.has(stage.ordinal) || total != null && stage.total !== total) {
+        truncated = true;
+        continue;
+      }
+      total = stage.total;
+      ordinals.add(stage.ordinal);
+      stages.push(stage);
+    }
+    return { stages, truncated, ignoredLines: value.ignoredLines };
+  } catch {
+    return;
+  }
+}
+
 // packages/shared/src/review_publication_validation.ts
 function rejected(status, reason) {
   return { version: 1, status, commands: [], reason };
@@ -19171,7 +19254,8 @@ function normalizeTrustedValidationReport(value) {
       attempt: typeof result.attempt === "number" && Number.isFinite(result.attempt) ? Math.max(1, Math.min(10, Math.floor(result.attempt))) : undefined,
       retryReason: result.retryReason === "transient_infrastructure" ? "transient_infrastructure" : undefined,
       validationTarget: result.validationTarget === "baseline" || result.validation_target === "baseline" ? "baseline" : "candidate",
-      baselineFailureProven: result.baselineFailureProven === true || result.baseline_failure_proven === true
+      baselineFailureProven: result.baselineFailureProven === true || result.baseline_failure_proven === true,
+      substeps: normalizeValidationSubstepReport(result.substeps)
     });
   }
   const candidateSha = trustedValidationText(input.candidateSha, 128) || null;
@@ -20286,7 +20370,8 @@ class CompletionQueue {
         attempt: result.attempt ?? null,
         retryReason: result.retryReason ?? null,
         validationTarget: result.validationTarget ?? "candidate",
-        baselineFailureProven: Boolean(result.baselineFailureProven)
+        baselineFailureProven: Boolean(result.baselineFailureProven),
+        substeps: result.substeps
       }), now);
     }
   }
@@ -20477,11 +20562,11 @@ function asRepositoryAgentMemoryRefs(value) {
   const refs = [];
   const seen = new Set;
   for (const entry of value.slice(0, 128)) {
-    const record = asObject2(entry);
-    const id = asString3(record.id).slice(0, 512);
-    const namespace = asString3(record.namespace).slice(0, 256);
-    const key = asString3(record.key).slice(0, 512);
-    const role = asString3(record.role);
+    const record2 = asObject2(entry);
+    const id = asString3(record2.id).slice(0, 512);
+    const namespace = asString3(record2.namespace).slice(0, 256);
+    const key = asString3(record2.key).slice(0, 512);
+    const role = asString3(record2.role);
     if (!id || !namespace || !key || !REPOSITORY_AGENT_MEMORY_ROLES.has(role))
       continue;
     const identity = `${namespace}\x00${key}\x00${role}`;
@@ -20493,8 +20578,8 @@ function asRepositoryAgentMemoryRefs(value) {
       namespace,
       key,
       role,
-      ...Number.isFinite(asNumber(record.relevance, Number.NaN)) ? { relevance: clamp012(asNumber(record.relevance, 0)) } : {},
-      ...asString3(record.sourceRevision) ? { sourceRevision: asString3(record.sourceRevision).slice(0, 512) } : {}
+      ...Number.isFinite(asNumber(record2.relevance, Number.NaN)) ? { relevance: clamp012(asNumber(record2.relevance, 0)) } : {},
+      ...asString3(record2.sourceRevision) ? { sourceRevision: asString3(record2.sourceRevision).slice(0, 512) } : {}
     });
   }
   return refs;
@@ -20511,11 +20596,11 @@ function normalizeObjectiveClusterProse(value) {
 function normalizeObjectiveClusterIdentifier(value) {
   return asString3(value).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}_.:/-]+/gu, " ").replace(/\s+/g, " ").trim();
 }
-function objectiveTargetFamily(record) {
-  const scope = asObject2(record.scope);
+function objectiveTargetFamily(record2) {
+  const scope = asObject2(record2.scope);
   return [
     ...new Set([
-      ...asStringArray3(record.targetPaths ?? record.target_paths),
+      ...asStringArray3(record2.targetPaths ?? record2.target_paths),
       ...asStringArray3(scope.targetPaths ?? scope.target_paths)
     ].map(normalizeObjectiveTargetPath).filter(Boolean).map((targetPath) => {
       const parts = targetPath.split("/").filter(Boolean);
@@ -20526,15 +20611,15 @@ function objectiveTargetFamily(record) {
     }))
   ].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
 }
-function semanticObjectiveClusterKey(record, fallback, portfolio = {}) {
-  const evidence = asObject2(record.evidence);
+function semanticObjectiveClusterKey(record2, fallback, portfolio = {}) {
+  const evidence = asObject2(record2.evidence);
   const evidencePortfolio = asObject2(evidence.portfolio);
-  const lineage = asObject2(record.lineage ?? evidence.lineage);
-  const explicitParentMembership = normalizeObjectiveClusterIdentifier(record.rootObjectiveId ?? record.root_objective_id ?? record.parentObjectiveId ?? record.parent_objective_id ?? lineage.rootObjectiveId ?? lineage.root_objective_id ?? lineage.parentObjectiveId ?? lineage.parent_objective_id ?? portfolio.root_objective_id ?? evidencePortfolio.root_objective_id);
-  const visionObjectiveId = normalizeObjectiveClusterIdentifier(record.visionObjectiveId ?? record.vision_objective_id ?? portfolio.vision_objective_id ?? evidencePortfolio.vision_objective_id);
-  const acceptanceCriteria = asStringArray3(record.acceptanceCriteria ?? record.acceptance_criteria ?? evidence.acceptanceCriteria ?? evidence.acceptance_criteria).map(normalizeObjectiveClusterProse).filter(Boolean).sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-  const critic = asObject2(evidence.critic ?? record.critic);
-  const criticFingerprint = normalizeObjectiveClusterIdentifier(record.criticFingerprint ?? record.critic_fingerprint ?? evidence.criticFingerprint ?? evidence.critic_fingerprint ?? critic.fingerprint);
+  const lineage = asObject2(record2.lineage ?? evidence.lineage);
+  const explicitParentMembership = normalizeObjectiveClusterIdentifier(record2.rootObjectiveId ?? record2.root_objective_id ?? record2.parentObjectiveId ?? record2.parent_objective_id ?? lineage.rootObjectiveId ?? lineage.root_objective_id ?? lineage.parentObjectiveId ?? lineage.parent_objective_id ?? portfolio.root_objective_id ?? evidencePortfolio.root_objective_id);
+  const visionObjectiveId = normalizeObjectiveClusterIdentifier(record2.visionObjectiveId ?? record2.vision_objective_id ?? portfolio.vision_objective_id ?? evidencePortfolio.vision_objective_id);
+  const acceptanceCriteria = asStringArray3(record2.acceptanceCriteria ?? record2.acceptance_criteria ?? evidence.acceptanceCriteria ?? evidence.acceptance_criteria).map(normalizeObjectiveClusterProse).filter(Boolean).sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  const critic = asObject2(evidence.critic ?? record2.critic);
+  const criticFingerprint = normalizeObjectiveClusterIdentifier(record2.criticFingerprint ?? record2.critic_fingerprint ?? evidence.criticFingerprint ?? evidence.critic_fingerprint ?? critic.fingerprint);
   if (!visionObjectiveId && acceptanceCriteria.length === 0 && !criticFingerprint && !explicitParentMembership) {
     return fallback;
   }
@@ -20542,10 +20627,10 @@ function semanticObjectiveClusterKey(record, fallback, portfolio = {}) {
     visionObjectiveId,
     acceptanceCriteria,
     criticFingerprint,
-    objectiveType: asString3(record.objectiveType ?? record.objective_type).toLowerCase(),
+    objectiveType: asString3(record2.objectiveType ?? record2.objective_type).toLowerCase(),
     explicitParentMembership: explicitParentMembership || null,
-    componentArea: explicitParentMembership ? null : normalizeObjectiveClusterIdentifier(record.componentArea ?? record.component_area),
-    targetFamily: explicitParentMembership ? [] : objectiveTargetFamily(record)
+    componentArea: explicitParentMembership ? null : normalizeObjectiveClusterIdentifier(record2.componentArea ?? record2.component_area),
+    targetFamily: explicitParentMembership ? [] : objectiveTargetFamily(record2)
   }))}`;
 }
 var OBJECTIVE_POLICY = {
@@ -20805,15 +20890,15 @@ var PUSHPALS_OWNED_PATH_PATTERNS = [
   /\bremotebuddy\b/i,
   /\blocalbuddy\b/i
 ];
-function pushpalsInternalCandidateReason(record) {
-  const scope = asObject2(record.scope);
+function pushpalsInternalCandidateReason(record2) {
+  const scope = asObject2(record2.scope);
   const targetPaths = [
-    ...asStringArray3(record.targetPaths ?? record.target_paths),
+    ...asStringArray3(record2.targetPaths ?? record2.target_paths),
     ...asStringArray3(scope.targetPaths ?? scope.target_paths)
   ];
   const writeGlobs = asStringArray3(scope.writeGlobs ?? scope.write_globs);
   const ownershipHints = [
-    asString3(record.componentArea ?? record.component_area),
+    asString3(record2.componentArea ?? record2.component_area),
     ...targetPaths,
     ...writeGlobs
   ].map((entry) => entry.replace(/\\/g, "/").replace(/\/+/g, "/").trim()).filter(Boolean);
@@ -20821,14 +20906,14 @@ function pushpalsInternalCandidateReason(record) {
   if (targetsPushPalsOwnedArea)
     return null;
   const candidateText = [
-    record.title,
-    record.name,
-    record.summary,
-    record.description,
-    record.instruction,
-    record.patternKey ?? record.pattern_key,
-    record.componentArea ?? record.component_area,
-    ...asStringArray3(record.acceptanceCriteria ?? record.acceptance_criteria)
+    record2.title,
+    record2.name,
+    record2.summary,
+    record2.description,
+    record2.instruction,
+    record2.patternKey ?? record2.pattern_key,
+    record2.componentArea ?? record2.component_area,
+    ...asStringArray3(record2.acceptanceCriteria ?? record2.acceptance_criteria)
   ].map((entry) => asString3(entry)).join(`
 `);
   const leakedTerm = PUSHPALS_INTERNAL_CANDIDATE_PATTERNS.find((pattern) => pattern.test(candidateText));
@@ -20989,8 +21074,8 @@ function parseJobPayloadText(raw) {
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const record = parsed;
-      return `${asString3(record.summary)} ${asString3(record.message)} ${asString3(record.detail)}`.trim();
+      const record2 = parsed;
+      return `${asString3(record2.summary)} ${asString3(record2.message)} ${asString3(record2.detail)}`.trim();
     }
   } catch {}
   return String(raw).trim();
@@ -21001,8 +21086,8 @@ function parseJobPayloadSignalSummary(raw) {
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const record = parsed;
-      return `${asString3(record.summary)} ${asString3(record.message)}`.trim();
+      const record2 = parsed;
+      return `${asString3(record2.summary)} ${asString3(record2.message)}`.trim();
     }
   } catch {}
   return String(raw).trim();
@@ -21261,10 +21346,10 @@ function deriveEngineAlgorithmFromTitle(title) {
     return "";
   return text.slice(prefix.length).trim();
 }
-function extractEngineTrialCandidateMeta(record) {
-  const candidateId = asString3(record.id);
-  const title = asString3(record.title);
-  const trial = asObject2(record.engine_trial ?? record.engineTrial ?? record.engine_inspiration ?? record.engineInspiration ?? asObject2(record.debug).engine_trial ?? asObject2(record.debug).engineTrial);
+function extractEngineTrialCandidateMeta(record2) {
+  const candidateId = asString3(record2.id);
+  const title = asString3(record2.title);
+  const trial = asObject2(record2.engine_trial ?? record2.engineTrial ?? record2.engine_inspiration ?? record2.engineInspiration ?? asObject2(record2.debug).engine_trial ?? asObject2(record2.debug).engineTrial);
   const explicitBlockId = asString3(trial.building_block_id ?? trial.buildingBlockId ?? trial.block_id ?? trial.blockId ?? trial.engine_building_block_id ?? trial.engineBuildingBlockId);
   const fallbackBlockId = parseEngineBuildingBlockIdFromCandidateId(candidateId);
   const buildingBlockId = explicitBlockId || fallbackBlockId;
@@ -21341,28 +21426,28 @@ function mergeUniqueText(base, incoming, maxItems = 24) {
   return normalizeTextList([...base, ...incoming], maxItems, 320);
 }
 function normalizeInspirationPatternEntry(raw) {
-  const record = asObject2(raw);
-  const algorithm = truncateText(asString3(record.algorithm ?? record.title ?? record.name), 220);
-  const whenToUse = truncateText(asString3(record.when_to_use ?? record.whenToUse ?? record.context ?? record.use_case), 360);
-  const summary = truncateText(asString3(record.summary ?? record.abstract ?? record.problem ?? record.content ?? record.notes), 2400);
+  const record2 = asObject2(raw);
+  const algorithm = truncateText(asString3(record2.algorithm ?? record2.title ?? record2.name), 220);
+  const whenToUse = truncateText(asString3(record2.when_to_use ?? record2.whenToUse ?? record2.context ?? record2.use_case), 360);
+  const summary = truncateText(asString3(record2.summary ?? record2.abstract ?? record2.problem ?? record2.content ?? record2.notes), 2400);
   if (!algorithm || !whenToUse || !summary)
     return null;
-  const sourceType = normalizeInspirationSourceType(record.source_type ?? record.sourceType ?? record.kind ?? record.type);
-  const sourceLabel = truncateText(asString3(record.source_label ?? record.sourceLabel ?? record.source_name ?? record.sourceName), 240) || null;
-  const sourceUrl = truncateText(asString3(record.source_url ?? record.sourceUrl ?? record.url), 1000) || null;
-  const explicitSourceRef = truncateText(asString3(record.source_ref ?? record.sourceRef ?? record.reference), 1000) || null;
+  const sourceType = normalizeInspirationSourceType(record2.source_type ?? record2.sourceType ?? record2.kind ?? record2.type);
+  const sourceLabel = truncateText(asString3(record2.source_label ?? record2.sourceLabel ?? record2.source_name ?? record2.sourceName), 240) || null;
+  const sourceUrl = truncateText(asString3(record2.source_url ?? record2.sourceUrl ?? record2.url), 1000) || null;
+  const explicitSourceRef = truncateText(asString3(record2.source_ref ?? record2.sourceRef ?? record2.reference), 1000) || null;
   const sourceRefs = normalizeTextList([explicitSourceRef, sourceUrl, sourceLabel, sourceType].filter(Boolean), 32, 1000);
-  const risks = normalizeTextList(record.risks ?? record.risk_notes ?? record.riskNotes, 20, 320);
-  const validationIdeas = normalizeTextList(record.validation ?? record.validation_ideas ?? record.validationIdeas ?? record.checks, 20, 320);
-  const tags = uniqueLowercaseTokens(record.tags, 24);
-  const qualityScore = clamp012(asNumber(record.quality_score ?? record.qualityScore, 0.5));
-  const explicitFreshness = record.freshness_score ?? record.freshnessScore;
+  const risks = normalizeTextList(record2.risks ?? record2.risk_notes ?? record2.riskNotes, 20, 320);
+  const validationIdeas = normalizeTextList(record2.validation ?? record2.validation_ideas ?? record2.validationIdeas ?? record2.checks, 20, 320);
+  const tags = uniqueLowercaseTokens(record2.tags, 24);
+  const qualityScore = clamp012(asNumber(record2.quality_score ?? record2.qualityScore, 0.5));
+  const explicitFreshness = record2.freshness_score ?? record2.freshnessScore;
   const freshnessScore = Number.isFinite(asNumber(explicitFreshness, Number.NaN)) ? clamp012(asNumber(explicitFreshness, 0.5)) : (() => {
-    const publishedAt = Date.parse(asString3(record.published_at ?? record.publishedAt));
+    const publishedAt = Date.parse(asString3(record2.published_at ?? record2.publishedAt));
     const ageDays = Number.isFinite(publishedAt) ? Math.max(0, (Date.now() - publishedAt) / (24 * 60 * 60 * 1000)) : 180;
     return clamp012(1 - ageDays / 365);
   })();
-  const metadata = asObject2(record.metadata);
+  const metadata = asObject2(record2.metadata);
   if (sourceRefs.length > 0)
     metadata.source_refs = sourceRefs;
   const fingerprint = sha256Hex([algorithm.toLowerCase(), whenToUse.toLowerCase()].join(`
@@ -21469,13 +21554,13 @@ function validateAnswerAgainstSchema(questionType, schema, answer) {
       return { valid: false, normalized: answer, error: "Expected a JSON object payload." };
     }
     const requiredKeys = asStringArray3(schema.required_keys);
-    const record = answer;
+    const record2 = answer;
     for (const key of requiredKeys) {
-      if (!(key in record)) {
+      if (!(key in record2)) {
         return { valid: false, normalized: answer, error: `Missing required key "${key}".` };
       }
     }
-    return { valid: true, normalized: record };
+    return { valid: true, normalized: record2 };
   }
   return { valid: false, normalized: answer, error: `Unknown question_type "${questionType}"` };
 }
@@ -22766,9 +22851,9 @@ class AutonomyStore {
     const durations = [];
     for (const row of attemptRows) {
       outcomeCounts[classifyAutonomyAttemptOutcome(row)] += 1;
-      const duration = asNumber(row.durationMs, Number.NaN);
-      if (Number.isFinite(duration) && duration >= 0)
-        durations.push(duration);
+      const duration2 = asNumber(row.durationMs, Number.NaN);
+      if (Number.isFinite(duration2) && duration2 >= 0)
+        durations.push(duration2);
     }
     const objectiveRow = this.db.prepare(`WITH windowed AS (
            SELECT id, success, terminal, created_at,
@@ -24508,9 +24593,9 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       return asStringArray3(scope.targetPaths ?? scope.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
     });
     const results = candidates.map((raw) => {
-      const record = asObject2(raw);
-      const candidateId = asString3(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID6();
-      const objectiveTypeRaw = asString3(record.objectiveType ?? record.objective_type);
+      const record2 = asObject2(raw);
+      const candidateId = asString3(record2.id ?? record2.candidateId ?? record2.candidate_id) || randomUUID6();
+      const objectiveTypeRaw = asString3(record2.objectiveType ?? record2.objective_type);
       const objectiveType = asObjectiveType(objectiveTypeRaw);
       if (!objectiveType) {
         return {
@@ -24519,11 +24604,11 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           reason: `invalid objective_type "${objectiveTypeRaw}"`
         };
       }
-      const patternKey = semanticObjectiveClusterKey(record, asString3(record.patternKey ?? record.pattern_key));
-      const componentArea = asComponentArea(record.componentArea ?? record.component_area);
-      const confidence = clamp012(asNumber(record.confidence, 0));
-      const targetPaths = asStringArray3(record.targetPaths ?? record.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
-      const requiredValidationRepair = requiredValidationRepairAuthorized && asBoolean2(record.requiredValidationRepair ?? record.required_validation_repair, false);
+      const patternKey = semanticObjectiveClusterKey(record2, asString3(record2.patternKey ?? record2.pattern_key));
+      const componentArea = asComponentArea(record2.componentArea ?? record2.component_area);
+      const confidence = clamp012(asNumber(record2.confidence, 0));
+      const targetPaths = asStringArray3(record2.targetPaths ?? record2.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
+      const requiredValidationRepair = requiredValidationRepairAuthorized && asBoolean2(record2.requiredValidationRepair ?? record2.required_validation_repair, false);
       const lifecycleRecovery = requiredValidationRepair;
       const preflightErr = this.preflightReason(snapshotId, runId, {
         allowFrozenRecovery: lifecycleRecovery
@@ -24531,7 +24616,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       const safetyErr = this.safetyBlockReason(now, {
         allowFrozenRecovery: lifecycleRecovery
       });
-      const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
+      const pushpalsInternalErr = pushpalsInternalCandidateReason(record2);
       if (pushpalsInternalErr) {
         return {
           candidate_id: candidateId,
@@ -24639,17 +24724,17 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const candidateEngineTrialMetaById = new Map;
     const candidatePortfolioMetaById = new Map;
     for (const raw of candidates) {
-      const record = asObject2(raw);
-      const objectiveTypeRaw2 = asString3(record.objectiveType ?? record.objective_type);
-      const componentAreaRaw2 = asString3(record.componentArea ?? record.component_area);
-      const triggerTypeRaw2 = asString3(record.triggerType ?? record.trigger_type);
+      const record2 = asObject2(raw);
+      const objectiveTypeRaw2 = asString3(record2.objectiveType ?? record2.objective_type);
+      const componentAreaRaw2 = asString3(record2.componentArea ?? record2.component_area);
+      const triggerTypeRaw2 = asString3(record2.triggerType ?? record2.trigger_type);
       const objectiveType2 = asObjectiveType(objectiveTypeRaw2);
       const componentArea2 = asComponentArea(componentAreaRaw2);
       const triggerType2 = asTriggerType(triggerTypeRaw2);
-      const targetPaths2 = asStringArray3(record.targetPaths ?? record.target_paths);
-      const scopeRecord2 = asObject2(record.scope);
-      const riskLevel2 = asString3(record.riskLevel ?? record.risk_level);
-      const expectedValidation2 = asStringArray3(record.expectedValidation ?? record.expected_validation);
+      const targetPaths2 = asStringArray3(record2.targetPaths ?? record2.target_paths);
+      const scopeRecord2 = asObject2(record2.scope);
+      const riskLevel2 = asString3(record2.riskLevel ?? record2.risk_level);
+      const expectedValidation2 = asStringArray3(record2.expectedValidation ?? record2.expected_validation);
       const readAnywhere2 = asBoolean2(scopeRecord2.readAnywhere ?? scopeRecord2.read_anywhere, false);
       const writeGlobs = asStringArray3(scopeRecord2.writeGlobs ?? scopeRecord2.write_globs);
       const scopeValidation2 = validateScopeInvariants(componentArea2, targetPaths2, writeGlobs, {
@@ -24668,14 +24753,14 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         expectedValidation: expectedValidation2,
         allowReadAnywhere: this.config.remotebuddy.autonomy.allowReadAnywhere
       });
-      const pushpalsInternalErr2 = pushpalsInternalCandidateReason(record);
+      const pushpalsInternalErr2 = pushpalsInternalCandidateReason(record2);
       const gateReasons = [
         ...enumErrors,
         ...scopeValidation2.ok ? [] : scopeValidation2.errors,
         ...policyErrors2,
         ...pushpalsInternalErr2 ? [pushpalsInternalErr2] : []
       ];
-      const penalties = normalizePenalties((Array.isArray(record.penalties) ? record.penalties : []).map((entry) => {
+      const penalties = normalizePenalties((Array.isArray(record2.penalties) ? record2.penalties : []).map((entry) => {
         const item = asObject2(entry);
         return {
           kind: asString3(item.kind),
@@ -24684,36 +24769,36 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           evidence_ids: asStringArray3(item.evidence_ids)
         };
       }));
-      const llmScore = asNumber(record.llmScore ?? record.llm_score, 0);
-      const impactSignal = asNumber(record.impactSignal ?? record.impact_signal, 0);
-      const emaSuccess = asNumber(record.emaSuccess ?? record.ema_success, 0);
-      const emaUserAccept = asNumber(record.emaUserAccept ?? record.ema_user_accept, 0);
-      const finalScore = Number.isFinite(asNumber(record.finalScore ?? record.final_score, Number.NaN)) ? asNumber(record.finalScore ?? record.final_score, 0) : 0.55 * llmScore + 0.2 * impactSignal + 0.15 * emaSuccess + 0.1 * emaUserAccept - penaltyTotal(penalties);
+      const llmScore = asNumber(record2.llmScore ?? record2.llm_score, 0);
+      const impactSignal = asNumber(record2.impactSignal ?? record2.impact_signal, 0);
+      const emaSuccess = asNumber(record2.emaSuccess ?? record2.ema_success, 0);
+      const emaUserAccept = asNumber(record2.emaUserAccept ?? record2.ema_user_accept, 0);
+      const finalScore = Number.isFinite(asNumber(record2.finalScore ?? record2.final_score, Number.NaN)) ? asNumber(record2.finalScore ?? record2.final_score, 0) : 0.55 * llmScore + 0.2 * impactSignal + 0.15 * emaSuccess + 0.1 * emaUserAccept - penaltyTotal(penalties);
       const objectiveTypePersist = (objectiveType2 ?? objectiveTypeRaw2) || "invalid";
       const triggerTypePersist = (triggerType2 ?? triggerTypeRaw2) || "invalid";
       const componentAreaPersist = scopeValidation2.componentArea ?? componentAreaRaw2 ?? "invalid";
-      const candidateExternalId = asString3(record.id) || randomUUID6();
+      const candidateExternalId = asString3(record2.id) || randomUUID6();
       const candidateStorageId = scopedCandidateStorageId(runId, candidateExternalId);
-      const engineTrialMeta = extractEngineTrialCandidateMeta(record);
+      const engineTrialMeta = extractEngineTrialCandidateMeta(record2);
       if (engineTrialMeta) {
         candidateEngineTrialMetaById.set(candidateStorageId, engineTrialMeta);
       }
       const portfolioMeta2 = {
-        work_kind: asString3(record.work_kind ?? record.workKind) || null,
-        work_area_key: asString3(record.work_area_key ?? record.workAreaKey) || null,
-        work_target_key: asString3(record.work_target_key ?? record.workTargetKey) || null,
-        vision_objective_id: asString3(record.vision_objective_id ?? record.visionObjectiveId) || null,
-        vision_objective_weight: Number.isFinite(asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, Number.NaN)) ? clamp012(asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, 0)) : null,
-        vision_priority_rank: Number.isFinite(asNumber(record.vision_priority_rank ?? record.visionPriorityRank, Number.NaN)) ? Math.max(1, Math.floor(asNumber(record.vision_priority_rank ?? record.visionPriorityRank, 1))) : null,
-        vision_source_bucket: asString3(record.vision_source_bucket ?? record.visionSourceBucket) || null,
-        vision_category: asString3(record.vision_category ?? record.visionCategory) || null,
-        vision_alignment_reason: asString3(record.vision_alignment_reason ?? record.visionAlignmentReason) || null,
-        vision_section_refs: asStringArray3(record.vision_section_refs ?? record.visionSectionRefs),
-        feature_hypotheses: asStringArray3(record.feature_hypotheses ?? record.featureHypotheses).slice(0, 24)
+        work_kind: asString3(record2.work_kind ?? record2.workKind) || null,
+        work_area_key: asString3(record2.work_area_key ?? record2.workAreaKey) || null,
+        work_target_key: asString3(record2.work_target_key ?? record2.workTargetKey) || null,
+        vision_objective_id: asString3(record2.vision_objective_id ?? record2.visionObjectiveId) || null,
+        vision_objective_weight: Number.isFinite(asNumber(record2.vision_objective_weight ?? record2.visionObjectiveWeight, Number.NaN)) ? clamp012(asNumber(record2.vision_objective_weight ?? record2.visionObjectiveWeight, 0)) : null,
+        vision_priority_rank: Number.isFinite(asNumber(record2.vision_priority_rank ?? record2.visionPriorityRank, Number.NaN)) ? Math.max(1, Math.floor(asNumber(record2.vision_priority_rank ?? record2.visionPriorityRank, 1))) : null,
+        vision_source_bucket: asString3(record2.vision_source_bucket ?? record2.visionSourceBucket) || null,
+        vision_category: asString3(record2.vision_category ?? record2.visionCategory) || null,
+        vision_alignment_reason: asString3(record2.vision_alignment_reason ?? record2.visionAlignmentReason) || null,
+        vision_section_refs: asStringArray3(record2.vision_section_refs ?? record2.visionSectionRefs),
+        feature_hypotheses: asStringArray3(record2.feature_hypotheses ?? record2.featureHypotheses).slice(0, 24)
       };
       candidatePortfolioMetaById.set(candidateStorageId, portfolioMeta2);
       const debugRecord = {
-        ...asObject2(record.debug),
+        ...asObject2(record2.debug),
         ...portfolioMeta2,
         candidate_external_id: candidateExternalId
       };
@@ -24723,10 +24808,10 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
             estimated_effort, why_now_signal_ids_json, confidence, pattern_key, llm_score, impact_signal,
             ema_success, ema_user_accept, penalties_json, final_score, selected, rejection_reason,
             gate_decision, gate_reasons_json, debug_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(candidateStorageId, runId, snapshotId, sessionId, asString3(record.title), objectiveTypePersist, asString3(record.problemStatement ?? record.problem_statement), triggerTypePersist, componentAreaPersist, JSON.stringify(scopeValidation2.normalizedTargetPaths), JSON.stringify({
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(candidateStorageId, runId, snapshotId, sessionId, asString3(record2.title), objectiveTypePersist, asString3(record2.problemStatement ?? record2.problem_statement), triggerTypePersist, componentAreaPersist, JSON.stringify(scopeValidation2.normalizedTargetPaths), JSON.stringify({
         readAnywhere: readAnywhere2,
         writeGlobs: scopeValidation2.normalizedWriteGlobs
-      }), riskLevel2, JSON.stringify(expectedValidation2), asString3(record.estimatedEffort ?? record.estimated_effort), JSON.stringify(asStringArray3(record.whyNowSignalIds ?? record.why_now_signal_ids)), clamp012(asNumber(record.confidence, 0)), semanticObjectiveClusterKey(record, makePatternKey(objectiveTypePersist, scopeValidation2.normalizedTargetPaths, triggerTypePersist, componentAreaPersist), portfolioMeta2), llmScore, impactSignal, emaSuccess, emaUserAccept, JSON.stringify(penalties), finalScore, asBoolean2(record.selected, false) ? 1 : 0, asString3(record.rejectionReason ?? record.rejection_reason) || null, asString3(record.gateDecision ?? record.gate_decision) || (gateReasons.length === 0 ? "approved" : "rejected"), JSON.stringify(gateReasons.length === 0 ? asStringArray3(record.gateReasons ?? record.gate_reasons) : gateReasons), JSON.stringify(debugRecord), asIsoNow());
+      }), riskLevel2, JSON.stringify(expectedValidation2), asString3(record2.estimatedEffort ?? record2.estimated_effort), JSON.stringify(asStringArray3(record2.whyNowSignalIds ?? record2.why_now_signal_ids)), clamp012(asNumber(record2.confidence, 0)), semanticObjectiveClusterKey(record2, makePatternKey(objectiveTypePersist, scopeValidation2.normalizedTargetPaths, triggerTypePersist, componentAreaPersist), portfolioMeta2), llmScore, impactSignal, emaSuccess, emaUserAccept, JSON.stringify(penalties), finalScore, asBoolean2(record2.selected, false) ? 1 : 0, asString3(record2.rejectionReason ?? record2.rejection_reason) || null, asString3(record2.gateDecision ?? record2.gate_decision) || (gateReasons.length === 0 ? "approved" : "rejected"), JSON.stringify(gateReasons.length === 0 ? asStringArray3(record2.gateReasons ?? record2.gate_reasons) : gateReasons), JSON.stringify(debugRecord), asIsoNow());
     }
     const llmCalls = Array.isArray(body.llmCalls) ? body.llmCalls : [];
     for (const raw of llmCalls) {
@@ -27299,17 +27384,17 @@ function includesAll(haystack, needles) {
   const values = new Set(haystack.map((value) => value.toLowerCase()));
   return needles.every((needle) => values.has(needle.toLowerCase()));
 }
-function lexicalScore(record, text) {
+function lexicalScore(record2, text) {
   const tokens = compact(text, MEMORY_LIMITS.searchTextChars).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
   if (tokens.length === 0)
     return 0;
-  const subject = (record.subjectKey ?? "").toLowerCase();
-  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  const subject = (record2.subjectKey ?? "").toLowerCase();
+  const haystack = [record2.key, record2.kind, subject, record2.summary, ...record2.tags].join(" ").toLowerCase();
   let score = 0;
   for (const token of new Set(tokens)) {
-    if (record.key.toLowerCase() === token || subject === token)
+    if (record2.key.toLowerCase() === token || subject === token)
       score += 6;
-    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+    else if (record2.key.toLowerCase().includes(token) || subject.includes(token))
       score += 3;
     else if (haystack.includes(token))
       score += 1;
@@ -27555,24 +27640,24 @@ class SqliteMemoryStore {
     const requestedMaxChars = Number(query.maxChars ?? 16000);
     const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
     let usedChars = 0;
-    const candidates = rows.map((row) => hydrate(row)).filter((record) => matchesAny2(record.kind, kinds)).filter((record) => matchesAny2(record.subjectKey, subjects)).filter((record) => includesAll(record.tags, tags)).filter((record) => {
+    const candidates = rows.map((row) => hydrate(row)).filter((record2) => matchesAny2(record2.kind, kinds)).filter((record2) => matchesAny2(record2.subjectKey, subjects)).filter((record2) => includesAll(record2.tags, tags)).filter((record2) => {
       if (paths.length === 0)
         return true;
-      const evidencePaths = evidencePathSet(record.evidence);
+      const evidencePaths = evidencePathSet(record2.evidence);
       return paths.every((path) => evidencePaths.has(path));
-    }).map((record) => ({
-      record,
-      lexical: lexicalScore(record, text)
+    }).map((record2) => ({
+      record: record2,
+      lexical: lexicalScore(record2, text)
     })).filter((row) => !text || row.lexical > 0).sort((left, right) => right.lexical - left.lexical || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
     const selected = [];
-    for (const { record } of candidates) {
+    for (const { record: record2 } of candidates) {
       if (selected.length >= maxItems)
         break;
-      if (usedChars + serializedMemoryRecordChars(record) > maxChars)
+      if (usedChars + serializedMemoryRecordChars(record2) > maxChars)
         continue;
       const hydratedRecord = {
-        ...record,
-        observations: this.observationsForRecord(record.id)
+        ...record2,
+        observations: this.observationsForRecord(record2.id)
       };
       const size = serializedMemoryRecordChars(hydratedRecord);
       if (usedChars + size > maxChars)
@@ -27592,10 +27677,10 @@ class SqliteMemoryStore {
     const paths = normalizeList(selector.evidencePaths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
     const statuses = selector.statuses?.length ? selector.statuses : ALL_MEMORY_STATUSES;
     const selected = this.db.prepare(`SELECT ${MEMORY_SELECT_COLUMNS} FROM memory_records
-           WHERE namespace = ? AND repositoryId = ? AND sessionId = ?`).all(scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "").map((row) => hydrate(row)).filter((record) => record.status !== "invalid" && statuses.includes(record.status)).filter((record) => matchesAny2(record.key, keys)).filter((record) => matchesAny2(record.kind, kinds)).filter((record) => matchesAny2(record.subjectKey, subjects)).filter((record) => includesAll(record.tags, tags)).filter((record) => {
+           WHERE namespace = ? AND repositoryId = ? AND sessionId = ?`).all(scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "").map((row) => hydrate(row)).filter((record2) => record2.status !== "invalid" && statuses.includes(record2.status)).filter((record2) => matchesAny2(record2.key, keys)).filter((record2) => matchesAny2(record2.kind, kinds)).filter((record2) => matchesAny2(record2.subjectKey, subjects)).filter((record2) => includesAll(record2.tags, tags)).filter((record2) => {
       if (paths.length === 0)
         return true;
-      const cited = evidencePathSet(record.evidence);
+      const cited = evidencePathSet(record2.evidence);
       return paths.some((path) => cited.has(path));
     });
     if (selected.length === 0)
@@ -27606,8 +27691,8 @@ class SqliteMemoryStore {
        invalidatedAt = ?, invalidationReason = ?, updatedAt = ? WHERE id = ?`);
     const tx = this.db.transaction(() => {
       let count = 0;
-      for (const record of selected)
-        count += statement.run(now, reason, now, record.id).changes;
+      for (const record2 of selected)
+        count += statement.run(now, reason, now, record2.id).changes;
       return count;
     });
     return tx();
@@ -27741,9 +27826,9 @@ function canonicalJson2(value, ancestors = new Set) {
     if (ancestors.has(value))
       throw new TypeError("RepositoryAgent request must not be cyclic");
     ancestors.add(value);
-    const record = value;
-    const encoded = `{${Object.keys(record).sort().flatMap((key) => {
-      const entry = record[key];
+    const record2 = value;
+    const encoded = `{${Object.keys(record2).sort().flatMap((key) => {
+      const entry = record2[key];
       return entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? [] : [`${JSON.stringify(key)}:${canonicalJson2(entry, ancestors)}`];
     }).join(",")}}`;
     ancestors.delete(value);
@@ -28669,15 +28754,15 @@ function readParam(url, name) {
 function normalizeMetadata(value, userAgent) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
-  const record = value;
-  const clientId = compactText2(record.clientId, 128);
-  const kind = normalizeKind(record.kind);
+  const record2 = value;
+  const clientId = compactText2(record2.clientId, 128);
+  const kind = normalizeKind(record2.kind);
   if (!clientId || !kind)
     return null;
-  const label = compactText2(record.label, 120) || defaultLabelForKind(kind);
-  const version = compactText2(record.version, 64);
-  const platform = compactText2(record.platform, 120);
-  const repoRoot = compactText2(record.repoRoot, 400);
+  const label = compactText2(record2.label, 120) || defaultLabelForKind(kind);
+  const version = compactText2(record2.version, 64);
+  const platform = compactText2(record2.platform, 120);
+  const repoRoot = compactText2(record2.repoRoot, 400);
   return {
     clientId,
     kind,
@@ -28719,67 +28804,67 @@ class ClientPresenceRegistry {
   announce(sessionId, metadata, source) {
     const now = this.now();
     this.pruneExpired(now);
-    const record = this.upsertRecord(sessionId, metadata, now);
-    record.lastSeenAtMs = now;
+    const record2 = this.upsertRecord(sessionId, metadata, now);
+    record2.lastSeenAtMs = now;
     if (source !== "session") {
-      this.connectionSet(record, source).add(`${source}-announced`);
+      this.connectionSet(record2, source).add(`${source}-announced`);
     }
-    console.log(`[Client] announced kind=${record.kind} clientId=${record.clientId} session=${sessionId} source=${source}`);
+    console.log(`[Client] announced kind=${record2.kind} clientId=${record2.clientId} session=${sessionId} source=${source}`);
   }
   connect(sessionId, metadata, transport, connectionId) {
     const now = this.now();
     this.pruneExpired(now);
-    const record = this.upsertRecord(sessionId, metadata, now);
-    const connections = this.connectionSet(record, transport);
+    const record2 = this.upsertRecord(sessionId, metadata, now);
+    const connections = this.connectionSet(record2, transport);
     const alreadyConnected = connections.size > 0;
     connections.add(connectionId);
-    record.lastSeenAtMs = now;
+    record2.lastSeenAtMs = now;
     if (!alreadyConnected) {
-      console.log(`[Client] connected kind=${record.kind} clientId=${record.clientId} session=${sessionId} transport=${transport}`);
+      console.log(`[Client] connected kind=${record2.kind} clientId=${record2.clientId} session=${sessionId} transport=${transport}`);
     }
   }
   disconnect(clientId, transport, connectionId) {
     this.pruneExpired();
-    const record = this.records.get(clientId);
-    if (!record)
+    const record2 = this.records.get(clientId);
+    if (!record2)
       return;
-    const connections = record.transportConnections.get(transport);
+    const connections = record2.transportConnections.get(transport);
     if (!connections)
       return;
     if (!connections.delete(connectionId))
       return;
     if (connections.size === 0) {
-      record.transportConnections.delete(transport);
+      record2.transportConnections.delete(transport);
     }
-    record.lastSeenAtMs = this.now();
-    console.log(`[Client] disconnected kind=${record.kind} clientId=${record.clientId} session=${record.sessionId} transport=${transport}`);
+    record2.lastSeenAtMs = this.now();
+    console.log(`[Client] disconnected kind=${record2.kind} clientId=${record2.clientId} session=${record2.sessionId} transport=${transport}`);
   }
   touch(clientId, transport, connectionId) {
-    const record = this.records.get(clientId);
-    if (!record)
+    const record2 = this.records.get(clientId);
+    if (!record2)
       return;
-    const connections = record.transportConnections.get(transport);
+    const connections = record2.transportConnections.get(transport);
     if (!connections || connections.size === 0)
       return;
     if (connectionId && !connections.has(connectionId))
       return;
-    record.lastSeenAtMs = this.now();
+    record2.lastSeenAtMs = this.now();
   }
   snapshot() {
     this.pruneExpired();
-    const rows = [...this.records.values()].map((record) => ({
-      clientId: record.clientId,
-      kind: record.kind,
-      ...record.label ? { label: record.label } : {},
-      ...record.version ? { version: record.version } : {},
-      ...record.platform ? { platform: record.platform } : {},
-      ...record.repoRoot ? { repoRoot: record.repoRoot } : {},
-      ...record.userAgent ? { userAgent: record.userAgent } : {},
-      sessionId: record.sessionId,
-      status: this.connectedTransportKeys(record).length > 0 ? "connected" : "announced",
-      connectedTransports: this.connectedTransportKeys(record),
-      announcedAt: new Date(record.announcedAtMs).toISOString(),
-      lastSeenAt: new Date(record.lastSeenAtMs).toISOString()
+    const rows = [...this.records.values()].map((record2) => ({
+      clientId: record2.clientId,
+      kind: record2.kind,
+      ...record2.label ? { label: record2.label } : {},
+      ...record2.version ? { version: record2.version } : {},
+      ...record2.platform ? { platform: record2.platform } : {},
+      ...record2.repoRoot ? { repoRoot: record2.repoRoot } : {},
+      ...record2.userAgent ? { userAgent: record2.userAgent } : {},
+      sessionId: record2.sessionId,
+      status: this.connectedTransportKeys(record2).length > 0 ? "connected" : "announced",
+      connectedTransports: this.connectedTransportKeys(record2),
+      announcedAt: new Date(record2.announcedAtMs).toISOString(),
+      lastSeenAt: new Date(record2.lastSeenAtMs).toISOString()
     })).sort((a, b) => {
       if (a.status !== b.status)
         return a.status === "connected" ? -1 : 1;
@@ -28819,23 +28904,23 @@ class ClientPresenceRegistry {
     this.records.set(metadata.clientId, created);
     return created;
   }
-  connectionSet(record, transport) {
-    let connections = record.transportConnections.get(transport);
+  connectionSet(record2, transport) {
+    let connections = record2.transportConnections.get(transport);
     if (!connections) {
       connections = new Set;
-      record.transportConnections.set(transport, connections);
+      record2.transportConnections.set(transport, connections);
     }
     return connections;
   }
-  connectedTransportKeys(record) {
-    return [...record.transportConnections.entries()].filter(([, connections]) => connections.size > 0).map(([transport]) => transport).sort();
+  connectedTransportKeys(record2) {
+    return [...record2.transportConnections.entries()].filter(([, connections]) => connections.size > 0).map(([transport]) => transport).sort();
   }
   pruneExpired(now = this.now()) {
     let removed = 0;
-    for (const [clientId, record] of this.records.entries()) {
-      const connected = this.connectedTransportKeys(record).length > 0;
+    for (const [clientId, record2] of this.records.entries()) {
+      const connected = this.connectedTransportKeys(record2).length > 0;
       const maxAgeMs = connected ? this.connectedRetentionMs : this.retentionMs;
-      if (now - record.lastSeenAtMs <= maxAgeMs)
+      if (now - record2.lastSeenAtMs <= maxAgeMs)
         continue;
       this.records.delete(clientId);
       removed++;
@@ -29921,8 +30006,8 @@ function createRequestHandler() {
       const recordHasAutonomyOrigin = (value) => {
         if (!value || typeof value !== "object" || Array.isArray(value))
           return false;
-        const record = value;
-        const origin = String(record.origin ?? "").trim().toLowerCase();
+        const record2 = value;
+        const origin = String(record2.origin ?? "").trim().toLowerCase();
         return origin === "autonomy";
       };
       const isAutonomyRequestPayload = (value) => [value.metadata, value.meta, value.params, value].some(recordHasAutonomyOrigin);
@@ -29930,10 +30015,10 @@ function createRequestHandler() {
         for (const candidate of [value.metadata, value.meta, value.params, value]) {
           if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
             continue;
-          const record = candidate;
-          if (!recordHasAutonomyOrigin(record))
+          const record2 = candidate;
+          if (!recordHasAutonomyOrigin(record2))
             continue;
-          const autonomy = record.autonomy;
+          const autonomy = record2.autonomy;
           if (autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)) {
             return autonomy;
           }
@@ -30265,15 +30350,15 @@ function createRequestHandler() {
         for (const entry of value) {
           if (!entry || typeof entry !== "object")
             continue;
-          const record = entry;
-          const scope = String(record.scope ?? "").trim().toLowerCase();
-          const key = String(record.key ?? "").trim();
+          const record2 = entry;
+          const scope = String(record2.scope ?? "").trim().toLowerCase();
+          const key = String(record2.key ?? "").trim();
           if (scope !== "env" && scope !== "toml" || !key)
             continue;
           out.push({
             scope,
             key,
-            value: record.value
+            value: record2.value
           });
         }
         return out;
@@ -30479,12 +30564,12 @@ function createRequestHandler() {
         }
         try {
           if (pathname === "/memory/records" && method === "PUT") {
-            const record = await memoryStore.put(body.input, body.options ?? {});
-            return makeJson({ ok: true, record }, 200);
+            const record2 = await memoryStore.put(body.input, body.options ?? {});
+            return makeJson({ ok: true, record: record2 }, 200);
           }
           if (pathname === "/memory/get" && method === "POST") {
-            const record = await memoryStore.get(body.address, body.options ?? {});
-            return makeJson({ ok: true, record }, 200);
+            const record2 = await memoryStore.get(body.address, body.options ?? {});
+            return makeJson({ ok: true, record: record2 }, 200);
           }
           if (pathname === "/memory/search" && method === "POST") {
             const records = await memoryStore.search(body.query);
@@ -30495,8 +30580,8 @@ function createRequestHandler() {
             return makeJson({ ok: true, count }, 200);
           }
           if (pathname === "/memory/reinforce" && method === "POST") {
-            const record = await memoryStore.reinforce(body.input);
-            return makeJson({ ok: true, record }, 200);
+            const record2 = await memoryStore.reinforce(body.input);
+            return makeJson({ ok: true, record: record2 }, 200);
           }
           if (pathname === "/memory/prune" && method === "POST") {
             const count = await memoryStore.prune(body.options ?? {});
@@ -32597,14 +32682,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const params = parseJsonRecord2(parent?.params ?? "");
           const review = params.reviewAgent;
           if (review && typeof review === "object" && !Array.isArray(review)) {
-            const record = review;
-            if (typeof record.repositoryIdentity === "string" && Number.isSafeInteger(record.prNumber) && Number(record.prNumber) > 0 && typeof record.prHeadSha === "string" && typeof record.prBaseSha === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prHeadSha) && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prBaseSha) && (record.resolutionType === "review_fix" || record.resolutionType === "merge_conflict")) {
+            const record2 = review;
+            if (typeof record2.repositoryIdentity === "string" && Number.isSafeInteger(record2.prNumber) && Number(record2.prNumber) > 0 && typeof record2.prHeadSha === "string" && typeof record2.prBaseSha === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record2.prHeadSha) && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record2.prBaseSha) && (record2.resolutionType === "review_fix" || record2.resolutionType === "merge_conflict")) {
               result.completion.reviewPublicationAuthority = {
-                repositoryIdentity: record.repositoryIdentity,
-                prNumber: record.prNumber,
-                expectedHeadSha: record.prHeadSha,
-                expectedBaseSha: record.prBaseSha,
-                resolutionType: record.resolutionType
+                repositoryIdentity: record2.repositoryIdentity,
+                prNumber: record2.prNumber,
+                expectedHeadSha: record2.prHeadSha,
+                expectedBaseSha: record2.prBaseSha,
+                resolutionType: record2.resolutionType
               };
             }
           }

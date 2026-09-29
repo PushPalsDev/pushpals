@@ -16,6 +16,9 @@ import {
 } from "../../../packages/shared/src/bounded_process.js";
 import { copyEnvWithoutScmRepairAuthoritySecret } from "../../../packages/shared/src/scm_repair_authority.js";
 import { redactToolText } from "../../../packages/shared/src/tooling.js";
+import { withTrustedDependencyArtifacts } from "./dependency_artifact_cache";
+import { createValidationSubstepCollector } from "./validation_substeps";
+import type { ValidationSubstepTiming } from "../../../packages/shared/src/validation_substeps.js";
 
 export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
 
@@ -61,10 +64,48 @@ export type TrustedValidationProgressCallback = (
   event: Readonly<TrustedValidationProgressEvent>,
 ) => void;
 
+type CommandOptions = {
+  cwd: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  onStdoutLine?: (line: string) => void;
+  onStderrLine?: (line: string) => void;
+};
+
 type CommandRunner = (
   argv: string[],
-  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
-) => Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }>;
+  options: CommandOptions,
+) => Promise<{
+  ok: boolean;
+  output: string;
+  exitCode: number;
+  timedOut?: boolean;
+  outputIncomplete?: boolean;
+}>;
+
+export type TrustedValidationSubstepEvent = ValidationSubstepTiming & {
+  phase: "validation";
+  command: string;
+  attempt: number;
+};
+
+export function createTrustedValidationSubstepLogger(
+  identity: { jobId: string; completionId: string; commitSha: string; candidateSha: string | null },
+  log: (line: string) => void = console.log,
+): (event: TrustedValidationSubstepEvent) => void {
+  return (event) => {
+    const observedAt = new Date().toISOString();
+    log(
+      `[${observedAt}] trustedValidationSubstep=${JSON.stringify({
+        event: "trusted_validation_substep",
+        observedAt,
+        ...identity,
+        ...event,
+        command: redactTrustedValidationProgressCommand(event.command),
+      })}`,
+    );
+  };
+}
 
 const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60_000;
 const PROCESS_TREE_TERMINATION_GRACE_MS = 5_000;
@@ -236,6 +277,7 @@ export function normalizeTrustedValidationAffectedPaths(paths: readonly string[]
 export function trustedValidationInstallFingerprint(options: {
   repoPath: string;
   bunExecutable?: string;
+  artifactCacheDir?: string | null;
   invariantContext?: TrustedValidationInvariantContext;
 }): string | null {
   const candidateSha = String(options.invariantContext?.candidateSha ?? "")
@@ -257,6 +299,9 @@ export function trustedValidationInstallFingerprint(options: {
   hash.update(`platform=${process.platform}-${process.arch}\n`);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}\n`);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}\n`);
+  hash.update(
+    `artifactPolicy=${options.artifactCacheDir ? `copyfile-v1:${resolve(options.artifactCacheDir)}` : "inherited"}\n`,
+  );
   if (options.invariantContext) {
     hash.update(`candidate=${candidateSha}\n`);
     hash.update(`base=${baseSha}\n`);
@@ -287,6 +332,7 @@ function invalidateTrustedInstallMarker(repoPath: string): void {
 export function hasFreshTrustedValidationInstall(options: {
   repoPath: string;
   bunExecutable?: string;
+  artifactCacheDir?: string | null;
   invariantContext?: TrustedValidationInvariantContext;
 }): boolean {
   const fingerprint = trustedValidationInstallFingerprint(options);
@@ -304,8 +350,8 @@ export function hasFreshTrustedValidationInstall(options: {
 async function runTimed(
   runner: CommandRunner,
   argv: string[],
-  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
-): Promise<{ ok: boolean; output: string; exitCode: number; durationMs: number }> {
+  options: CommandOptions,
+): Promise<Awaited<ReturnType<CommandRunner>> & { durationMs: number }> {
   const startedAt = Date.now();
   const result = await runner(argv, options);
   return { ...result, durationMs: Math.max(0, Date.now() - startedAt) };
@@ -369,6 +415,7 @@ async function ensureTrustedValidationInstall(options: {
   preparationArgv: string[];
   timeoutMs: number;
   bunExecutable?: string;
+  artifactCacheDir?: string | null;
   invariantContext?: TrustedValidationInvariantContext;
   runner: CommandRunner;
   signal?: AbortSignal;
@@ -434,11 +481,15 @@ async function ensureTrustedValidationInstall(options: {
       invalidateTrustedInstallMarker(options.repoPath);
       let preparation: Awaited<ReturnType<typeof runTimed>>;
       try {
-        preparation = await runTimed(options.runner, options.preparationArgv, {
-          cwd: options.repoPath,
-          timeoutMs: options.timeoutMs,
-          signal: options.signal,
-        });
+        preparation = await runTimed(
+          options.runner,
+          withTrustedDependencyArtifacts(options.preparationArgv, options.artifactCacheDir),
+          {
+            cwd: options.repoPath,
+            timeoutMs: options.timeoutMs,
+            signal: options.signal,
+          },
+        );
       } catch (error) {
         if (options.signal?.aborted) {
           return trustedInstallWaitFailure("cancelled", Date.now() - waitStartedAt);
@@ -575,8 +626,8 @@ export async function terminateProcessTree(
 
 export async function runProcessWithTreeTimeout(
   argv: string[],
-  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
-): Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }> {
+  options: CommandOptions,
+): ReturnType<CommandRunner> {
   const result = await runBoundedProcess(argv, {
     cwd: options.cwd,
     env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
@@ -584,12 +635,21 @@ export async function runProcessWithTreeTimeout(
     outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
     streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS,
     signal: options.signal,
+    onStdoutLine: options.onStdoutLine,
+    onStderrLine: options.onStderrLine,
   });
   return {
     ok: !result.timedOut && result.exitCode === 0,
     output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
     exitCode: result.exitCode,
     ...(result.timedOut ? { timedOut: true } : {}),
+    ...(result.drainTimedOut ||
+    result.stdoutReadError ||
+    result.stderrReadError ||
+    result.stdoutDecodeError ||
+    result.stderrDecodeError
+      ? { outputIncomplete: true }
+      : {}),
   };
 }
 
@@ -598,9 +658,13 @@ export async function runTrustedValidationCommands(options: {
   commandsJson: string;
   timeoutMs?: number;
   bunExecutable?: string;
+  /** Native package artifacts only; never skips candidate-specific install hooks. */
+  artifactCacheDir?: string | null;
   runner?: CommandRunner;
   retryTransientFailures?: boolean;
   onProgress?: TrustedValidationProgressCallback;
+  /** Observation-only stream; must not renew progress watchdogs or command deadlines. */
+  onSubstep?: (event: TrustedValidationSubstepEvent) => void;
   signal?: AbortSignal;
   singleFlightWaitMs?: number;
   /**
@@ -641,6 +705,7 @@ export async function runTrustedValidationCommands(options: {
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
+      artifactCacheDir: options.artifactCacheDir,
       invariantContext: options.invariantContext,
       runner,
       signal: options.signal,
@@ -684,6 +749,7 @@ export async function runTrustedValidationCommands(options: {
           preparationArgv,
           timeoutMs,
           bunExecutable: options.bunExecutable,
+          artifactCacheDir: options.artifactCacheDir,
           invariantContext: options.invariantContext,
           runner,
           signal: options.signal,
@@ -717,11 +783,32 @@ export async function runTrustedValidationCommands(options: {
         command,
         attempt,
       });
-      const result = await runTimed(runner, resolvedArgv, {
-        cwd: options.repoPath,
-        timeoutMs,
-        signal: options.signal,
+      const collector = createValidationSubstepCollector({
+        onEvent: (event) =>
+          options.onSubstep?.({ ...event, command, phase: "validation", attempt }),
       });
+      let result: Awaited<ReturnType<typeof runTimed>>;
+      try {
+        result = await runTimed(runner, resolvedArgv, {
+          cwd: options.repoPath,
+          timeoutMs,
+          signal: options.signal,
+          onStdoutLine: collector.onStdoutLine,
+          onStderrLine: collector.onStderrLine,
+        });
+      } catch (error) {
+        collector.finish(options.signal?.aborted ? "aborted" : "output_incomplete");
+        throw error;
+      }
+      const substeps = collector.finish(
+        options.signal?.aborted
+          ? "aborted"
+          : result.timedOut
+            ? "timed_out"
+            : result.outputIncomplete
+              ? "output_incomplete"
+              : "command_finished",
+      );
       const evidence = result.ok
         ? null
         : extractTrustedValidationFailureEvidence({
@@ -736,6 +823,7 @@ export async function runTrustedValidationCommands(options: {
         output: truncateTrustedValidationOutput(result.output),
         phase: "validation",
         attempt,
+        ...(substeps.stages.length > 0 || substeps.truncated ? { substeps } : {}),
         ...(evidence ?? {}),
       };
       emitTrustedValidationProgress(options.onProgress, {

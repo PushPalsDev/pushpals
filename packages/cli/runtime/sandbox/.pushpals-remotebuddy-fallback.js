@@ -8404,7 +8404,7 @@ var IDEATION_RETRY_MAX_TOKENS = 900;
 var IDEATION_NORMAL_MAX_CANDIDATES = 5;
 var STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 var STARTUP_FAST_TICK_MAX_DELAY_MS = 15000;
-var DISCOVERY_FOLLOWUP_DELAY_MS = 30000;
+var DISCOVERY_FOLLOWUP_DELAY_MS = 5000;
 var DISCOVERY_FOLLOWUP_MAX_ATTEMPTS = 16;
 var STARTUP_STALE_LOCK_AFTER_MS = 30000;
 var VISION_DOC_FNAME = "vision.md";
@@ -16015,7 +16015,7 @@ async function buildSeedEvidencePacket(repoRoot, request, tracked, question, con
 function boundedRetrievalTerms(request) {
   const context = request.context ?? {};
   const vision = isRecord2(context.vision) ? context.vision : {};
-  const sections = Array.isArray(vision.sections) ? vision.sections.slice(0, 24) : [];
+  const sections = autonomyVisionFingerprint(request) == null && Array.isArray(vision.sections) ? vision.sections.slice(0, 24) : [];
   const boundedVision = [
     vision.path,
     vision.one_sentence,
@@ -16025,6 +16025,9 @@ function boundedRetrievalTerms(request) {
   ];
   const source = [request.purpose, request.question, ...boundedVision].map((value) => compactText2(value, 8000).normalize("NFKC").toLocaleLowerCase("und")).join(`
 `);
+  return retrievalTermsFromText(source);
+}
+function retrievalTermsFromText(source) {
   const output = new Set;
   const cjkRuns = source.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) ?? [];
   let cjkTerms = 0;
@@ -16056,26 +16059,94 @@ function boundedRetrievalTerms(request) {
   }
   return [...output].slice(0, 128);
 }
+function retrievalWords(value) {
+  return value.normalize("NFKC").replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, "$1 $2").toLocaleLowerCase("und").replace(/[_.@/\\-]+/g, " ");
+}
+function autonomyPriorityTerms(request) {
+  const weights = new Map;
+  if (autonomyVisionFingerprint(request) == null)
+    return weights;
+  const vision = normalizedAutonomyVision(request);
+  const topics = [
+    ...vision.priorities.map((text2, index) => [text2, 4 / (1 + index * 0.1)]),
+    ...vision.objectives.map((text2, index) => [text2, 2 / (1 + index * 0.1)]),
+    [vision.one_sentence, 1]
+  ];
+  for (const [text2, weight] of topics) {
+    const terms = new Set(retrievalTermsFromText(retrievalWords(text2)));
+    for (const term of terms) {
+      const stem = /^[a-z0-9]+$/i.test(term) ? term.replace(/(?:ing|ed|es|s)$/i, "") : term;
+      if (stem !== term && stem.length >= 4 && terms.has(stem))
+        continue;
+      if (weights.size >= 128 && !weights.has(term))
+        continue;
+      weights.set(term, Math.max(weights.get(term) ?? 0, weight));
+    }
+  }
+  return weights;
+}
+function pathTermScore(lower, base, term) {
+  if (lower === term)
+    return 1000;
+  if (base === term)
+    return 400;
+  if (base.includes(term))
+    return 80;
+  if (lower.includes(`/${term}`) || lower.startsWith(`${term}/`))
+    return 30;
+  if (lower.includes(term))
+    return 8;
+  return 0;
+}
+function diversifyDiscoveryPaths(ranked) {
+  const output = [];
+  const buffer = [];
+  let cursor = 0;
+  const counts = new Map;
+  const directory = (path) => path.slice(0, path.lastIndexOf("/") + 1);
+  while (cursor < ranked.length || buffer.length) {
+    while (cursor < ranked.length && buffer.length < MAX_DISCOVERY_PATHS * 4)
+      buffer.push(ranked[cursor++]);
+    if (output.length % MAX_DISCOVERY_PATHS === 0)
+      counts.clear();
+    const diverse = buffer.findIndex((entry2) => (counts.get(directory(entry2.path)) ?? 0) < 2);
+    const [entry] = buffer.splice(diverse < 0 ? 0 : diverse, 1);
+    output.push(entry);
+    const key = directory(entry.path);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return output;
+}
 function rankedAdditionalPaths(request, tracked, seedPaths, includeUnmatched = false) {
   const seedKeys = new Set(seedPaths.map(comparablePath));
   const exactContextPaths = collectContextPaths([request.question, request.context], tracked);
   const exactKeys = new Set([...exactContextPaths].map(comparablePath));
   const terms = boundedRetrievalTerms(request);
+  const priorityTerms = autonomyPriorityTerms(request);
+  const pathWordFrequency = new Map;
+  if (priorityTerms.size) {
+    for (const path of tracked.paths) {
+      for (const term of retrievalTermsFromText(retrievalWords(path))) {
+        if (priorityTerms.has(term))
+          pathWordFrequency.set(term, (pathWordFrequency.get(term) ?? 0) + 1);
+      }
+    }
+  }
+  const weightedPriorityTerms = [...priorityTerms].map(([term, weight]) => [
+    term,
+    weight * Math.log2(1 + tracked.paths.length / (1 + (pathWordFrequency.get(term) ?? 0)))
+  ]);
   const ranked = tracked.paths.filter((path) => !seedKeys.has(comparablePath(path))).map((path) => {
     const lower = path.normalize("NFKC").toLocaleLowerCase("und");
     const base = basename(lower);
-    let score = exactKeys.has(comparablePath(path)) ? 1e4 : 0;
+    const exact = exactKeys.has(comparablePath(path));
+    let score = exact ? 1e4 : 0;
     for (const term of terms) {
-      if (lower === term)
-        score += 1000;
-      else if (base === term)
-        score += 400;
-      else if (base.includes(term))
-        score += 80;
-      else if (lower.includes(`/${term}`) || lower.startsWith(`${term}/`))
-        score += 30;
-      else if (lower.includes(term))
-        score += 8;
+      score += pathTermScore(lower, base, term);
+    }
+    let priorityScore = 0;
+    for (const [term, weight] of weightedPriorityTerms) {
+      priorityScore += pathTermScore(lower, base, term) * weight;
     }
     if (score > 0) {
       if (/^(?:src|app|apps|lib|packages|services)\//.test(lower))
@@ -16086,8 +16157,14 @@ function rankedAdditionalPaths(request, tracked, seedPaths, includeUnmatched = f
       if (/(?:^|\/)(?:test|tests|spec|specs|__tests__)(?:\/|$)/.test(lower))
         score += 2;
     }
-    return { path, score };
-  }).filter((entry) => includeUnmatched || entry.score > 0).sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
+    return { path, score, exact, priorityScore };
+  }).filter((entry) => includeUnmatched || entry.score > 0 || entry.priorityScore > 0).sort((left, right) => (priorityTerms.size ? Number(right.exact) - Number(left.exact) || right.priorityScore - left.priorityScore : 0) || right.score - left.score || left.path.localeCompare(right.path));
+  if (priorityTerms.size) {
+    const exact = ranked.filter((entry) => entry.exact);
+    const relevant = ranked.filter((entry) => !entry.exact && entry.priorityScore > 0);
+    const remainder = ranked.filter((entry) => !entry.exact && entry.priorityScore <= 0);
+    return [...exact, ...diversifyDiscoveryPaths(relevant), ...remainder].map((entry) => entry.path);
+  }
   return ranked.map((entry) => entry.path);
 }
 async function extendEvidencePacket(repoRoot, request, seedPacket, selectedPaths, signal) {
@@ -17447,7 +17524,7 @@ class RepositoryAgentWorker {
     let windowStartPage = valid && typeof value.windowStartPage === "number" ? value.windowStartPage : 0;
     if (windowStartPage * MAX_DISCOVERY_PATHS >= rankedPaths.length || valid && value.rankedPlanHash !== rankedPlanHash)
       windowStartPage = 0;
-    if (windowStartPage > 0 && valid && value.deferredPageFingerprints.length > 0 && value.exclusionFingerprint !== exclusionFingerprint)
+    if (windowStartPage > 0 && valid && Array.isArray(value.deferredPageFingerprints) && value.deferredPageFingerprints.length > 0 && value.exclusionFingerprint !== exclusionFingerprint)
       windowStartPage = 0;
     if (windowStartPage > 0 && valid && value.repositoryRevision !== request.repository.revision) {
       try {

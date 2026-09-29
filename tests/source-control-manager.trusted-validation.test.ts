@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   buildWindowsProcessTreeTerminationArgv,
   createTrustedValidationProgressLogger,
+  createTrustedValidationSubstepLogger,
   hasFreshTrustedValidationInstall,
   normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
@@ -33,6 +34,155 @@ function gitResult(repoPath: string, args: string[]) {
 }
 
 describe("SourceControlManager trusted validation", () => {
+  test("streams substep observations before command completion without changing gate authority", async () => {
+    const lines: string[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started!: () => void;
+    const firstMarker = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const running = runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      retryTransientFailures: false,
+      onSubstep: createTrustedValidationSubstepLogger(
+        { jobId: "j", completionId: "c", commitSha: "a", candidateSha: "b" },
+        (line) => lines.push(line),
+      ),
+      runner: async (_argv, options) => {
+        options.onStdoutLine?.("[build checks 1/2] [private-stage-token] private-stage-label");
+        started();
+        await blocked;
+        options.onStdoutLine?.("[ok] private-stage-label (123.4 ms)");
+        options.onStdoutLine?.("[build checks 2/2] [second-stage] unfinished stage");
+        return { ok: false, output: "Command timed out", exitCode: 124, timedOut: true };
+      },
+    });
+    try {
+      await firstMarker;
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0].split("trustedValidationSubstep=")[1])).toMatchObject({
+        event: "trusted_validation_substep",
+        jobId: "j",
+        command: "bun run validate",
+        boundary: "start",
+        durationMs: null,
+        observationOnly: true,
+      });
+    } finally {
+      release();
+    }
+    const results = await running;
+    expect(results[0]).toMatchObject({
+      ok: false,
+      exitCode: 124,
+      substeps: {
+        truncated: false,
+        stages: [
+          {
+            stageId: "substep-1",
+            boundary: "complete",
+            completionMarker: "ok",
+            reportedDurationMs: 123.4,
+          },
+          {
+            stageId: "substep-2",
+            boundary: "incomplete",
+            durationMs: null,
+            incompleteReason: "timed_out",
+          },
+        ],
+      },
+    });
+    expect(lines.join("\n")).not.toContain("private-stage");
+    expect(lines.join("\n")).not.toContain("unfinished stage");
+  });
+
+  test("records aborted substeps when the bounded runner returns cancellation rather than throwing", async () => {
+    const controller = new AbortController();
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      signal: controller.signal,
+      retryTransientFailures: false,
+      runner: async (_argv, options) => {
+        options.onStdoutLine?.("[checks 1/1] [check] Check");
+        controller.abort();
+        return { ok: false, output: "cancelled", exitCode: 143 };
+      },
+    });
+    expect(results[0]).toMatchObject({
+      ok: false,
+      exitCode: 143,
+      substeps: {
+        stages: [{ boundary: "incomplete", durationMs: null, incompleteReason: "aborted" }],
+      },
+    });
+  });
+
+  test("observes real bounded process streams and isolates telemetry sink errors", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-substep-stream-"));
+    try {
+      writeFileSync(
+        join(root, "check.js"),
+        "console.log('[checks 1/1] [check] Check'); console.log('[ok] Check (1.0 ms)');",
+      );
+      const results = await runTrustedValidationCommands({
+        repoPath: root,
+        commandsJson: JSON.stringify(["bun check.js"]),
+        bunExecutable: process.execPath,
+        onSubstep: () => {
+          throw new Error("observer failed");
+        },
+      });
+      expect(results[0]).toMatchObject({
+        ok: true,
+        substeps: {
+          stages: [
+            {
+              ordinal: 1,
+              total: 1,
+              boundary: "complete",
+              observationOnly: true,
+              reportedDurationMs: 1,
+            },
+          ],
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retries use separate substep collectors and do not inherit missing completions", async () => {
+    let attempt = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async (_argv, options) => {
+        attempt += 1;
+        options.onStdoutLine?.("[checks 1/1] [check] Check");
+        if (attempt === 1)
+          return { ok: false, exitCode: 124, output: "Command timed out", timedOut: true };
+        options.onStdoutLine?.("[ok] Check (2.0 ms)");
+        return { ok: true, exitCode: 0, output: "passed" };
+      },
+    });
+    expect(results).toHaveLength(2);
+    expect(results[0].substeps?.stages[0]).toMatchObject({
+      boundary: "incomplete",
+      durationMs: null,
+    });
+    expect(results[1].substeps?.stages[0]).toMatchObject({
+      boundary: "complete",
+      reportedDurationMs: 2,
+    });
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBeNull();
+  });
+
   test("builds a forced Windows process-tree termination command", () => {
     expect(buildWindowsProcessTreeTerminationArgv(4321)).toEqual([
       "taskkill",
@@ -185,7 +335,7 @@ describe("SourceControlManager trusted validation", () => {
     });
   });
 
-  test("marks a validation command unhealthy when its runner stops making progress", async () => {
+  test("marks a stalled command unhealthy even when child substep markers keep arriving", async () => {
     let now = Date.parse("2026-08-18T00:00:00.000Z");
     let releaseRunner!: () => void;
     const runnerGate = new Promise<void>((resolveGate) => {
@@ -197,20 +347,32 @@ describe("SourceControlManager trusted validation", () => {
       now: () => now,
     });
     tracker.beginTick("trusted_validation");
+    let emitLine!: (line: string) => void;
+    const observations: string[] = [];
 
     const validation = runTrustedValidationCommands({
       repoPath: "C:/repo",
       commandsJson: JSON.stringify(["bun test tests/stuck.test.ts"]),
-      runner: async () => {
+      runner: async (_argv, options) => {
+        emitLine = (line) => options.onStdoutLine?.(line);
         await runnerGate;
         return { ok: true, output: "passed", exitCode: 0 };
       },
+      onSubstep: createTrustedValidationSubstepLogger(
+        { jobId: "j", completionId: "completion-stuck", commitSha: "a", candidateSha: "b" },
+        (line) => observations.push(line),
+      ),
       onProgress: (event) =>
         tracker.progress(trustedValidationHealthPhase(event), "completion-stuck"),
     });
     await Promise.resolve();
 
-    now += 17 * 60_000;
+    for (let step = 1; step <= 18; step += 1) {
+      now += 60_000;
+      emitLine(`[checks ${step}/18] [stage-${step}] Stage ${step}`);
+      emitLine(`[ok] Stage ${step} (1.0 ms)`);
+    }
+    expect(observations).toHaveLength(36);
     expect(tracker.snapshot()).toMatchObject({
       healthy: false,
       activeCompletionId: "completion-stuck",

@@ -23,6 +23,7 @@ import {
 } from "../../../packages/shared/src/trusted_validation.js";
 import { repointDurableRecoveryLinks, type JobClaimAuthority } from "./jobs.js";
 import { normalizeRepositoryOriginRemote } from "../../../packages/shared/src/repository_identity.js";
+import { normalizeValidationSubstepReport } from "../../../packages/shared/src/validation_substeps.js";
 import {
   buildReviewPublicationValidationPlan,
   type ReviewPublicationValidationPlan,
@@ -392,6 +393,7 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
           : "candidate",
       baselineFailureProven:
         result.baselineFailureProven === true || result.baseline_failure_proven === true,
+      substeps: normalizeValidationSubstepReport(result.substeps),
     });
   }
   const candidateSha = trustedValidationText(input.candidateSha, 128) || null;
@@ -2105,6 +2107,7 @@ export class CompletionQueue {
           retryReason: result.retryReason ?? null,
           validationTarget: result.validationTarget ?? "candidate",
           baselineFailureProven: Boolean(result.baselineFailureProven),
+          substeps: result.substeps,
         }),
         now,
       );

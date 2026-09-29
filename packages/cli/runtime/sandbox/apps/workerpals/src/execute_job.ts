@@ -6,18 +6,24 @@
 import { createHash } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import {
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { basename, isAbsolute, resolve } from "path";
+import { basename, isAbsolute, relative, resolve } from "path";
 import { tmpdir } from "os";
 import {
   buildGitCommitArgs as buildSourceControlGitCommitArgs,
@@ -2251,6 +2257,7 @@ function isRepoAggregateValidationCommand(repo: string, command: string): boolea
   const text = `${resolvedScript.script}\n${readReferencedValidationScriptText(
     resolvedScript.cwd,
     resolvedScript.script,
+    repo,
   )}`.toLowerCase();
   const layers = [
     /\b(?:bun|npm|pnpm|yarn|vitest|jest)\b[\s\S]{0,80}\btest\b/.test(text),
@@ -2527,7 +2534,7 @@ export function validationCommandIncludesLongRunningBrowserWork(
     if (isLongRunningBrowserValidationCommand(currentCommand)) return true;
     if (depth >= 8) return false;
 
-    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand);
+    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand, repo);
     if (!resolvedScript) return false;
     const visitKey = `${resolvedScript.cwd}\0${resolvedScript.script}`;
     if (visited.has(visitKey)) return false;
@@ -2536,6 +2543,7 @@ export function validationCommandIncludesLongRunningBrowserWork(
     const referencedText = readReferencedValidationScriptText(
       resolvedScript.cwd,
       resolvedScript.script,
+      repo,
     );
     if (textIncludesLongRunningBrowserValidation(`${resolvedScript.script}\n${referencedText}`)) {
       return true;
@@ -2586,7 +2594,7 @@ export function validationCommandIncludesTestWork(repo: string, command: string)
     if (isTestLikeValidationStep(currentCommand)) return true;
     if (depth >= 8) return false;
 
-    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand);
+    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand, repo);
     if (!resolvedScript) return false;
     const visitKey = `${resolvedScript.cwd}\0${resolvedScript.script}`;
     if (visited.has(visitKey)) return false;
@@ -2595,6 +2603,7 @@ export function validationCommandIncludesTestWork(repo: string, command: string)
     const referencedText = readReferencedValidationScriptText(
       resolvedScript.cwd,
       resolvedScript.script,
+      repo,
     );
     const aggregateText = `${resolvedScript.script}\n${referencedText}`;
     if (textIncludesTestValidation(aggregateText)) return true;
@@ -2674,7 +2683,74 @@ export function shouldDeferLongValidationAfterFastFailures(
   return `fast validation already failed for "${first.command}"${digest ? ` (${digest})` : ""}`;
 }
 
-function readPackageJson(repo: string): {
+const MAX_VALIDATION_MANIFEST_BYTES = 256_000;
+const MAX_VALIDATION_SCRIPT_BYTES = 64_000;
+const MAX_VALIDATION_SCRIPT_REFERENCES = 8;
+const MAX_VALIDATION_VISION_BYTES = 1_048_576;
+
+/** Inspection must not block on pipes/devices or read outside the checkout.
+ * Read a bounded regular-file handle, not an unbounded file followed by slice.
+ * Null means unavailable evidence, never a passing validation result. */
+function readValidationInspectionText(
+  repo: string,
+  path: string,
+  maxBytes: number,
+  allowPrefix = false,
+): string | null {
+  let fd: number | undefined;
+  try {
+    const physicalRoot = realpathSync(repo);
+    const outside = (value: string) =>
+      value === ".." || value.replace(/\\/g, "/").startsWith("../") || isAbsolute(value);
+    if (outside(relative(resolve(repo), resolve(path)))) return null;
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || (!allowPrefix && stat.size > maxBytes))
+      return null;
+    const physicalPath = realpathSync(path);
+    if (outside(relative(physicalRoot, physicalPath))) return null;
+    // Nonblocking avoids a FIFO race between lstat/open on POSIX; no-follow
+    // rejects replacement with a final-component symlink. Windows file type
+    // and physical containment are checked before and after opening instead.
+    const flags =
+      fsConstants.O_RDONLY |
+      (process.platform === "win32" ? 0 : fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+    fd = openSync(path, flags);
+    const opened = fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.dev !== stat.dev ||
+      opened.ino !== stat.ino ||
+      (!allowPrefix && opened.size > maxBytes) ||
+      realpathSync(path) !== physicalPath
+    )
+      return null;
+    const buffer = Buffer.alloc(Math.min(opened.size, maxBytes));
+    let used = 0;
+    while (used < buffer.length) {
+      const count = readSync(fd, buffer, used, buffer.length - used, used);
+      if (count === 0) break;
+      used += count;
+    }
+    const finished = fstatSync(fd);
+    if (finished.size !== opened.size || finished.mtimeMs !== opened.mtimeMs) return null;
+    return buffer.subarray(0, used).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* Inspection cleanup must not change gate authority. */
+      }
+    }
+  }
+}
+
+function readPackageJson(
+  repo: string,
+  inspectionRoot = repo,
+): {
   scripts?: Record<string, unknown>;
   dependencies?: Record<string, unknown>;
   devDependencies?: Record<string, unknown>;
@@ -2682,9 +2758,14 @@ function readPackageJson(repo: string): {
   peerDependencies?: Record<string, unknown>;
 } | null {
   const packagePath = resolve(repo, "package.json");
-  if (!existsSync(packagePath)) return null;
+  const text = readValidationInspectionText(
+    inspectionRoot,
+    packagePath,
+    MAX_VALIDATION_MANIFEST_BYTES,
+  );
+  if (text === null) return null;
   try {
-    return JSON.parse(readFileSync(packagePath, "utf8"));
+    return JSON.parse(text);
   } catch {
     return null;
   }
@@ -2707,6 +2788,7 @@ function packageJsonDeclaresPlaywright(repo: string): boolean {
 function resolvePackageScriptForValidationCommand(
   repo: string,
   command: string,
+  inspectionRoot = repo,
 ): { script: string; scriptName: string; cwd: string } | null {
   const argv = tokenizeValidationCommandArgv(command);
   if (!argv || argv.length === 0) return null;
@@ -2772,13 +2854,18 @@ function resolvePackageScriptForValidationCommand(
   }
 
   if (!scriptName) return null;
-  const script = readPackageJson(cwd)?.scripts?.[scriptName];
+  const script = readPackageJson(cwd, inspectionRoot)?.scripts?.[scriptName];
   if (typeof script !== "string" || !script.trim()) return null;
   return { script, scriptName, cwd };
 }
 
-function readReferencedValidationScriptText(cwd: string, script: string): string {
+function readReferencedValidationScriptText(
+  cwd: string,
+  script: string,
+  inspectionRoot = cwd,
+): string {
   const texts: string[] = [];
+  const seen = new Set<string>();
   const tokens = tokenizeValidationCommandArgv(script) ?? script.split(/\s+/).filter(Boolean);
   for (const rawToken of tokens) {
     const token = rawToken
@@ -2788,12 +2875,16 @@ function readReferencedValidationScriptText(cwd: string, script: string): string
     if (!/\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$/i.test(token)) continue;
     if (token.includes("://") || token.includes("node_modules/")) continue;
     const scriptPath = resolve(cwd, token);
-    if (!existsSync(scriptPath)) continue;
-    try {
-      texts.push(readFileSync(scriptPath, "utf8").slice(0, 64_000));
-    } catch {
-      // Best effort: the validation command will surface unreadable files.
-    }
+    if (seen.has(scriptPath)) continue;
+    seen.add(scriptPath);
+    const text = readValidationInspectionText(
+      inspectionRoot,
+      scriptPath,
+      MAX_VALIDATION_SCRIPT_BYTES,
+      true,
+    );
+    if (text !== null) texts.push(text);
+    if (seen.size >= MAX_VALIDATION_SCRIPT_REFERENCES) break;
   }
   return texts.join("\n");
 }
@@ -2844,6 +2935,7 @@ export function validationCommandRequiresDockerDaemon(repo: string, command: str
     const referencedText = readReferencedValidationScriptText(
       resolvedScript.cwd,
       resolvedScript.script,
+      repo,
     );
     const combined = `${resolvedScript.script}\n${referencedText}`;
     if (validationTextRequiresDockerDaemon(combined)) return true;
@@ -2894,7 +2986,7 @@ export function shouldEnsurePlaywrightBrowserRuntime(repo: string, command: stri
   }
   if (!script) return false;
   return /(?:^|[^A-Za-z0-9_-])(?:@playwright\/test|playwright)(?:$|[^A-Za-z0-9_-])/i.test(
-    `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script)}`,
+    `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script, repo)}`,
   );
 }
 
@@ -2925,7 +3017,7 @@ export function inferPlaywrightBrowserInstallTargets(repo: string, command: stri
   const targets = new Set<string>(["chromium"]);
   const script = resolvePackageScriptForValidationCommand(repo, command);
   const scriptText = script
-    ? `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script)}`
+    ? `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script, repo)}`
     : "";
   const text = `${command}\n${scriptText}`;
 
@@ -5454,12 +5546,18 @@ export function extractRequiredValidationStepsFromVisionMarkdown(markdown: strin
 
 function loadRequiredValidationStepsFromVision(repo: string): string[] {
   const visionPath = resolve(repo, "vision.md");
-  if (!existsSync(visionPath)) return [];
   try {
-    return extractRequiredValidationStepsFromVisionMarkdown(readFileSync(visionPath, "utf8"));
-  } catch {
-    return [];
+    lstatSync(visionPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error("Cannot safely inspect vision.md validation requirements.");
   }
+  const text = readValidationInspectionText(repo, visionPath, MAX_VALIDATION_VISION_BYTES);
+  if (text === null)
+    throw new Error(
+      "Cannot safely inspect vision.md validation requirements: expected an in-repository regular file no larger than 1 MiB.",
+    );
+  return extractRequiredValidationStepsFromVisionMarkdown(text);
 }
 
 function resolveRequiredValidationSteps(repo: string, planning: TaskExecutePlanning): string[] {
@@ -5630,7 +5728,7 @@ export function validationCommandSubsumes(
   const candidate = resolvePackageScriptForValidationCommand(repo, candidateCommand);
   const aggregateText = [
     aggregate.script,
-    readReferencedValidationScriptText(aggregate.cwd, aggregate.script),
+    readReferencedValidationScriptText(aggregate.cwd, aggregate.script, repo),
   ].join("\n");
   const normalizedCandidate = candidateCommand.trim().replace(/\s+/g, " ");
   if (
@@ -5697,6 +5795,160 @@ export interface ValidationExecutionPlanNode {
   capability: "worker" | "trusted_host";
   subsumes: string[];
   subsumedBy: string[];
+}
+
+/** Host-derived prompt guidance, never evidence of a passing validation gate. */
+export interface ExecutorValidationOwnership {
+  schemaVersion: 1;
+  owner: "pushpals_after_edit" | "executor";
+  focusedCommands: string[];
+  postEditCommands: ValidationExecutionPlanNode[];
+  requiredSteps: string[];
+}
+
+// These are command suggestions rendered as text for multiple agent shells,
+// not direct argv execution. Fail closed instead of guessing shell escaping.
+const UNSAFE_FOCUSED_GUIDANCE_ARG = /[\u0000-\u001f;&|$`<>'"#%!()\[\]{}*?^~\\]/;
+const MAX_FOCUSED_GUIDANCE_COMMAND_CHARS = 500;
+
+function isFocusedExecutorValidationCommand(repo: string, command: string): boolean {
+  if (/[\u0000-\u001f;&|$`<>#%!()\[\]{}*?^~\\]/.test(command)) return false;
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv || !isBunCommandToken(argv[0] ?? "")) return false;
+  let cursor = 1;
+  let cwd = repo;
+  if (argv[cursor] === "--cwd") {
+    const directory = argv[++cursor];
+    if (!directory || UNSAFE_FOCUSED_GUIDANCE_ARG.test(directory)) return false;
+    cwd = resolve(repo, directory);
+    cursor += 1;
+  }
+  try {
+    const physicalCwd = relative(realpathSync(repo), realpathSync(cwd));
+    if (physicalCwd.startsWith("..") || isAbsolute(physicalCwd) || !statSync(cwd).isDirectory())
+      return false;
+  } catch {
+    return false;
+  }
+  if (argv[cursor++] !== "test") return false;
+  // Guidance-only recognition; never change the deterministic gate DAG based
+  // on this intentionally conservative parser. Option operands are not tests.
+  const optionsWithValues = new Set([
+    "--preload",
+    "--coverage-dir",
+    "--timeout",
+    "-t",
+    "--test-name-pattern",
+    "--seed",
+    "--rerun-each",
+    "--test-reporter-outfile",
+  ]);
+  let selectors = 0;
+  let literalArguments = false;
+  while (cursor < argv.length) {
+    const token = argv[cursor++]!;
+    if (UNSAFE_FOCUSED_GUIDANCE_ARG.test(token)) return false;
+    if (!literalArguments && token === "--") {
+      literalArguments = true;
+      continue;
+    }
+    if (!literalArguments && token.startsWith("-")) {
+      const equals = token.indexOf("=");
+      const option = equals < 0 ? token : token.slice(0, equals);
+      if (!optionsWithValues.has(option)) return false;
+      const operand = equals < 0 ? argv[cursor++] : token.slice(equals + 1);
+      if (!operand || UNSAFE_FOCUSED_GUIDANCE_ARG.test(operand)) return false;
+      continue;
+    }
+    if (!/\.(?:test|spec|vitest)\.[cm]?[jt]sx?$/i.test(token)) return false;
+    try {
+      const file = resolve(cwd, token);
+      const physicalRelative = relative(realpathSync(repo), realpathSync(file));
+      if (
+        physicalRelative.startsWith("..") ||
+        isAbsolute(physicalRelative) ||
+        !statSync(file).isFile()
+      )
+        return false;
+    } catch {
+      return false;
+    }
+    selectors += 1;
+  }
+  return selectors > 0;
+}
+
+function focusedChecksForExistingTestTarget(repo: string, path: string): string[] {
+  // A filename alone is not enough to invent a runner (or execute fixtures,
+  // shared mock setup, Python unittest files, etc. as Bun tests).
+  if (
+    UNSAFE_FOCUSED_GUIDANCE_ARG.test(path) ||
+    !/\.(?:test|spec|vitest)\.[cm]?[jt]sx?$/i.test(path)
+  )
+    return [];
+  try {
+    const file = resolve(repo, path);
+    const physicalRelative = relative(realpathSync(repo), realpathSync(file));
+    if (physicalRelative.startsWith("..") || isAbsolute(physicalRelative)) return [];
+    const stat = statSync(file);
+    if (!stat.isFile() || stat.size > 256_000) return [];
+    const command = `bun test ${formatBunTestPathArg(path)}`;
+    const routed = routeRepositoryFocusedTestCommand(repo, command);
+    // Native owner scripts can expand to an entire suite. Preserve them in
+    // final validation, but do not label them as focused editing checks or
+    // invent filter-forwarding argv for an arbitrary package script.
+    if (routed.length !== 1 || routed[0] !== command)
+      return routed.filter((candidate) => isFocusedExecutorValidationCommand(repo, candidate));
+    const source = readValidationInspectionText(repo, file, MAX_VALIDATION_MANIFEST_BYTES);
+    return source !== null && /(?:from\s*|(?:require|import)\s*\(\s*)["']bun:test["']/.test(source)
+      ? [command]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function buildExecutorValidationOwnership(
+  repo: string,
+  params: Record<string, unknown>,
+  validationGateEnabled: boolean,
+): ExecutorValidationOwnership {
+  const planning = params.planning as TaskExecutePlanning;
+  // Read the current checkout's requirements, just as the final gate does.
+  // Do not replace or mutate planner/vision commands with focused suggestions.
+  const requiredSteps = resolveRequiredValidationSteps(repo, planning);
+  const instruction = String(params.instruction ?? "");
+  const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
+  const targetTests = [targetPath ?? "", ...(planning.targetPaths ?? [])]
+    .map((path) => normalizeTargetPath(path))
+    .filter((path): path is string => Boolean(path))
+    .slice(0, 4);
+  const gate = collectQualityGateValidationCommands({
+    instruction,
+    targetPath,
+    planning: { ...planning, requiredValidationSteps: requiredSteps },
+    changedTestPaths: [],
+    isTestTask: isTestFocusedTask(instruction, planning, targetPath),
+    repo,
+  });
+  const suggested = [
+    ...gate.plannerRunnableSteps.filter((command) =>
+      isFocusedExecutorValidationCommand(repo, command),
+    ),
+    ...targetTests.flatMap((path) => focusedChecksForExistingTestTarget(repo, path)),
+  ];
+  return {
+    schemaVersion: 1,
+    owner: validationGateEnabled ? "pushpals_after_edit" : "executor",
+    focusedCommands: dedupeValidationCommands(suggested)
+      // Keep executable suggestions complete; Python must not display a
+      // clipped path, option operand, or unmatched quotation as a command.
+      .filter((command) => command.length <= MAX_FOCUSED_GUIDANCE_COMMAND_CHARS)
+      .filter((command) => !trustedEnvironmentValidationDeferralReason(repo, command))
+      .slice(0, 4),
+    postEditCommands: buildValidationExecutionPlan(repo, gate.discoveredCommands),
+    requiredSteps,
+  };
 }
 
 export function withValidationExecutionPlanProvenance(
@@ -6042,19 +6294,8 @@ export function collectPrePublishHygieneIssues(params: {
 }
 
 export function inferRepoNativeValidationCommands(repo: string, changedPaths: string[]): string[] {
-  const packageJsonPath = resolve(repo, "package.json");
-  if (!existsSync(packageJsonPath)) return [];
-
-  let packageJson: {
-    scripts?: Record<string, unknown>;
-    dependencies?: Record<string, unknown>;
-    devDependencies?: Record<string, unknown>;
-  } = {};
-  try {
-    packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-  } catch {
-    return [];
-  }
+  const packageJson = readPackageJson(repo);
+  if (!packageJson) return [];
 
   const scripts = packageJson.scripts ?? {};
   const dependencies = {
@@ -11714,6 +11955,13 @@ export async function executeJob(
         exitCode: 1,
       });
     }
+    // Overwrite any caller-supplied contract. This is execution ownership, not
+    // a model-controlled way to remove requirements or reuse claimed passes.
+    attemptParams.executorValidationOwnership = buildExecutorValidationOwnership(
+      repo,
+      normalizedParams,
+      qualityGatePolicy.validationGateEnabled,
+    );
     let result: Awaited<ReturnType<typeof runExecutor>> | null = null;
     let validatingExecutorTimeoutCandidate = false;
     let mergeConflictPass = 0;

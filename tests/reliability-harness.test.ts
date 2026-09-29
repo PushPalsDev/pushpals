@@ -34,6 +34,9 @@ describe("reliability harness release coverage", () => {
     expect(watchdogFiles).toContain(
       "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
     );
+    expect(watchdogFiles).toContain(
+      "apps/workerpals/src/backends/shared/test_settings_resolver.py",
+    );
   });
 
   test("gates both source and packaged generic-executor progress behavior", () => {
@@ -80,6 +83,11 @@ describe("reliability harness release coverage", () => {
     expect(repairFiles).toContain("tests/source-control-manager.runtime-helpers.test.ts");
     expect(repairFiles).toContain("tests/source-control-manager.completion-lease.test.ts");
     expect(evidenceFiles).toContain("tests/source-control-manager.trusted-validation.test.ts");
+    expect(evidenceFiles).toContain(
+      "tests/source-control-manager.dependency-artifact-cache.test.ts",
+    );
+    expect(evidenceFiles).toContain("tests/source-control-manager.validation-substeps.test.ts");
+    expect(evidenceFiles).toContain("tests/shared.validation-substeps.test.ts");
     expect(evidenceFiles).toContain("tests/shared.trusted-validation-evidence.test.ts");
     expect(evidenceFiles).toContain("tests/server.failure-circuit-evidence.test.ts");
     expect(evidenceFiles).toContain("tests/server.job-terminal-semantics.test.ts");

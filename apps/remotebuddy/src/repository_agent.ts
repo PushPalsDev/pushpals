@@ -869,7 +869,13 @@ async function buildSeedEvidencePacket(
 function boundedRetrievalTerms(request: RepositoryAgentRequest): string[] {
   const context = request.context ?? {};
   const vision = isRecord(context.vision) ? context.vision : {};
-  const sections = Array.isArray(vision.sections) ? vision.sections.slice(0, 24) : [];
+  // Unclassified autonomy sections can be exclusions or policy in any language.
+  // Keep them in synthesis context, but do not turn their headings/body into
+  // positive retrieval hints when explicit goals are missing or unrelated.
+  const sections =
+    autonomyVisionFingerprint(request) == null && Array.isArray(vision.sections)
+      ? vision.sections.slice(0, 24)
+      : [];
   const boundedVision = [
     vision.path,
     vision.one_sentence,
@@ -882,6 +888,10 @@ function boundedRetrievalTerms(request: RepositoryAgentRequest): string[] {
   const source = [request.purpose, request.question, ...boundedVision]
     .map((value) => compactText(value, 8_000).normalize("NFKC").toLocaleLowerCase("und"))
     .join("\n");
+  return retrievalTermsFromText(source);
+}
+
+function retrievalTermsFromText(source: string): string[] {
   const output = new Set<string>();
   // Natural CJK questions commonly omit spaces. Add a tightly bounded set of
   // longest-first script-aware n-grams so a phrase such as “检查支付处理边界” can
@@ -916,6 +926,71 @@ function boundedRetrievalTerms(request: RepositoryAgentRequest): string[] {
   return [...output].slice(0, 128);
 }
 
+function retrievalWords(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, "$1 $2")
+    .toLocaleLowerCase("und")
+    .replace(/[_.@/\\-]+/g, " ");
+}
+
+function autonomyPriorityTerms(request: RepositoryAgentRequest): Map<string, number> {
+  const weights = new Map<string, number>();
+  if (autonomyVisionFingerprint(request) == null) return weights;
+  const vision = normalizedAutonomyVision(request);
+  const topics: Array<[string, number]> = [
+    ...vision.priorities.map((text, index): [string, number] => [text, 4 / (1 + index * 0.1)]),
+    ...vision.objectives.map((text, index): [string, number] => [text, 2 / (1 + index * 0.1)]),
+    [vision.one_sentence, 1],
+  ];
+  // Missing positive goals do not make arbitrary headings positive objectives.
+  // The caller question remains a fallback; unclassified sections and negative
+  // constraints retain their existing synthesis/vision fingerprint roles.
+  for (const [text, weight] of topics) {
+    const terms = new Set(retrievalTermsFromText(retrievalWords(text)));
+    for (const term of terms) {
+      const stem = /^[a-z0-9]+$/i.test(term) ? term.replace(/(?:ing|ed|es|s)$/i, "") : term;
+      // A word and its matching suffix stem are one hint, not two votes.
+      // Otherwise e.g. a lower-priority "shipping" beats "ledger" solely
+      // because both "shipping" and "shipp" match the same filename.
+      if (stem !== term && stem.length >= 4 && terms.has(stem)) continue;
+      if (weights.size >= 128 && !weights.has(term)) continue;
+      weights.set(term, Math.max(weights.get(term) ?? 0, weight));
+    }
+  }
+  return weights;
+}
+
+function pathTermScore(lower: string, base: string, term: string): number {
+  if (lower === term) return 1_000;
+  if (base === term) return 400;
+  if (base.includes(term)) return 80;
+  if (lower.includes(`/${term}`) || lower.startsWith(`${term}/`)) return 30;
+  if (lower.includes(term)) return 8;
+  return 0;
+}
+
+/** Keep a page from being monopolized by near-neighbor filenames, without
+ * jumping arbitrarily far down the relevance ordering or changing coverage. */
+function diversifyDiscoveryPaths<T extends { path: string }>(ranked: T[]): T[] {
+  const output: T[] = [];
+  const buffer: T[] = [];
+  let cursor = 0;
+  const counts = new Map<string, number>();
+  const directory = (path: string) => path.slice(0, path.lastIndexOf("/") + 1);
+  while (cursor < ranked.length || buffer.length) {
+    while (cursor < ranked.length && buffer.length < MAX_DISCOVERY_PATHS * 4)
+      buffer.push(ranked[cursor++]!);
+    if (output.length % MAX_DISCOVERY_PATHS === 0) counts.clear();
+    const diverse = buffer.findIndex((entry) => (counts.get(directory(entry.path)) ?? 0) < 2);
+    const [entry] = buffer.splice(diverse < 0 ? 0 : diverse, 1);
+    output.push(entry!);
+    const key = directory(entry!.path);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return output;
+}
+
 /**
  * Repository retrieval is deliberately host-deterministic. It cannot consume
  * synthesis time, execute repository instructions, or leave a second provider
@@ -931,18 +1006,39 @@ function rankedAdditionalPaths(
   const exactContextPaths = collectContextPaths([request.question, request.context], tracked);
   const exactKeys = new Set([...exactContextPaths].map(comparablePath));
   const terms = boundedRetrievalTerms(request);
+  const priorityTerms = autonomyPriorityTerms(request);
+  const pathWordFrequency = new Map<string, number>();
+  if (priorityTerms.size) {
+    for (const path of tracked.paths) {
+      for (const term of retrievalTermsFromText(retrievalWords(path))) {
+        if (priorityTerms.has(term))
+          pathWordFrequency.set(term, (pathWordFrequency.get(term) ?? 0) + 1);
+      }
+    }
+  }
+  const weightedPriorityTerms = [...priorityTerms].map(
+    ([term, weight]) =>
+      [
+        term,
+        weight * Math.log2(1 + tracked.paths.length / (1 + (pathWordFrequency.get(term) ?? 0))),
+      ] as const,
+  );
   const ranked = tracked.paths
     .filter((path) => !seedKeys.has(comparablePath(path)))
     .map((path) => {
       const lower = path.normalize("NFKC").toLocaleLowerCase("und");
       const base = basename(lower);
-      let score = exactKeys.has(comparablePath(path)) ? 10_000 : 0;
+      const exact = exactKeys.has(comparablePath(path));
+      let score = exact ? 10_000 : 0;
       for (const term of terms) {
-        if (lower === term) score += 1_000;
-        else if (base === term) score += 400;
-        else if (base.includes(term)) score += 80;
-        else if (lower.includes(`/${term}`) || lower.startsWith(`${term}/`)) score += 30;
-        else if (lower.includes(term)) score += 8;
+        score += pathTermScore(lower, base, term);
+      }
+      let priorityScore = 0;
+      for (const [term, weight] of weightedPriorityTerms) {
+        // Ubiquitous path vocabulary must not drown a rarer vision topic.
+        // Frequency comes only from this bounded tracked inventory, never a
+        // repository-specific dictionary or an extra model round trip.
+        priorityScore += pathTermScore(lower, base, term) * weight;
       }
       if (score > 0) {
         if (/^(?:src|app|apps|lib|packages|services)\//.test(lower)) score += 6;
@@ -951,10 +1047,25 @@ function rankedAdditionalPaths(
         }
         if (/(?:^|\/)(?:test|tests|spec|specs|__tests__)(?:\/|$)/.test(lower)) score += 2;
       }
-      return { path, score };
+      return { path, score, exact, priorityScore };
     })
-    .filter((entry) => includeUnmatched || entry.score > 0)
-    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
+    .filter((entry) => includeUnmatched || entry.score > 0 || entry.priorityScore > 0)
+    .sort(
+      (left, right) =>
+        (priorityTerms.size
+          ? Number(right.exact) - Number(left.exact) || right.priorityScore - left.priorityScore
+          : 0) ||
+        right.score - left.score ||
+        left.path.localeCompare(right.path),
+    );
+  if (priorityTerms.size) {
+    const exact = ranked.filter((entry) => entry.exact);
+    const relevant = ranked.filter((entry) => !entry.exact && entry.priorityScore > 0);
+    const remainder = ranked.filter((entry) => !entry.exact && entry.priorityScore <= 0);
+    return [...exact, ...diversifyDiscoveryPaths(relevant), ...remainder].map(
+      (entry) => entry.path,
+    );
+  }
   return ranked.map((entry) => entry.path);
 }
 
@@ -2948,6 +3059,7 @@ export class RepositoryAgentWorker {
     if (
       windowStartPage > 0 &&
       valid &&
+      Array.isArray(value.deferredPageFingerprints) &&
       value.deferredPageFingerprints.length > 0 &&
       value.exclusionFingerprint !== exclusionFingerprint
     )

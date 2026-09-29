@@ -1114,6 +1114,39 @@ describe("server CompletionQueue PR URL persistence", () => {
             exitCode: 1,
             durationMs: 32_100,
             phase: "validation",
+            substeps: {
+              truncated: false,
+              ignoredLines: 0,
+              stages: [
+                {
+                  source: "aggregate_lines",
+                  observationOnly: true,
+                  stageId: "private-stage-token",
+                  ordinal: 1,
+                  total: 2,
+                  boundary: "complete",
+                  durationMs: 12,
+                  observedElapsedMs: 12,
+                  reportedDurationMs: 10,
+                  completionMarker: "ok",
+                  label: "private-substep-label",
+                  authorizePublication: true,
+                },
+                {
+                  source: "aggregate_lines",
+                  observationOnly: true,
+                  stageId: "private-incomplete-token",
+                  ordinal: 2,
+                  total: 2,
+                  boundary: "incomplete",
+                  durationMs: null,
+                  observedElapsedMs: 24,
+                  reportedDurationMs: null,
+                  completionMarker: null,
+                  incompleteReason: "command_finished",
+                },
+              ],
+            },
             failureClass: "test_failure",
             failedTests: [
               "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
@@ -1173,8 +1206,30 @@ describe("server CompletionQueue PR URL persistence", () => {
           "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
         ],
         targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+        substeps: {
+          stages: [
+            {
+              stageId: "substep-1",
+              boundary: "complete",
+              durationMs: 12,
+              reportedDurationMs: 10,
+              observationOnly: true,
+            },
+            {
+              stageId: "substep-2",
+              boundary: "incomplete",
+              durationMs: null,
+              observedElapsedMs: 24,
+              reportedDurationMs: null,
+              incompleteReason: "command_finished",
+              observationOnly: true,
+            },
+          ],
+        },
       },
     });
+    expect(JSON.stringify(validationRuns[0])).not.toContain("private-substep-label");
+    expect(JSON.stringify(validationRuns[0])).not.toContain("authorizePublication");
     expect(completions.getCompletion(completionId)).toMatchObject({
       trustedInstallDurationMs: 7_654,
       trustedValidationDurationMs: 32_100,

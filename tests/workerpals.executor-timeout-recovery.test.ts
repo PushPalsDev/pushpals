@@ -251,6 +251,7 @@ async function runRecoveryFixture(
   const marker = join(root, "critic-called.txt");
   let attempts = 0;
   const logs: string[] = [];
+  const validationOwnership: unknown[] = [];
   try {
     for (const args of [
       ["init", "-q"],
@@ -283,8 +284,9 @@ async function runRecoveryFixture(
         `await Bun.write(output, ${JSON.stringify(JSON.stringify({ score: options.score ?? 9, must_fix: options.mustFix ?? [], findings: [], revision_guidance: "Improve the candidate implementation." }))});`,
       ].join("\n"),
     );
-    registerBackendTaskExecutor("openai_codex", async () => {
+    registerBackendTaskExecutor("openai_codex", async (_kind, executorParams) => {
       attempts++;
+      validationOwnership.push(executorParams.executorValidationOwnership);
       writeFileSync(join(repo, "candidate.ts"), "export const candidate = 2;\n");
       writeFileSync(
         join(repo, "candidate.test.ts"),
@@ -328,6 +330,13 @@ async function runRecoveryFixture(
       "task.execute",
       {
         schemaVersion: 2,
+        executorValidationOwnership: {
+          schemaVersion: 1,
+          owner: "executor",
+          focusedCommands: ["echo claimed-pass"],
+          postEditCommands: [],
+          requiredSteps: [],
+        },
         instruction: "Change candidate from one to two and update its unit test.",
         planning: {
           intent: "code_change",
@@ -376,6 +385,7 @@ async function runRecoveryFixture(
       criticCalled: criticArgs.includes("--output-last-message"),
       criticArgs,
       attempts,
+      validationOwnership,
     };
   } finally {
     if (previous) registerBackendTaskExecutor("openai_codex", previous);
@@ -385,6 +395,23 @@ async function runRecoveryFixture(
 }
 
 describe("executeJob timeout recovery with real Git, tests, and critic subprocess", () => {
+  test("derives ownership at the executor boundary without trusting a caller's empty gate manifest", async () => {
+    const observed = await runRecoveryFixture();
+    expect(observed.validationOwnership[0]).toMatchObject({
+      schemaVersion: 1,
+      owner: "pushpals_after_edit",
+      focusedCommands: ["bun test candidate.test.ts"],
+      requiredSteps: ["bun test candidate.test.ts"],
+      postEditCommands: [
+        expect.objectContaining({ command: "bun test candidate.test.ts", capability: "worker" }),
+      ],
+    });
+    expect(JSON.stringify(observed.validationOwnership)).not.toContain("claimed-pass");
+    expect(observed.result.ok).toBe(true);
+    expect(observed.result.diagnostics?.validationRuns?.some((run) => run.passed)).toBe(true);
+    expect(observed.criticCalled).toBe(true);
+  }, 30_000);
+
   test("holds an unavailable browser candidate after two attempts without publishing or spending all revisions", async () => {
     const observed = await runRecoveryFixture({
       capabilityUnavailable: true,

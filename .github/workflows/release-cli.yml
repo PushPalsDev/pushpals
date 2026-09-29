@@ -689,6 +689,9 @@ jobs:
           bun test
           tests/workerpals.executor-timeout-recovery.test.ts
           tests/source-control-manager.trusted-validation.test.ts
+          tests/source-control-manager.dependency-artifact-cache.test.ts
+          tests/source-control-manager.validation-substeps.test.ts
+          tests/shared.validation-substeps.test.ts
           tests/source-control-manager.http.test.ts
           tests/source-control-manager.runtime-helpers.test.ts
           tests/source-control-manager.review-agent.test.ts

@@ -216,6 +216,56 @@ supports multiple package managers and language ecosystems, emits single-process
 commands without shell chaining, and does not substitute a PushPals-specific
 test command into another repository.
 
+## Editing-turn validation ownership
+
+WorkerPals derives a structured validation handoff from the current checkout
+before every executor turn. Existing literal test targets can provide focused
+check suggestions where the runner and literal selector are established.
+Repo-native owner scripts that cover an entire suite remain final-gate commands,
+not focused editing suggestions; arbitrary scripts are never given invented
+filter-forwarding arguments. Option operands (such as preload files) are not
+test selectors, and unsafe shell-text paths receive no synthesized suggestion.
+It does not invent a replacement runner or turn a missing test target into a
+whole-suite suggestion.
+
+All backends receive separate lists for focused editing checks and scheduled
+post-edit gates, with worker versus trusted-host capabilities. The ownership
+section follows supplemental planner and repair instructions so a repeated
+planner checklist does not accidentally request another full validation run.
+This is model guidance, not a command prohibition: a small full suite or one
+necessary aggregate-failure reproduction can still be appropriate.
+
+Required vision commands and the deterministic gate inputs remain unchanged.
+Executor-reported passes never replace gate evidence, and runnable worker
+checks are retained even when the containing aggregate must run on the trusted
+host. When the automatic validation gate is disabled, the contract explicitly
+assigns validation to the executor instead of promising a nonexistent handoff.
+Absent or malformed ownership metadata leaves neutral validation headings;
+guidance never promises that an unconfigured critic gate will run.
+
+Ownership is respected throughout the assembled backend prompt, including speed,
+revision, browser, and unavailable-Docker guidance. Missing ownership is not an
+implicit promise that another service will validate. Full manifest and required
+commands retain their exact quoted arguments up to the trusted command limit
+(1,000 characters); unsupported or over-budget entries produce an explicit
+incomplete-manifest notice rather than an executable-looking truncated command.
+The ownership section is bounded to 32,000 characters and does not cache passes.
+Fallback planner validation requirements use the same whole-command rendering,
+outside the truncated planning prose. Codex watchdogs may end editing early for
+a successful gate handoff only with an explicit enabled post-edit owner;
+otherwise the executor continues within its deadline or retains incomplete
+changes as a non-passing partial candidate. Recovery retries preserve that
+structured ownership instead of inferring it from prompt text.
+
+Pre-execution validation inspection reads only bounded, in-repository regular
+files. Referenced scripts retain at most 64 KB per file across at most eight
+references; package manifests are capped at 256 KB. Pipes, devices, linked files,
+and references escaping the repository are not opened as inspection input.
+Native monorepo parent references within the repository remain supported.
+An existing unsafe or oversized `vision.md` (over 1 MiB) fails inspection explicitly
+instead of silently discarding required validation. The final gate command list
+and execution sequence are not replaced by these prompt suggestions.
+
 ## Operational Failure Patterns
 
 - Backend output parse errors:

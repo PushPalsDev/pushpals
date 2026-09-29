@@ -1,103 +1,175 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="680" viewBox="0 0 1760 680" role="img" aria-labelledby="title description">
-  <title id="title">PushPals runtime architecture</title>
-  <desc id="description">CLI, Expo, and VS Code connect directly to the durable Server control plane. Optional LocalBuddy can answer locally or enqueue a request. RemoteBuddy plans, WorkerPals execute, SourceControlManager validates and publishes, and Server persists lifecycle state in SQLite.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="1180" viewBox="0 0 1760 1180" role="img" aria-labelledby="title description">
+  <title id="title">PushPals runtime architecture and shared repository intelligence</title>
+  <desc id="description">CLI, Expo, and VS Code connect to the durable Server control plane. Optional LocalBuddy can answer locally or enqueue a request. RemoteBuddy plans, WorkerPals execute and optionally use CriticGate, and SourceControlManager validates, publishes, and optionally uses ReviewAgent for PR review. Repository Agent is a shared AI helper hosted inside RemoteBuddy, not a separate required process. Every service has a typed client; autonomy is the current advice caller. Questions and results use a separate Server-owned durable queue. The helper uses the assigned LLM and snapshot-verified repository evidence. An independent MemoryStore interface exposes Server-owned SQLite memory: verified facts, analysis caches, discovery progress, and authoritative outcome feedback. Memory reuse is not model training, and advice cannot bypass deterministic validation or publication gates.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155" />
     </marker>
+    <marker id="advice-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed" />
+    </marker>
+    <marker id="memory-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d" />
+    </marker>
     <style>
       .title { font: 700 28px Inter, Segoe UI, sans-serif; fill: #0f172a; }
       .subtitle { font: 400 15px Inter, Segoe UI, sans-serif; fill: #475569; }
+      .section-title { font: 700 22px Inter, Segoe UI, sans-serif; fill: #0f172a; }
       .box-title { font: 700 19px Inter, Segoe UI, sans-serif; fill: #0f172a; text-anchor: middle; }
       .box-copy { font: 400 14px Inter, Segoe UI, sans-serif; fill: #334155; text-anchor: middle; }
-      .edge-label { font: 600 12px Inter, Segoe UI, sans-serif; fill: #475569; text-anchor: middle; }
+      .edge-label { font: 600 12px Inter, Segoe UI, sans-serif; fill: #475569; text-anchor: middle; paint-order: stroke; stroke: #ffffff; stroke-width: 5px; stroke-linejoin: round; }
+      .group-label { font: 600 13px Inter, Segoe UI, sans-serif; fill: #475569; text-anchor: middle; }
       .note { font: 400 13px Inter, Segoe UI, sans-serif; fill: #334155; }
       .edge { fill: none; stroke: #334155; stroke-width: 2; marker-end: url(#arrow); }
       .edge-both { fill: none; stroke: #334155; stroke-width: 2; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .advice-edge { fill: none; stroke: #7c3aed; stroke-width: 2; marker-start: url(#advice-arrow); marker-end: url(#advice-arrow); }
+      .memory-edge { fill: none; stroke: #15803d; stroke-width: 2; marker-start: url(#memory-arrow); marker-end: url(#memory-arrow); }
       .human { fill: #f8fafc; stroke: #64748b; stroke-width: 2; }
       .surface { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; }
       .optional { fill: #f8fafc; stroke: #64748b; stroke-width: 2; stroke-dasharray: 8 5; }
-      .authority { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; }
+      .authority { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; }
       .service { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 2; }
       .trusted { fill: #fff7ed; stroke: #ea580c; stroke-width: 2; }
       .state { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; }
+      .boundary { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; stroke-dasharray: 6 5; }
     </style>
   </defs>
 
-  <rect width="1760" height="680" fill="#ffffff" />
+  <rect width="1760" height="1180" fill="#ffffff" />
   <text class="title" x="40" y="44">PushPals runtime architecture</text>
-  <text class="subtitle" x="40" y="70">Queue-mediated local control plane; deterministic host gates remain authoritative.</text>
+  <text class="subtitle" x="40" y="70">Durable orchestration above; shared AI assistance and memory below. Model advice does not replace host-side gates.</text>
 
-  <rect class="human" x="40" y="270" width="130" height="72" rx="14" />
-  <text class="box-title" x="105" y="313">User</text>
+  <g id="runtime-flow" aria-label="Request, execution, and publication flow">
+    <rect class="human" x="40" y="280" width="130" height="72" rx="14" />
+    <text class="box-title" x="105" y="323">User</text>
 
-  <rect class="surface" x="240" y="115" width="270" height="112" rx="14" />
-  <text class="box-title" x="375" y="151">Primary clients</text>
-  <text class="box-copy" x="375" y="180">Terminal CLI · Expo · VS Code</text>
-  <text class="box-copy" x="375" y="203">Direct Server session ingress</text>
+    <rect class="surface" x="240" y="120" width="270" height="112" rx="14" />
+    <text class="box-title" x="375" y="156">Primary clients</text>
+    <text class="box-copy" x="375" y="185">Terminal CLI &#183; Expo &#183; VS Code</text>
+    <text class="box-copy" x="375" y="208">Direct Server session ingress</text>
 
-  <rect class="optional" x="240" y="388" width="270" height="112" rx="14" />
-  <text class="box-title" x="375" y="424">LocalBuddy (optional)</text>
-  <text class="box-copy" x="375" y="453">Quick/local read-only answer</text>
-  <text class="box-copy" x="375" y="476">or durable request enqueue</text>
+    <rect class="optional" x="240" y="410" width="270" height="112" rx="14" />
+    <text class="box-title" x="375" y="446">LocalBuddy (optional)</text>
+    <text class="box-copy" x="375" y="475">Quick/local read-only answer</text>
+    <text class="box-copy" x="375" y="498">or durable request enqueue</text>
 
-  <rect class="authority" x="630" y="225" width="310" height="162" rx="16" />
-  <text class="box-title" x="785" y="265">Server control plane</text>
-  <text class="box-copy" x="785" y="295">sessions · events · requests · jobs</text>
-  <text class="box-copy" x="785" y="319">completions · workers · autonomy</text>
-  <text class="box-copy" x="785" y="343">RepositoryAgent queue · shared memory</text>
-  <text class="box-copy" x="785" y="367">HTTP + SSE/WS on loopback</text>
+    <rect class="authority" x="630" y="240" width="310" height="172" rx="16" />
+    <text class="box-title" x="785" y="278">Server control plane</text>
+    <text class="box-copy" x="785" y="308">sessions &#183; events &#183; requests &#183; jobs</text>
+    <text class="box-copy" x="785" y="332">completions &#183; workers &#183; autonomy</text>
+    <text class="box-copy" x="785" y="356">Repository Agent broker &#183; memory API</text>
+    <text class="box-copy" x="785" y="386">HTTP + SSE/WS on loopback</text>
 
-  <rect class="state" x="630" y="500" width="310" height="100" rx="14" />
-  <text class="box-title" x="785" y="538">SQLite authority</text>
-  <text class="box-copy" x="785" y="568">outputs/data/pushpals.db · WAL</text>
+    <rect class="state" x="630" y="505" width="310" height="95" rx="14" />
+    <text class="box-title" x="785" y="540">SQLite authority</text>
+    <text class="box-copy" x="785" y="568">outputs/data/pushpals.db &#183; WAL</text>
+    <text class="box-copy" x="785" y="588">Lifecycle state + shared memory</text>
 
-  <rect class="service" x="1070" y="90" width="290" height="125" rx="14" />
-  <text class="box-title" x="1215" y="127">RemoteBuddy</text>
-  <text class="box-copy" x="1215" y="156">planning · request orchestration · autonomy</text>
-  <text class="box-copy" x="1215" y="180">hosts RepositoryAgent worker</text>
-  <text class="box-copy" x="1215" y="202">vision.md → provisional request → same queue</text>
+    <rect class="service" x="1070" y="100" width="290" height="128" rx="14" />
+    <text class="box-title" x="1215" y="137">RemoteBuddy</text>
+    <text class="box-copy" x="1215" y="165">planning &#183; orchestration &#183; autonomy</text>
+    <text class="box-copy" x="1215" y="189">vision.md &#8594; requests &#8594; jobs</text>
+    <text class="box-copy" x="1215" y="213">Hosts Repository Agent (detail below)</text>
 
-  <rect class="service" x="1070" y="257" width="290" height="125" rx="14" />
-  <text class="box-title" x="1215" y="294">WorkerPals</text>
-  <text class="box-copy" x="1215" y="323">detached worktree / Docker execution</text>
-  <text class="box-copy" x="1215" y="347">quality loop · immutable candidate commit</text>
-  <text class="box-copy" x="1215" y="369">does not decide publication</text>
+    <rect class="service" x="1070" y="278" width="290" height="128" rx="14" />
+    <text class="box-title" x="1215" y="315">WorkerPals</text>
+    <text class="box-copy" x="1215" y="343">Isolated coding + validation gates</text>
+    <text class="box-copy" x="1215" y="367">CriticGate: optional AI patch review</text>
+    <text class="box-copy" x="1215" y="391">Produces immutable candidate commits</text>
 
-  <rect class="trusted" x="1070" y="424" width="290" height="125" rx="14" />
-  <text class="box-title" x="1215" y="461">SourceControlManager</text>
-  <text class="box-copy" x="1215" y="490">trusted validation · ReviewAgent</text>
-  <text class="box-copy" x="1215" y="514">lease-fenced publication and callbacks</text>
-  <text class="box-copy" x="1215" y="536">does not execute the coding job</text>
+    <rect class="trusted" x="1070" y="455" width="290" height="140" rx="14" />
+    <text class="box-title" x="1215" y="492">SourceControlManager</text>
+    <text class="box-copy" x="1215" y="520">Trusted validation + fenced publication</text>
+    <text class="box-copy" x="1215" y="544">ReviewAgent: optional AI PR review</text>
+    <text class="box-copy" x="1215" y="570">Approval / repair / merge workflow</text>
 
-  <rect class="state" x="1480" y="236" width="240" height="252" rx="14" />
-  <text class="box-title" x="1600" y="275">Git</text>
-  <text class="box-copy" x="1600" y="309">detached worktrees</text>
-  <text class="box-copy" x="1600" y="335">internal candidate refs</text>
-  <line x1="1515" y1="358" x2="1685" y2="358" stroke="#86efac" stroke-width="2" />
-  <text class="box-copy" x="1600" y="390">main_agents integration branch</text>
-  <text class="box-copy" x="1600" y="418">individual or aggregate PR</text>
-  <text class="box-copy" x="1600" y="450">main source of truth</text>
+    <rect class="state" x="1480" y="267" width="240" height="268" rx="14" />
+    <text class="box-title" x="1600" y="306">Git + PR provider</text>
+    <text class="box-copy" x="1600" y="340">Detached worktrees</text>
+    <text class="box-copy" x="1600" y="366">Internal candidate refs</text>
+    <line x1="1515" y1="389" x2="1685" y2="389" stroke="#86efac" stroke-width="2" />
+    <text class="box-copy" x="1600" y="421">main_agents integration branch</text>
+    <text class="box-copy" x="1600" y="449">Individual or aggregate PRs</text>
+    <text class="box-copy" x="1600" y="481">Provider review / merge outcomes</text>
+    <text class="box-copy" x="1600" y="507">main source of truth</text>
 
-  <path class="edge" d="M 170 292 C 198 258, 210 205, 240 186" />
-  <path class="edge" d="M 170 320 C 200 354, 212 417, 240 437" />
-  <path class="edge-both" d="M 510 171 C 565 171, 582 255, 630 271" />
-  <text class="edge-label" x="570" y="191">message / events</text>
-  <path class="edge" d="M 510 444 C 568 444, 585 365, 630 345" />
-  <text class="edge-label" x="568" y="430">enqueue</text>
-  <path class="edge-both" d="M 785 387 L 785 500" />
-  <text class="edge-label" x="847" y="451">durable state</text>
-  <path class="edge-both" d="M 940 256 C 986 236, 1018 174, 1070 161" />
-  <text class="edge-label" x="1000" y="198">claim / plan</text>
-  <path class="edge-both" d="M 940 306 L 1070 317" />
-  <text class="edge-label" x="1005" y="298">job / logs</text>
-  <path class="edge-both" d="M 940 356 C 990 385, 1018 461, 1070 476" />
-  <text class="edge-label" x="998" y="430">completion / callback</text>
-  <path class="edge" d="M 1360 319 L 1480 319" />
-  <text class="edge-label" x="1420" y="305">candidate ref</text>
-  <path class="edge" d="M 1360 486 C 1410 486, 1428 425, 1480 418" />
-  <text class="edge-label" x="1417" y="470">validated publish</text>
+    <path class="edge" d="M 170 302 C 198 268, 210 215, 240 191" />
+    <path class="edge" d="M 170 330 C 200 364, 212 437, 240 459" />
+    <path class="edge-both" d="M 510 176 C 565 176, 582 265, 630 286" />
+    <text class="edge-label" x="570" y="196">message / events</text>
+    <path class="edge" d="M 510 466 C 568 466, 585 387, 630 366" />
+    <text class="edge-label" x="568" y="452">enqueue</text>
+    <path class="edge-both" d="M 785 412 L 785 505" />
+    <text class="edge-label" x="850" y="462">durable state</text>
+    <path class="edge-both" d="M 940 281 C 986 261, 1018 187, 1070 174" />
+    <text class="edge-label" x="1000" y="211">claim / plan</text>
+    <path class="edge-both" d="M 940 331 L 1070 342" />
+    <text class="edge-label" x="1005" y="323">job / logs</text>
+    <path class="edge-both" d="M 940 381 C 990 410, 1018 492, 1070 507" />
+    <text class="edge-label" x="999" y="456">completion</text>
+    <text class="edge-label" x="999" y="472">/ callback</text>
+    <path class="edge" d="M 1360 342 L 1480 342" />
+    <text class="edge-label" x="1420" y="328">candidate ref</text>
+    <path class="edge-both" d="M 1360 521 C 1410 521, 1428 456, 1480 449" />
+    <text class="edge-label" x="1416" y="546">publish / review</text>
+  </g>
 
-  <rect x="40" y="625" width="1680" height="34" rx="8" fill="#f8fafc" />
-  <text class="note" x="55" y="647">All queue mutations use durable state and fenced leases. Model output proposes work; deterministic identity, policy, validation, review, and publication checks authorize it.</text>
+  <g id="repository-intelligence" aria-label="Shared Repository Agent and independent memory interface">
+    <rect x="40" y="637" width="1680" height="466" rx="16" fill="#f8fafc" stroke="#e2e8f0" stroke-width="2" />
+    <text class="section-title" x="65" y="674">Shared repository intelligence</text>
+    <text class="subtitle" x="65" y="699">Detail of the same Server and RemoteBuddy above &#8212; no additional required service process.</text>
+
+    <rect class="surface" x="65" y="757" width="345" height="138" rx="14" />
+    <text class="box-title" x="237.5" y="789">Any service can ask</text>
+    <text class="box-copy" x="237.5" y="817">Server &#183; LocalBuddy &#183; RemoteBuddy</text>
+    <text class="box-copy" x="237.5" y="841">WorkerPals &#183; SourceControlManager</text>
+    <text class="box-copy" x="237.5" y="879">Current caller: RemoteBuddy autonomy</text>
+
+    <rect class="state" x="65" y="948" width="345" height="112" rx="14" />
+    <text class="box-title" x="237.5" y="981">Independent MemoryStore client</text>
+    <text class="box-copy" x="237.5" y="1010">Any service can use memory without AI</text>
+    <text class="box-copy" x="237.5" y="1035">Get / search / put / invalidate / reinforce</text>
+
+    <rect class="boundary" x="530" y="726" width="410" height="359" rx="14" />
+    <text class="group-label" x="735" y="747">SERVER-OWNED BROKER + PERSISTENCE</text>
+    <rect class="authority" x="550" y="767" width="370" height="122" rx="12" />
+    <text class="box-title" x="735" y="800">Repository Agent queue</text>
+    <text class="box-copy" x="735" y="828">Separate from request / job / completion queues</text>
+    <text class="box-copy" x="735" y="852">Deduplication &#183; leases &#183; heartbeats &#183; deadlines</text>
+    <text class="box-copy" x="735" y="876">Snapshot-validated, durable questions and results</text>
+
+    <rect class="state" x="550" y="938" width="370" height="127" rx="12" />
+    <text class="box-title" x="735" y="972">Shared memory API &#8594; SQLite</text>
+    <text class="box-copy" x="735" y="998">Facts &#183; analysis cache &#183; discovery progress</text>
+    <text class="box-copy" x="735" y="1022">Provenance + authoritative outcome feedback</text>
+    <text class="box-copy" x="735" y="1046">Same Server database; not model training</text>
+
+    <rect class="boundary" x="1090" y="726" width="605" height="359" rx="14" />
+    <text class="group-label" x="1392.5" y="747">HOSTED INSIDE REMOTEBUDDY</text>
+    <rect class="service" x="1110" y="767" width="565" height="169" rx="12" />
+    <text class="box-title" x="1392.5" y="801">Repository Agent &#183; shared AI helper</text>
+    <text class="box-copy" x="1392.5" y="831">Assigned LLM + bounded, snapshot-verified repository evidence</text>
+    <text class="box-copy" x="1392.5" y="857">Ownership &#183; architecture &#183; vision priorities &#183; debugging &#183; validation advice</text>
+    <text class="box-copy" x="1392.5" y="883">Host checks exact revision, tree, and cited Git blobs</text>
+    <text class="box-copy" x="1392.5" y="917">Returns advice; does not edit, execute jobs, or authorize publication</text>
+    <text class="box-copy" x="1392.5" y="976">Recalls verified facts and reuses scoped analysis caches</text>
+    <text class="box-copy" x="1392.5" y="1003">Freshness / expiry / evidence checks reject stale memory</text>
+    <text class="box-copy" x="1392.5" y="1030">Server outcomes reinforce memory; model claims are not proof</text>
+    <text class="box-copy" x="1392.5" y="1057">Dirty snapshots are analyzed without durable cache / fact writes</text>
+
+    <path class="advice-edge" d="M 410 827 L 550 827" />
+    <text class="edge-label" x="480" y="797">typed client</text>
+    <text class="edge-label" x="480" y="814">ask / result</text>
+    <path class="advice-edge" d="M 920 827 L 1110 827" />
+    <text class="edge-label" x="1015" y="797">worker claims</text>
+    <text class="edge-label" x="1015" y="814">/ returns result</text>
+
+    <path class="memory-edge" d="M 410 1004 L 550 1004" />
+    <text class="edge-label" x="480" y="990">memory HTTP</text>
+    <path class="memory-edge" d="M 1110 908 L 1022 908 L 1022 1004 L 920 1004" />
+    <text class="edge-label" x="1010" y="1033">memory HTTP</text>
+  </g>
+
+  <rect x="40" y="1121" width="1680" height="39" rx="8" fill="#eff6ff" />
+  <text class="note" x="55" y="1146">AI helpers propose and review. Deterministic snapshot, policy, scope, test, lease, and publication checks still control delivery. Shared clients never call the hosted helper directly.</text>
 </svg>

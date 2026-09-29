@@ -1,3 +1,5 @@
+import type { ValidationSubstepReport } from "./validation_substeps.js";
+
 export const MAX_TRUSTED_VALIDATION_COMMANDS = 8;
 export const MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1_000;
 
@@ -89,6 +91,8 @@ export interface TrustedValidationExecutionResult {
   /** Tree that was executed; baseline proof must never be inferred from candidate count. */
   validationTarget?: "candidate" | "baseline";
   baselineFailureProven?: boolean;
+  /** Bounded child-output observations only; never evidence of gate success. */
+  substeps?: ValidationSubstepReport;
 }
 
 export interface TrustedValidationReport {

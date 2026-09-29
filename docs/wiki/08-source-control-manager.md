@@ -25,6 +25,8 @@ The publication path is `claim completion -> validate candidate -> publish -> ac
 - `apps/source_control_manager/src/completion_lease.ts` - shared lease-renewal barrier.
 - `apps/source_control_manager/src/completion_callback.ts` - bounded authoritative callback retries.
 - `apps/source_control_manager/src/trusted_validation.ts` - trusted-host validation orchestration.
+- `apps/source_control_manager/src/dependency_artifact_cache.ts` - reusable native package artifacts, separate from candidate validation.
+- `apps/source_control_manager/src/validation_substeps.ts` - bounded, observation-only aggregate-stage timing.
 
 ## Current Operating Modes
 
@@ -212,6 +214,72 @@ receive bounded rejection, and subsequent ordinary pooled health
 requests remain usable; raising limits or hiding failed responses is not recovery.
 
 ## Debugging Checklist
+
+### Dependency artifacts versus candidate validation
+
+By default, SCM keeps Bun's existing native artifact-cache/backend behavior,
+including a warm global cache. Set `PUSHPALS_TRUSTED_ISOLATED_ARTIFACT_CACHE=1`
+in the SCM process environment to opt into isolated artifact reuse. This mode
+retains Bun's native package artifacts under the repository Git metadata
+directory at `pushpals/dependencies/trusted-packages/<toolchain-key>`. Normal CLI
+`--clear` preserves this existing dependency-cache boundary; `--clear
+--include-caches` removes it. Native platform, architecture, and the selected
+Bun executable distinguish cache namespaces. Explicit `BUN_INSTALL_CACHE_DIR`,
+project/user/XDG `.npmrc` cache settings, or project/global Bun cache/backend
+configuration keeps its existing behavior instead of being silently replaced.
+Explicit `npm_config_cache`, `npm_config_userconfig`, or `npm_config_globalconfig`
+environment overrides also disable this optional override (case-insensitively),
+without assuming npm and Bun resolve them identically. Configuration inspection
+rejects special files, symlinks, unreadable/oversized files, and unfamiliar npmrc
+declarations conservatively; it never expands or logs credentials. Unavailable
+cache directories disable the optional cache mode.
+
+This cache is not a snapshot of a worker's or an earlier candidate's mutable
+`node_modules`. New candidates still run `bun install --frozen-lockfile`, with
+their lifecycle hooks enabled, before the unchanged validation sequence. The
+scoped artifact path uses Bun's `copyfile` backend so an install hook patching a
+dependency cannot modify the reusable package-cache inode. An exact-candidate
+install marker is still distinct from a package artifact: only the former can
+skip an already-completed install for the same inputs. Validation commands are
+not cached. See Bun's [install and backend documentation](https://bun.sh/docs/pm/cli/install)
+and [lifecycle-script contract](https://bun.sh/docs/pm/lifecycle).
+
+A new cache can initially be colder than an existing global cache, and copying
+has filesystem cost. The native regression proves offline artifact reuse and
+candidate-hook isolation, not a production speedup or a sub-ten-minute SLO.
+Compare warm/cold dependency-preparation timings separately from validation.
+
+### Aggregate validation substeps
+
+Trusted commands stream bounded `trustedValidationSubstep` events before the
+aggregate exits. An optional generic adapter recognizes ordered output such as
+`[build checks 1/3] [types/check] Type checks` followed by
+`[ok] Type checks (123.4 ms)`. No repository-specific script names are assumed,
+and scripts that do not emit this format simply retain command-level timings.
+This does not split or reorder required aggregates.
+
+Each event carries the job/completion/candidate IDs, redacted command, attempt,
+ordinal, total, and generated `substep-N` ID. Raw labels/tokens/output are not
+copied into these events. `durationMs` is the observed monotonic time between
+markers; `reportedDurationMs` is the separate, untrusted duration printed by the
+child. Missing completions retain `durationMs: null` and a fixed incomplete
+reason, rather than implying a zero-duration success. Map ordinals to the
+repository's ordered validation script to identify expensive stages.
+
+The collector has fixed stage, line, and length caps, exposes truncation, and
+starts fresh on each command attempt. Duplicate or nested/conflicting start
+headers sharing a label leave that stage incomplete: a completion marker has
+no reliable stage identity. A bounded private prefix identifies the first
+aggregate; differently prefixed nested headers cannot consume its ordinals.
+Unprefixed aggregates remain supported. This is conservative correlation, not
+a parser for arbitrary nested protocols. Unrelated headers do not invalidate
+already tracked labels. Ignored-header label history is also bounded; when it
+fills, later new labels remain uncorrelated and the report exposes truncation.
+A child's `[ok]` marker never proves that
+the command passed, renews a health/claim deadline, or authorizes publication.
+Observer failures do not affect gate results. Server validates and persists the
+final observations in `job_validation_runs.metadataJson.substeps`, exposed in
+job diagnostics; live observations are in the SCM service log.
 
 SCM `/health` includes bounded, process-local `diagnostics`: event-loop delay and
 slow `integration_maintenance`, `completion_claim`, and `completion_ref_gc`

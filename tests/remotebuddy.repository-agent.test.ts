@@ -471,6 +471,265 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(freshPayload.advisoryMemory?.length).toBeGreaterThan(0);
   }, 20_000);
 
+  test("prioritizes vision vocabulary and diverse components without widening evidence or losing coverage", async () => {
+    const repo = createRepository();
+    const paths = [
+      ...Array.from(
+        { length: 18 },
+        (_, index) => `src/catalog/InventoryCard${String(index).padStart(2, "0")}.tsx`,
+      ),
+      "lib/synchronization/InventorySync.rs",
+      "services/audit/AuditTrail.py",
+      ...Array.from(
+        { length: 12 },
+        (_, index) => `tests/aaa/testImprove${String(index).padStart(2, "0")}.ts`,
+      ),
+      "src/neutral/untargeted.ts",
+    ];
+    for (const path of paths) {
+      mkdirSync(join(repo, path, ".."), { recursive: true });
+      writeFileSync(join(repo, path), "// bounded tracked source evidence\n");
+    }
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "vision-ranked fixture",
+    ]);
+    const request = await requestFor(repo, {
+      question: "Inspect test coverage and improve the repository.",
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: {
+          path: "vision.md",
+          sha256: "c".repeat(64),
+          priorities: ["Inventory reconciliation", "Audit history"],
+          non_goals: ["Rewrite all testImprove helpers"],
+        },
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    const result = await worker.analyze("priority-diversity-first", request);
+    const first = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content).evidencePacket;
+    expect(first.selectedPaths).toContain("lib/synchronization/InventorySync.rs");
+    expect(first.selectedPaths).toContain("services/audit/AuditTrail.py");
+    expect(first.selectedPaths.some((path: string) => path.startsWith("src/catalog/"))).toBe(true);
+    expect(first.selectedPaths.some((path: string) => path.startsWith("tests/"))).toBe(false);
+    for (let page = 1; page < result.discoveryProgress!.pageCount; page++)
+      await worker.analyze(`priority-diversity-${page}`, request);
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    const selected = packets.flatMap((packet) => packet.selectedPaths as string[]);
+    expect(new Set(selected).size).toBe(selected.length);
+    for (const path of paths) expect(selected).toContain(path);
+    expect(
+      packets.every((packet) => packet.selectedPaths.length <= 6 && packet.files.length <= 12),
+    ).toBe(true);
+    expect(
+      packets.every(
+        (packet) =>
+          packet.files.reduce(
+            (bytes: number, file: { content: string }) => bytes + Buffer.byteLength(file.content),
+            0,
+          ) <= 64_000,
+      ),
+    ).toBe(true);
+    expect(llm.discoveryCalls).toHaveLength(0);
+  });
+
+  test("changed priority order reranks exact same snapshot and never promotes non-goals", async () => {
+    const repo = createRepository();
+    for (const name of ["ledger", "shipping", "forbidden"]) {
+      writeFileSync(join(repo, "src", `${name}.ts`), `export const ${name} = true;\n`);
+    }
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "ordered priorities",
+    ]);
+    const request = await requestFor(repo, {
+      question: "Inspect repository behavior.",
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: {
+          path: "vision.md",
+          sha256: "c".repeat(64),
+          priorities: ["ledger", "shipping"],
+          non_goals: ["forbidden"],
+        },
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("priority-order-first", request);
+    const changed = {
+      ...request,
+      context: {
+        ...request.context,
+        vision: { ...(request.context!.vision as any), priorities: ["shipping", "ledger"] },
+      },
+    };
+    const result = await worker.analyze("priority-order-changed", changed);
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    expect(packets[0].selectedPaths.slice(0, 2)).toEqual(["src/ledger.ts", "src/shipping.ts"]);
+    expect(packets[1].selectedPaths.slice(0, 2)).toEqual(["src/shipping.ts", "src/ledger.ts"]);
+    expect(result.cache.hit).toBe(false);
+    expect(result.analyzedRepository).toEqual({
+      identity: request.repository.identity,
+      revision: request.repository.revision,
+      tree: request.repository.tree,
+    });
+    expect(llm.discoveryCalls).toHaveLength(0);
+  });
+
+  for (const fixture of [
+    { heading: "Non-goals: database migrations", goals: { priorities: [], objectives: [] } },
+    { heading: "Garde-fous : database migrations", goals: {} },
+    {
+      heading: "禁止事项：database schema migrations storage replication transactions",
+      goals: { priorities: [], objectives: [] },
+    },
+  ]) {
+    test(`unclassified sections do not become positive autonomy retrieval topics: ${fixture.heading}`, async () => {
+      const repo = createRepository();
+      const desiredPath = "src/CatalogSearchFilteringPagination.ts";
+      const databasePaths = Array.from(
+        { length: 6 },
+        (_, index) => `src/DatabaseSchemaMigrationsStorageReplicationTransactions${index}.ts`,
+      );
+      for (const path of [desiredPath, ...databasePaths])
+        writeFileSync(join(repo, path), "export const fixture = true;\n");
+      git(repo, ["add", "."]);
+      git(repo, [
+        "-c",
+        "user.name=PushPals Test",
+        "-c",
+        "user.email=pushpals@example.invalid",
+        "commit",
+        "-m",
+        "unclassified vision sections",
+      ]);
+      const vision = {
+        path: "vision.md",
+        sha256: "c".repeat(64),
+        one_sentence: "A useful product.",
+        ...fixture.goals,
+        non_goals: ["Do not change database migrations."],
+        guardrails: ["Preserve database storage contracts."],
+        constraints: ["No database replication redesign."],
+        sections: [
+          {
+            number: "1",
+            title: fixture.heading,
+            markdown:
+              "Database schema migrations storage replication transactions are out of scope.",
+          },
+        ],
+      };
+      const request = await requestFor(repo, {
+        question: "Improve catalog search filtering pagination.",
+        context: { operation: "analyze_autonomy_opportunities", vision },
+      });
+      const llm = new FakeLlm(emptyAutonomyResponse);
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: new InMemoryMemoryStore(),
+        llm,
+        logger: quietLogger,
+      });
+      const result = await worker.analyze("unclassified-sections-first", request);
+      const first = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content);
+      // Neither absent positive goals nor a neutral summary makes negative
+      // headings/body stronger than the caller's concrete retrieval question.
+      expect(first.evidencePacket.selectedPaths[0]).toBe(desiredPath);
+      expect(first.request.context.vision).toMatchObject({
+        one_sentence: vision.one_sentence,
+        priorities: [],
+        objectives: [],
+        non_goals: vision.non_goals,
+        guardrails: vision.guardrails,
+        constraints: vision.constraints,
+        sections: [{ number: "1", title: fixture.heading }],
+      });
+      for (let page = 1; page < result.discoveryProgress!.pageCount; page++)
+        await worker.analyze(`unclassified-sections-${page}`, request);
+      const packets = llm.analysisCalls.map(
+        (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+      );
+      const selected = packets.flatMap((packet) => packet.selectedPaths as string[]);
+      expect(new Set(selected).size).toBe(selected.length);
+      for (const path of [desiredPath, ...databasePaths]) expect(selected).toContain(path);
+      expect(packets.every((packet) => packet.selectedPaths.length <= 6)).toBe(true);
+      expect(llm.discoveryCalls).toHaveLength(0);
+    });
+  }
+
+  test("autonomy without positive goals preserves exact caller-path precedence", async () => {
+    const repo = createRepository();
+    const exactPaths = ["src/Exact00.ts", "src/Exact01.ts", "src/Exact02.ts"];
+    const desiredPath = "src/CatalogSearchFilteringPagination.ts";
+    for (const path of [...exactPaths, desiredPath, "src/Database.ts"])
+      writeFileSync(join(repo, path), "export const fixture = true;\n");
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "exact caller retrieval paths",
+    ]);
+    const request = await requestFor(repo, {
+      // Autonomy normalizes away unkeyed transient context.targetPaths. Put
+      // explicit caller paths in the keyed question, which survives that fence.
+      question: `Improve catalog search filtering pagination. Inspect ${exactPaths.join(", ")} before choosing a change.`,
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: {
+          path: "vision.md",
+          sha256: "c".repeat(64),
+          sections: [{ number: "1", title: "Guardrails: database" }],
+        },
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("unclassified-sections-exact", request);
+    const packet = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content).evidencePacket;
+    expect(packet.seedPaths).toContain(exactPaths[0]);
+    expect(packet.seedPaths).toContain(exactPaths[1]);
+    expect(packet.selectedPaths.slice(0, 2)).toEqual([exactPaths[2], desiredPath]);
+  });
+
   test("advances grounded empty pages across restart and preserves an exact positive cache", async () => {
     const repo = createCoverageRepository();
     const request = await coverageRequest(repo);

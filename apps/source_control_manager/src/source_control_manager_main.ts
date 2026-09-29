@@ -63,6 +63,7 @@ import {
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
+import { resolveTrustedDependencyArtifactCache } from "./dependency_artifact_cache";
 import {
   parseCompletionPositiveAck,
   postCompletionCallbackWithRetry,
@@ -98,6 +99,7 @@ import {
 } from "./publication_recovery";
 import {
   createTrustedValidationProgressLogger,
+  createTrustedValidationSubstepLogger,
   normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
   runProcessWithTreeTimeout,
@@ -1758,6 +1760,10 @@ async function tick(): Promise<void> {
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: validationCommandsJson,
+            artifactCacheDir: resolveTrustedDependencyArtifactCache({
+              repoRoot,
+              configRoot: runtimeConfig.repoPath,
+            }),
             invariantContext:
               trustedValidationBaselineSha && trustedValidationCandidateSha
                 ? {
@@ -1770,6 +1776,14 @@ async function tick(): Promise<void> {
               healthTracker.progress(trustedValidationHealthPhase(event), completion.id);
               logValidationProgress(event);
             },
+            // Child text is observation-only: it cannot reset the SCM stall
+            // clock or extend a command/claim deadline by printing markers.
+            onSubstep: createTrustedValidationSubstepLogger({
+              jobId: completion.jobId,
+              completionId: completion.id,
+              commitSha: completion.commitSha,
+              candidateSha: trustedValidationCandidateSha,
+            }),
           });
           const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
           const terminalResults = new Set(validationOutcome.terminalResults);

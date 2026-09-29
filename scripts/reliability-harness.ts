@@ -55,6 +55,9 @@ const phases: HarnessPhase[] = [
       "tests/client.pushpals-api.test.ts",
       "tests/server.completions-queue.test.ts",
       "tests/source-control-manager.trusted-validation.test.ts",
+      "tests/source-control-manager.dependency-artifact-cache.test.ts",
+      "tests/source-control-manager.validation-substeps.test.ts",
+      "tests/shared.validation-substeps.test.ts",
       "tests/workerpals.session-events.test.ts",
     ],
     timeoutMs: 120_000,
@@ -119,10 +122,16 @@ const phases: HarnessPhase[] = [
   },
   {
     name: "worker_watchdog",
-    files: ["apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py"],
+    files: [
+      "apps/workerpals/src/backends/shared/test_settings_resolver.py",
+      "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
+    ],
     command: [
       process.env.PYTHON?.trim() || "python",
       "-u",
+      "-m",
+      "unittest",
+      "apps/workerpals/src/backends/shared/test_settings_resolver.py",
       "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
     ],
     timeoutMs: 300_000,

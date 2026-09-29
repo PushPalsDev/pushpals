@@ -1154,7 +1154,7 @@ describe("bounded autonomy discovery followups", () => {
       expect(engine.discoveryFollowupTimer).toBeNull();
       const nextWindow = { ...progress, nextWindowAvailable: true };
       engine.scheduleDiscoveryFollowup(nextWindow, engine.schedulingGeneration);
-      expect(timers.get(engine.discoveryFollowupTimer)?.delay).toBe(30_000);
+      expect(timers.get(engine.discoveryFollowupTimer)?.delay).toBe(5_000);
       expect(engine.discoveryFollowupAttemptsRemaining).toBe(15);
       fire(engine.discoveryFollowupTimer);
       for (const override of [
@@ -1176,7 +1176,7 @@ describe("bounded autonomy discovery followups", () => {
     });
   });
 
-  test("schedules one 30s followup with earliest-next-tick telemetry and bounded attempts", async () => {
+  test("schedules one 5s idle followup with earliest-next-tick telemetry and unchanged bounded attempts", async () => {
     await withCapturedAutonomyTimers(({ timers, fire }) => {
       const engine = discoveryTestEngine() as any;
       const calls: unknown[][] = [];
@@ -1187,7 +1187,7 @@ describe("bounded autonomy discovery followups", () => {
       const generation = engine.schedulingGeneration;
       engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
       const first = engine.discoveryFollowupTimer;
-      expect(timers.get(first)?.delay).toBe(30_000);
+      expect(timers.get(first)?.delay).toBe(5_000);
       expect(engine.nextTickAtMs).toBe(engine.discoveryFollowupAtMs);
       expect(engine.nextTickAtMs).toBeLessThan(engine.baselineNextTickAtMs);
       engine.scheduleDiscoveryFollowup(durableDiscoveryProgress, generation);
@@ -1257,7 +1257,7 @@ describe("bounded autonomy discovery followups", () => {
           ...(scenario === "ineligible" ? { retryEligible: false } : {}),
         };
         if (scenario === "backoff") engine.dispatchBackoffUntilMs = Date.now() + 60_000;
-        if (scenario === "earlier_baseline") engine.baselineNextTickAtMs = Date.now() + 20_000;
+        if (scenario === "earlier_baseline") engine.baselineNextTickAtMs = Date.now() + 2_000;
         engine.scheduleDiscoveryFollowup(progress, engine.schedulingGeneration);
         expect(engine.discoveryFollowupTimer).toBeNull();
         engine.stop();
@@ -1312,6 +1312,9 @@ describe("bounded autonomy discovery followups", () => {
     "unknown_load",
     "offline",
     "missing_publication",
+    "publication_backlog",
+    "pending_job",
+    "busy_workers",
     "expired_claim",
     "global_budget",
     "max_concurrent",
@@ -1328,6 +1331,9 @@ describe("bounded autonomy discovery followups", () => {
     const load = healthyDiscoveryLoad();
     if (scenario === "offline") load.workers = { total: 1, online: 0, idle: 0, busy: 0 };
     if (scenario === "missing_publication") load.discoveryCapacityVerified = false;
+    if (scenario === "publication_backlog") load.publication.backlog = 2;
+    if (scenario === "pending_job") load.jobs.pending = 1;
+    if (scenario === "busy_workers") load.workers = { total: 1, online: 1, idle: 0, busy: 1 };
     if (scenario === "expired_claim") load.publication.expiredClaims = 1;
     engine.fetchWorkerLoadSnapshot = async () => (scenario === "unknown_load" ? null : load);
     const snapshot: any = makeSnapshot();

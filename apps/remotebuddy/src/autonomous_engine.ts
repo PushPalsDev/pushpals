@@ -329,7 +329,10 @@ const IDEATION_RETRY_MAX_TOKENS = 900;
 const IDEATION_NORMAL_MAX_CANDIDATES = 5;
 const STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 const STARTUP_FAST_TICK_MAX_DELAY_MS = 15_000;
-const DISCOVERY_FOLLOWUP_DELAY_MS = 30_000;
+// Only durable empty-page progress with verified idle capacity reaches this
+// timer. Recheck all capacity, publication, and budget gates on every tick;
+// shortening the wait must not raise the bounded number of provider attempts.
+const DISCOVERY_FOLLOWUP_DELAY_MS = 5_000;
 const DISCOVERY_FOLLOWUP_MAX_ATTEMPTS = 16;
 const STARTUP_STALE_LOCK_AFTER_MS = 30_000;
 const VISION_DOC_FNAME = "vision.md";

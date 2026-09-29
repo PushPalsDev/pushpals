@@ -29,6 +29,7 @@ if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
 from executor_base import (
+    _has_executor_validation_ownership,
     Logger,
     SettingsResolver,
     build_settings_resolver,
@@ -1185,7 +1186,7 @@ def _build_no_edit_recovery_guidance(
         "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
         "Do not repeat the same read/search sequence from the previous attempt. Re-reading the target without editing is a failed recovery.",
         "Runtime/dependency artifacts such as node_modules, outputs, .worktrees, .codex, dist, build, and coverage do not count as progress.",
-        "Run at most one focused fast validation check before final diff review; let PushPals ValidationGate own long required/browser validation.",
+        "After editing, prefer one focused fast check. Hand long required/browser validation to PushPals only when the enabled host-derived ownership contract explicitly assigns it; otherwise perform required checks where possible or report unmet requirements. Never assume an automatic runner from this recovery guidance.",
     ]
     if final_attempt:
         lines[0] = (
@@ -1558,7 +1559,7 @@ def _build_rollout_recovery_guidance(
         "If the requested or hinted file/path is absent, treat it as a stale hint: choose an existing repo-native owner or existing test nearby instead of creating PushPals/autonomy-specific scaffolding.",
         "For web review or shell-validation work, prefer an existing browser/e2e script, route shell, or navigation surface over generic autonomy infrastructure.",
         "Avoid broad React Native render harnesses and shared mock expansion unless the repo already has that stable infrastructure and the task explicitly asks for it.",
-        "After the first patch, run one focused fast check or stop with a concise final update so ValidationGate can run the expensive suite.",
+        "After the first patch, prefer one focused fast check. Defer the expensive suite only when the enabled host-derived ownership contract explicitly assigns it to PushPals; otherwise perform required checks where possible or report unmet requirements. Never assume an automatic runner from this recovery guidance.",
     ]
     if artifact_only_paths:
         lines.append(f"Only non-publishable artifact paths changed so far: {artifact_only_paths}.")
@@ -3286,12 +3287,16 @@ def _run_codex_task(
     execution_deadline_monotonic: Optional[float] = None,
     resume_thread_id: Optional[str] = None,
     usage_attempts: Optional[List[Dict[str, Any]]] = None,
+    automatic_validation_handoff: bool = False,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
     _INTERRUPTED_SIGNAL = None
     _install_signal_handlers()
     if usage_attempts is None:
         usage_attempts = []
+    # Only the host-derived structured contract can authorize an early
+    # successful handoff. Planner/recovery prose is not gate configuration.
+    automatic_validation_handoff = automatic_validation_handoff is True
 
     if not _is_git_repo(repo):
         return {
@@ -3943,7 +3948,7 @@ def _run_codex_task(
                                     f"{', '.join(missing_artifacts)} content; allowing Codex to "
                                     "continue instead of stopping early."
                                 )
-                            else:
+                            elif automatic_validation_handoff:
                                 publishable_progress_finalized = True
                                 log.info(
                                     "No-edit watchdog observed durable publishable file changes "
@@ -4129,6 +4134,25 @@ def _run_codex_task(
                 effective_paths = list(paths_hint)
             last_message = _read_text_if_exists(last_message_path)
             log_git_status(repo, log)
+            if not automatic_validation_handoff:
+                return {
+                    "ok": False,
+                    "summary": "openai_codex retained partial changes without an automatic validation handoff",
+                    "stdout": _truncate(_build_success_stdout(
+                        effective_paths=effective_paths,
+                        last_message=last_message,
+                        trace_excerpt=trace_excerpt,
+                        prefix="Codex stopped with partial changes. Validation remains executor-owned or unmet; no automatic final gate is configured, so these changes are not reported as successful execution.",
+                    )),
+                    "stderr": _truncate(stderr),
+                    "exitCode": 124,
+                    "usage": usage,
+                    "candidateState": {
+                        "status": "partial",
+                        "reason": "validation_handoff_unavailable",
+                        "changedPaths": effective_paths,
+                    },
+                }
             return {
                 "ok": True,
                 "summary": summary,
@@ -4189,6 +4213,7 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                     usage_attempts=usage_attempts,
+                    automatic_validation_handoff=automatic_validation_handoff,
                 )
             _, _, rollout_effective_paths = _codex_changed_paths(
                 repo,
@@ -4222,8 +4247,11 @@ def _run_codex_task(
                     "Rollout coach exhausted its recovery attempts, but publishable file "
                     "changes remain "
                     f"({_describe_publishable_paths(rollout_effective_paths)}); stopping "
-                    "Codex so QualityGate/ValidationGate can evaluate the patch instead "
-                    "of failing the executor before validation."
+                    + (
+                        "Codex so the configured final gate can evaluate the patch."
+                        if automatic_validation_handoff else
+                        "Codex with a non-passing partial candidate because no automatic final gate is configured."
+                    )
                 )
                 return _return_publishable_progress_for_quality_gate(
                     summary=(
@@ -4313,6 +4341,7 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                     usage_attempts=usage_attempts,
+                    automatic_validation_handoff=automatic_validation_handoff,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):
@@ -4362,6 +4391,7 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                     usage_attempts=usage_attempts,
+                    automatic_validation_handoff=automatic_validation_handoff,
                 )
             detail = "Codex spent too much of the execution budget without producing publishable file changes."
             if trace_excerpt:
@@ -4496,7 +4526,7 @@ def _run_codex_task(
                         "usage": usage,
                     }
 
-            if effective_paths and credible_progress:
+            if effective_paths and credible_progress and automatic_validation_handoff:
                 command_lines = (
                     "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
                     if rejected_shell_wrappers
@@ -4579,6 +4609,7 @@ def _run_codex_task(
                         execution_deadline_monotonic=overall_deadline,
                         resume_thread_id=recovery_thread_id or None,
                         usage_attempts=usage_attempts,
+                        automatic_validation_handoff=automatic_validation_handoff,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                     if wrapper_recovery_attempt == 0 and retry_result.get("ok"):
@@ -4599,6 +4630,12 @@ def _run_codex_task(
                         )
                     return retry_result
             if effective_paths:
+                if not automatic_validation_handoff:
+                    return _return_publishable_progress_for_quality_gate(
+                        summary="Partial patch after command-policy recovery",
+                        prefix="Command-policy recovery ended before executor-owned validation completed.",
+                        paths_hint=effective_paths,
+                    )
                 command_lines = (
                     "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
                     if rejected_shell_wrappers
@@ -4696,6 +4733,7 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                     usage_attempts=usage_attempts,
+                    automatic_validation_handoff=automatic_validation_handoff,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):
@@ -4787,6 +4825,10 @@ def main() -> int:
             task.instruction,
             task.supplemental_guidance,
             usage_attempts=usage_attempts,
+            automatic_validation_handoff=(
+                _has_executor_validation_ownership(task.params)
+                and task.params["executorValidationOwnership"]["owner"] == "pushpals_after_edit"
+            ),
         )
     except Exception as exc:
         result = {

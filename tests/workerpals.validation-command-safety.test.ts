@@ -3,8 +3,10 @@ import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { runBoundedProcess } from "../packages/shared/src/bounded_process";
 import {
   buildBunDependencyLayoutPreflightFailureRun,
+  buildExecutorValidationOwnership,
   buildValidationExecutionDag,
   buildValidationExecutionPlan,
   bunDependencySnapshotKey,
@@ -90,6 +92,417 @@ async function runGit(repo: string, args: string[]): Promise<string> {
 }
 
 describe("workerpals validation command safety", () => {
+  test.skipIf(process.platform === "win32")(
+    "ownership inspection never opens FIFO scripts or manifests, even with disabled gates",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-validation-inspection-fifo-"));
+      try {
+        mkdirSync(join(root, "scripts"));
+        const child = join(root, "inspect.ts");
+        writeFileSync(
+          child,
+          `import { buildExecutorValidationOwnership } from ${JSON.stringify(new URL("../apps/workerpals/src/execute_job.ts", import.meta.url).href)};\nconst result=buildExecutorValidationOwnership(process.argv[2],JSON.parse(process.argv[3]),process.argv[4]==='true');\nconsole.log(JSON.stringify(result.postEditCommands.map(node=>node.command)));\n`,
+        );
+        const params = {
+          instruction: "Rename a constant",
+          planning: planningFixture({
+            acceptanceCriteria: [],
+            validationSteps: ["bun run validate"],
+            requiredValidationSteps: [],
+          }),
+        };
+        for (const kind of ["script", "manifest", "vision"]) {
+          const manifest = join(root, "package.json");
+          if (existsSync(manifest)) rmSync(manifest);
+          writeFileSync(
+            manifest,
+            JSON.stringify({ scripts: { validate: "bun scripts/check.ts" } }),
+          );
+          const fifo =
+            kind === "script"
+              ? join(root, "scripts/check.ts")
+              : kind === "manifest"
+                ? manifest
+                : join(root, "vision.md");
+          if (existsSync(fifo)) rmSync(fifo);
+          const created = await runBoundedProcess(["mkfifo", fifo], {
+            cwd: root,
+            timeoutMs: 1_000,
+          });
+          expect(created.exitCode).toBe(0);
+          for (const enabled of [false, true]) {
+            const inspected = await runBoundedProcess(
+              [process.execPath, child, root, JSON.stringify(params), String(enabled)],
+              {
+                cwd: root,
+                timeoutMs: 2_000,
+                outputLimitBytes: 32_000,
+                env: { ...process.env, PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable" },
+              },
+            );
+            expect(inspected.timedOut).toBe(false);
+            if (kind === "vision") {
+              expect(inspected.exitCode).not.toBe(0);
+              expect(inspected.stderr).toContain(
+                "Cannot safely inspect vision.md validation requirements",
+              );
+            } else {
+              expect(inspected.exitCode).toBe(0);
+              expect(JSON.parse(inspected.stdout)).toEqual(["bun run validate"]);
+            }
+          }
+          rmSync(fifo);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  test("bounds large script evidence while retaining commands and refuses incomplete required vision", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-inspection-large-"));
+    const previous = process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+    try {
+      process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = "unavailable";
+      mkdirSync(join(root, "scripts"));
+      writeFileSync(
+        join(root, "scripts/check.ts"),
+        "// requires docker daemon\n" + "x".repeat(2 * 1024 * 1024),
+      );
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({ scripts: { validate: "bun scripts/check.ts" } }),
+      );
+      const params = {
+        instruction: "Rename a constant",
+        planning: planningFixture({
+          validationSteps: ["bun run validate"],
+          requiredValidationSteps: [],
+        }),
+      };
+      for (const enabled of [false, true]) {
+        const contract = buildExecutorValidationOwnership(root, params, enabled);
+        expect(contract.postEditCommands).toEqual([
+          expect.objectContaining({ command: "bun run validate", capability: "trusted_host" }),
+        ]);
+      }
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: { validate: "bun scripts/check.ts" },
+          large: "x".repeat(512_000),
+        }),
+      );
+      expect(buildExecutorValidationOwnership(root, params, false).postEditCommands).toEqual([
+        expect.objectContaining({ command: "bun run validate", capability: "worker" }),
+      ]);
+      writeFileSync(join(root, "vision.md"), "x".repeat(1_048_577));
+      expect(() => buildExecutorValidationOwnership(root, params, false)).toThrow(
+        "Cannot safely inspect vision.md validation requirements",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+      else process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("script inspection respects repository containment but permits native monorepo parent references", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-inspection-containment-"));
+    const previous = process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+    try {
+      process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = "unavailable";
+      const repo = join(root, "repo");
+      const outside = join(root, "outside");
+      mkdirSync(join(repo, "apps/pkg"), { recursive: true });
+      mkdirSync(join(repo, "scripts"));
+      mkdirSync(outside);
+      writeFileSync(join(repo, "scripts/check.ts"), "// requires docker daemon\n");
+      writeFileSync(join(outside, "check.ts"), "// requires docker daemon\n");
+      writeFileSync(
+        join(repo, "apps/pkg/package.json"),
+        JSON.stringify({ scripts: { validate: "bun ../../scripts/check.ts" } }),
+      );
+      expect(validationCommandRequiresDockerDaemon(repo, "bun --cwd apps/pkg run validate")).toBe(
+        true,
+      );
+      symlinkSync(outside, join(repo, "linked"), process.platform === "win32" ? "junction" : "dir");
+      for (const script of ["bun linked/check.ts", "bun ../outside/check.ts"]) {
+        writeFileSync(
+          join(repo, "package.json"),
+          JSON.stringify({ scripts: { validate: script } }),
+        );
+        const contract = buildExecutorValidationOwnership(
+          repo,
+          {
+            instruction: "Rename a constant",
+            planning: planningFixture({
+              validationSteps: ["bun run validate"],
+              requiredValidationSteps: [],
+            }),
+          },
+          false,
+        );
+        expect(contract.postEditCommands).toEqual([
+          expect.objectContaining({ command: "bun run validate", capability: "worker" }),
+        ]);
+      }
+      if (process.platform !== "win32") {
+        // Final-component symlinks are not read, including ones whose target
+        // is inside the checkout; inspection is regular-file-only.
+        symlinkSync(join(repo, "scripts/check.ts"), join(repo, "alias.ts"));
+        writeFileSync(
+          join(repo, "package.json"),
+          JSON.stringify({ scripts: { validate: "bun alias.ts" } }),
+        );
+        expect(validationCommandRequiresDockerDaemon(repo, "bun run validate")).toBe(false);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+      else process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("separates edit-turn checks from unchanged required aggregate and worker gates", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-"));
+    const previousCapability = process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+    try {
+      process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = "unavailable";
+      mkdirSync(join(root, "tests"));
+      writeFileSync(join(root, "tests/catalog.test.ts"), 'import { test } from "bun:test";\n');
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: { test: "bun test", validate: "bun run test && docker ps" },
+        }),
+      );
+      const planning = planningFixture({
+        targetPaths: ["tests/catalog.test.ts"],
+        validationSteps: ["bun run test"],
+        requiredValidationSteps: ["bun run validate"],
+      });
+      const before = JSON.stringify(planning);
+      const contract = buildExecutorValidationOwnership(
+        root,
+        { instruction: "Fix catalog", planning },
+        true,
+      );
+      expect(contract.owner).toBe("pushpals_after_edit");
+      expect(contract.focusedCommands).toEqual(["bun test ./tests/catalog.test.ts"]);
+      expect(contract.requiredSteps).toEqual(["bun run validate"]);
+      expect(contract.postEditCommands).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ command: "bun run validate", capability: "trusted_host" }),
+          expect.objectContaining({ command: "bun run test", capability: "worker" }),
+        ]),
+      );
+      expect(JSON.stringify(planning)).toBe(before);
+      // Suggestions are not injected into or used to prune deterministic gate inputs.
+      expect(
+        collectQualityGateValidationCommands({
+          instruction: "Fix catalog",
+          planning: planning as any,
+          changedTestPaths: [],
+          isTestTask: false,
+          repo: root,
+        }).commandsToRun,
+      ).toEqual(expect.arrayContaining(["bun run validate", "bun run test"]));
+    } finally {
+      if (previousCapability === undefined) delete process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY;
+      else process.env.PUSHPALS_WORKER_DOCKER_CAPABILITY = previousCapability;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("derives required commands from vision and avoids invented focused targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-vision-"));
+    try {
+      writeFileSync(
+        join(root, "vision.md"),
+        "# Vision\n\n## Testing criteria\n- Run `bun run validate` before publication.\n",
+      );
+      const planning = planningFixture({
+        targetPaths: ["tests/missing.test.ts", "../outside.test.ts"],
+        validationSteps: ["bun test"],
+      });
+      const contract = buildExecutorValidationOwnership(
+        root,
+        { instruction: "Improve catalog", planning },
+        true,
+      );
+      expect(contract.focusedCommands).toEqual([]);
+      expect(contract.requiredSteps).toContain("bun run validate");
+      expect(contract.postEditCommands.map((node) => node.command)).toContain("bun test");
+      expect(
+        buildExecutorValidationOwnership(root, { instruction: "Improve catalog", planning }, false)
+          .owner,
+      ).toBe("executor");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains native owner suites in the gate without calling them focused edit checks", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-native-"));
+    try {
+      mkdirSync(join(root, "tests"));
+      writeFileSync(join(root, "tests/catalog.test.ts"), 'import { test } from "vitest";\n');
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({ packageManager: "pnpm@10.0.0", scripts: { test: "vitest run" } }),
+      );
+      const planning = planningFixture({
+        targetPaths: ["tests/catalog.test.ts"],
+        validationSteps: ["bun test ./tests/catalog.test.ts"],
+        requiredValidationSteps: ["pnpm run test"],
+      });
+      const contract = buildExecutorValidationOwnership(
+        root,
+        { instruction: "Fix catalog", planning },
+        true,
+      );
+      expect(contract.focusedCommands).toEqual([]);
+      expect(contract.requiredSteps).toEqual(["pnpm run test"]);
+      expect(contract.postEditCommands.map((node) => node.command)).toEqual(["pnpm run test"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses unsafe shell text in synthesized existing-file suggestions", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-metachar-"));
+    try {
+      mkdirSync(join(root, "tests"));
+      for (const name of [
+        "semi;name.test.ts",
+        "amp&name.test.ts",
+        "$VAR.test.ts",
+        "`whoami`.test.ts",
+        "quo'te.test.ts",
+        "group(foo).test.ts",
+        "bracket[ab].test.ts",
+        "brace{a,b}.test.ts",
+        "caret^name.test.ts",
+        "~name.test.ts",
+      ]) {
+        const target = `tests/${name}`;
+        writeFileSync(join(root, target), 'import { test } from "bun:test";\n');
+        const planning = planningFixture({
+          targetPaths: [target],
+          validationSteps: ["bun run test"],
+        });
+        const contract = buildExecutorValidationOwnership(
+          root,
+          { instruction: "Fix catalog", planning },
+          true,
+        );
+        expect(contract.focusedCommands).toEqual([]);
+        expect(contract.postEditCommands.map((node) => node.command)).toEqual(["bun run test"]);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not treat test option operands as focused selectors or change gate commands", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-options-"));
+    try {
+      mkdirSync(join(root, "tests"));
+      writeFileSync(join(root, "tests/setup.ts"), 'import { test } from "bun:test";\n');
+      writeFileSync(join(root, "preload.ts"), "export {};\n");
+      writeFileSync(join(root, "tests/catalog.test.ts"), 'import { test } from "bun:test";\n');
+      const commands = [
+        "bun test --preload ./tests/setup.ts",
+        "bun test --coverage-dir ./coverage",
+        "bun test --preload ./tests/catalog.test.ts",
+        "bun test --test-name-pattern ./tests/catalog.test.ts",
+        "bun test --preload=./tests/catalog.test.ts",
+        "bun test --unknown-option ./tests/catalog.test.ts",
+      ];
+      for (const command of commands) {
+        const planning = planningFixture({ validationSteps: [command] });
+        const before = collectQualityGateValidationCommands({
+          instruction: "Fix catalog",
+          planning: planning as any,
+          changedTestPaths: [],
+          isTestTask: isTestFocusedTask("Fix catalog", planning as any),
+          repo: root,
+        });
+        const contract = buildExecutorValidationOwnership(
+          root,
+          { instruction: "Fix catalog", planning },
+          true,
+        );
+        expect(contract.focusedCommands).toEqual([]);
+        expect(contract.postEditCommands.map((node) => node.command)).toEqual(before.commandsToRun);
+      }
+      for (const command of [
+        "bun test --preload ./preload.ts ./tests/catalog.test.ts",
+        "bun test --timeout 5000 ./tests/catalog.test.ts",
+        "bun test --test-name-pattern=catalog ./tests/catalog.test.ts",
+      ]) {
+        const planning = planningFixture({ validationSteps: [command] });
+        const contract = buildExecutorValidationOwnership(
+          root,
+          { instruction: "Fix catalog", planning },
+          true,
+        );
+        expect(contract.focusedCommands).toEqual([command]);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("omits over-budget focused commands without truncating or dropping final gates", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-command-budget-"));
+    try {
+      writeFileSync(join(root, "catalog.test.ts"), 'import { test } from "bun:test";\n');
+      const command = `bun test ./catalog.test.ts --test-name-pattern ${"x".repeat(500)}`;
+      const planning = planningFixture({ validationSteps: [command] });
+      const contract = buildExecutorValidationOwnership(
+        root,
+        { instruction: "Fix catalog", planning },
+        true,
+      );
+      expect(command.length).toBeGreaterThan(500);
+      expect(contract.focusedCommands).toEqual([]);
+      expect(contract.postEditCommands.map((node) => node.command)).toEqual([command]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not synthesize Bun checks for unknown runners or test-support artifacts", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-ownership-unknown-"));
+    try {
+      mkdirSync(join(root, "tests"));
+      for (const file of ["unknown.test.ts", "helpers.ts", "fixture.json", "test_catalog.py"]) {
+        writeFileSync(join(root, "tests", file), "# runner intentionally unspecified\n");
+      }
+      const planning = planningFixture({
+        targetPaths: [
+          "tests/unknown.test.ts",
+          "tests/helpers.ts",
+          "tests/fixture.json",
+          "tests/test_catalog.py",
+        ],
+        validationSteps: ["bun run test"],
+      });
+      const contract = buildExecutorValidationOwnership(
+        root,
+        { instruction: "Fix catalog", planning },
+        true,
+      );
+      expect(contract.focusedCommands).toEqual([]);
+      expect(contract.postEditCommands.map((node) => node.command)).toEqual(["bun run test"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("tokenizes quoted argv without using shell interpolation", () => {
     const argv = tokenizeValidationCommandArgv(
       'bun --cwd "apps/localbuddy" test tests/localbuddy.request-status.test.ts',

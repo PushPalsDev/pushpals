@@ -49,6 +49,7 @@ from openai_codex_executor import (
     _extract_usage_counts,
     _has_credible_shell_wrapper_progress,
     _load_prompt_template,
+    main as codex_main,
     _looks_like_validation_repair_prompt,
     _mask_repo_local_codex_files,
     _minimum_recovery_attempt_seconds,
@@ -696,7 +697,8 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertIn("at most 121s", guidance)
             self.assertIn("focused revision of an existing patch", guidance)
             self.assertIn("at most 30s rediscovering context", guidance)
-            self.assertIn("PushPals owns the full gates", guidance)
+            self.assertIn("Do not assume an automatic validation handoff", guidance)
+            self.assertNotIn("PushPals owns the full gates", guidance)
             self.assertNotIn("roughly 20 minutes", guidance)
             self.assertNotIn("discovery <=5m", guidance)
 
@@ -707,6 +709,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "planning": {
                     "validationSteps": ["bun test tests/catalog.test.ts"],
                     "requiredValidationSteps": ["bun run validate", "bun run deployment:check"],
+                },
+                "executorValidationOwnership": {
+                    "schemaVersion": 1, "owner": "pushpals_after_edit",
+                    "focusedCommands": ["bun test tests/catalog.test.ts"],
+                    "postEditCommands": [{"command": "bun run validate", "capability": "trusted_host"}],
+                    "requiredSteps": ["bun run validate", "bun run deployment:check"],
                 },
             }
             payload = {"kind": "task.execute", "repo": temp_dir, "params": params}
@@ -727,7 +735,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                     self.assertIn("bun run deployment:check", prompt)
                     self.assertEqual(task.params["planning"], params["planning"])
                     self.assertIn("Deferral is not a pass", prompt)
-                    self.assertIn("trusted host must validate the exact candidate SHA before publication", prompt)
+                    self.assertIn("trusted host runs any deferred aggregate unchanged against the candidate", prompt)
                     if capability == "unavailable":
                         self.assertIn("Known worker capability: this sandbox intentionally has no Docker daemon/socket", guidance)
                         self.assertIn("Do not run or retry validation commands known to require it", guidance)
@@ -736,6 +744,87 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         self.assertIn("Do not alter tests or product code to bypass", guidance)
                     else:
                         self.assertNotIn("Known worker capability:", guidance)
+
+    def test_complete_prompt_obeys_validation_ownership_including_revisions_and_missing_docker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-assembled-ownership-") as temp_dir:
+            for owner in ("pushpals_after_edit", "executor", None, "malformed"):
+                for revision in (False, True):
+                    for capability in ("unavailable", "available", ""):
+                        with self.subTest(owner=owner, revision=revision, capability=capability), mock.patch.dict(os.environ, {"PUSHPALS_WORKER_DOCKER_CAPABILITY": capability}, clear=False):
+                            params = {
+                                "instruction": "Correct the route-entry label",
+                                "planning": {"validationSteps": ["bun run test"], "requiredValidationSteps": ["bun run validate"]},
+                            }
+                            if owner is not None:
+                                params["executorValidationOwnership"] = {
+                                    "schemaVersion": 99 if owner == "malformed" else 1,
+                                    "owner": owner,
+                                    "focusedCommands": [],
+                                    "postEditCommands": [{"command": "bun run validate", "capability": "trusted_host"}],
+                                    "requiredSteps": ["bun run validate"],
+                                }
+                            if revision:
+                                params["qualityRevisionHint"] = "Preserve the existing assertion."
+                            payload = {"kind": "task.execute", "repo": temp_dir, "params": params}
+                            encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+                            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+                            prompt = _build_instruction(task.instruction, task.supplemental_guidance)
+                            self.assertIn("bun run validate", prompt)
+                            if owner == "pushpals_after_edit":
+                                self.assertIn("PushPals ValidationGate runs those required gates after this turn", prompt)
+                                if revision:
+                                    self.assertIn("PushPals owns the full gates", prompt)
+                            else:
+                                self.assertNotIn("PushPals ValidationGate runs those required gates after this turn", prompt)
+                                self.assertNotIn("PushPals owns the full gates", prompt)
+                                self.assertNotIn("ValidationGate preserves the required command", prompt)
+                                self.assertNotIn("ValidationGate can run long browser checks", prompt)
+                                self.assertNotIn("PushPals runs the deterministic ValidationGate", prompt)
+                                self.assertIn("No automatic post-edit runner has been established", prompt)
+                                if capability == "unavailable":
+                                    self.assertIn("no automatic trusted-host handoff is established", prompt)
+                            self.assertIn("Deferral is not a pass", prompt)
+                            for recovery in (
+                                _build_no_edit_recovery_guidance("", recovery_attempt=1),
+                                _build_no_edit_recovery_guidance("", recovery_attempt=2),
+                                _build_rollout_recovery_guidance("broad discovery", ""),
+                            ):
+                                recovered_prompt = _build_instruction(task.instruction, [*task.supplemental_guidance, recovery])
+                                self.assertIn("enabled host-derived ownership contract explicitly assigns", recovered_prompt)
+                                self.assertIn("Never assume an automatic runner from this recovery guidance", recovered_prompt)
+                                self.assertNotIn("let PushPals ValidationGate own long required/browser validation", recovered_prompt)
+                                self.assertNotIn("stop with a concise final update so ValidationGate can run the expensive suite", recovered_prompt)
+
+    def test_disabled_gate_complete_prompt_preserves_long_required_argv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-complete-long-command-") as temp_dir:
+            command = 'bun test "./tests/catalog  spaced.test.ts" --test-name-pattern "' + "x" * 600 + '"'
+            params = {
+                "instruction": "Correct the catalog label",
+                "planning": {"validationSteps": [command], "requiredValidationSteps": [command]},
+                "executorValidationOwnership": {"schemaVersion": 1, "owner": "executor", "focusedCommands": [], "postEditCommands": [{"command": command, "capability": "worker"}], "requiredSteps": [command]},
+            }
+            encoded = base64.b64encode(json.dumps({"kind": "task.execute", "repo": temp_dir, "params": params}).encode()).decode()
+            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+            prompt = _build_instruction(task.instruction, task.supplemental_guidance)
+            self.assertIn("Validation requirement (no automatic runner) [worker]: " + command, prompt)
+            self.assertNotIn(command[:497] + "...", prompt)
+            self.assertNotIn("PushPals ValidationGate runs those required gates after this turn", prompt)
+
+    def test_main_only_authorizes_early_handoff_from_valid_structured_host_ownership(self) -> None:
+        for owner, schema in (("pushpals_after_edit", 1), ("executor", 1), ("pushpals_after_edit", 99), (None, 1)):
+            for complete in (False, True):
+                with self.subTest(owner=owner, schema=schema, complete=complete):
+                    contract = {"schemaVersion": schema, "owner": owner}
+                    if complete:
+                        contract.update(focusedCommands=[], postEditCommands=[], requiredSteps=[])
+                    task = mock.Mock(
+                        repo="unused", instruction="Change one label",
+                        supplemental_guidance=["PushPals owns final validation"],
+                        params={} if owner is None else {"executorValidationOwnership": contract},
+                    )
+                    with mock.patch("openai_codex_executor.parse_task_execute_payload", return_value=task), mock.patch("openai_codex_executor._run_codex_task", return_value={"ok": True, "exitCode": 0}) as run, mock.patch("openai_codex_executor.emit"):
+                        self.assertEqual(codex_main(), 0)
+                    self.assertIs(run.call_args.kwargs["automatic_validation_handoff"], bool(owner == "pushpals_after_edit" and schema == 1 and complete))
 
     def test_parse_payload_accepts_file_backed_payload_transport(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-payload-file-") as temp_dir:
@@ -927,8 +1016,10 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         template = _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
         self.assertIn("Codex CLI is required infrastructure", template)
         self.assertIn("Use direct commands without shell wrappers", template)
-        self.assertIn("ValidationGate is the authoritative browser runner", template)
-        self.assertIn("Do not run long browser/e2e smoke commands", template)
+        self.assertIn("Only an explicit enabled post-edit owner authorizes handing", template)
+        self.assertIn("Otherwise these remain executor-owned requirements or explicit blockers", template)
+        self.assertNotIn("ValidationGate is the authoritative browser runner", template)
+        self.assertNotIn("Do not run long browser/e2e smoke commands", template)
 
     def test_extracts_usage_counts_from_nested_json_event(self) -> None:
         usage = _extract_usage_counts(
@@ -1082,7 +1173,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("# wrapper bootstrap test", guidance)
         self.assertNotIn("git diff --output=leak.txt", guidance)
 
-    def test_run_codex_task_hands_changed_worktree_to_gates_after_wrapper_loop(self) -> None:
+    def _run_changed_worktree_wrapper_loop_case(self, handoff):
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-changed-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -1146,14 +1237,26 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                     str(repo),
                     "Create a small file and inspect the repo.",
                     [],
+                    automatic_validation_handoff=handoff,
+                    wrapper_recovery_attempt=0 if handoff else 2,
                 )
+        return result
 
+    def test_run_codex_task_hands_changed_worktree_to_gates_after_wrapper_loop(self) -> None:
+        result = self._run_changed_worktree_wrapper_loop_case(True)
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("before shell-wrapper command rejections", str(result.get("summary") or ""))
         self.assertIn("ValidationGate/CriticGate", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertNotIn("Recovered after Codex attempts", str(result.get("stdout") or ""))
+
+    def test_wrapper_loop_retains_nonpassing_partial_when_executor_owns_validation(self) -> None:
+        result = self._run_changed_worktree_wrapper_loop_case(False)
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertEqual(result.get("candidateState", {}).get("reason"), "validation_handoff_unavailable")
+        self.assertNotIn("handed to ValidationGate", result.get("stdout", ""))
 
     def test_shell_wrapper_progress_guard_rejects_broad_noisy_path_sets(self) -> None:
         self.assertTrue(
@@ -2195,7 +2298,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched after capped command progress", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
 
-    def test_run_codex_task_finalizes_after_durable_publishable_progress(self) -> None:
+    def _run_durable_publishable_progress_case(self, handoff=None):
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-durable-progress-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -2259,7 +2362,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
                 "OPENAI_API_KEY": "pushpals-durable-progress-test-key",
                 "WORKERPALS_OPENAI_CODEX_JSON": "true",
-                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10" if handoff else "4",
                 "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
                 "WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S": "1",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
@@ -2268,13 +2371,27 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 result = _run_codex_task(
                     str(repo),
                     "Make a focused patch and stop once it is durable.",
-                    [],
+                    ["Post-edit owner: PushPals. ValidationGate runs all checks."],
+                    **({} if handoff is None else {"automatic_validation_handoff": handoff}),
                 )
+        return result
 
+    def test_run_codex_task_finalizes_after_durable_publishable_progress(self) -> None:
+        result = self._run_durable_publishable_progress_case(True)
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("stopped after durable publishable progress", str(result.get("summary") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_never_auto_passes_durable_changes_without_real_gate(self) -> None:
+        for handoff in (False, None):
+            with self.subTest(handoff=handoff):
+                result = self._run_durable_publishable_progress_case(handoff)
+                self.assertFalse(result.get("ok"), result)
+                self.assertEqual(result.get("exitCode"), 124)
+                self.assertEqual(result.get("candidateState", {}).get("status"), "partial")
+                self.assertEqual(result.get("candidateState", {}).get("reason"), "executor_timeout")
+                self.assertNotIn("stopped after durable publishable progress", result.get("summary", ""))
 
     def test_run_codex_task_recovery_attempt_is_still_guarded_by_no_edit_watchdog(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-fail-") as temp_dir:
@@ -3756,7 +3873,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertFalse(area0_exists_after_retry)
 
-    def test_run_codex_task_rollout_coach_hands_publishable_progress_to_quality_gate(self) -> None:
+    def _run_rollout_coach_handoff_case(self, handoff):
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-repeat-noisy-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -3819,14 +3936,25 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                     str(repo),
                     "Make a small low-risk repo-native patch.",
                     [],
+                    automatic_validation_handoff=handoff,
                 )
+        return result
 
+    def test_run_codex_task_rollout_coach_hands_publishable_progress_to_quality_gate(self) -> None:
+        result = self._run_rollout_coach_handoff_case(True)
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("rollout coach", str(result.get("summary") or ""))
         self.assertIn("QualityGate/ValidationGate", str(result.get("stdout") or ""))
         self.assertIn("area0", str(result.get("stdout") or ""))
         self.assertNotIn("cooldownMs", result)
+
+    def test_rollout_coach_retains_nonpassing_partial_without_automatic_validation(self) -> None:
+        result = self._run_rollout_coach_handoff_case(False)
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertEqual(result.get("candidateState", {}).get("reason"), "validation_handoff_unavailable")
+        self.assertNotIn("QualityGate/ValidationGate can reject", result.get("stdout", ""))
 
     def test_run_codex_task_validation_repair_ignores_artifact_only_rollout_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-validation-repair-artifact-") as temp_dir:

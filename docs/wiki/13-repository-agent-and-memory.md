@@ -287,7 +287,25 @@ returned result still passes current-snapshot validation.
 
 The worker keeps seed evidence and examines at most six additional ranked tracked
 paths per page, for at most sixteen pages per window. Each page has its own exact
-cache. Completing a window advances to the next part of the bounded ranked
+cache. For autonomy, retrieval weights explicit vision priorities ahead of general
+question vocabulary, with objectives and the one-sentence vision as weaker hints.
+Unclassified section headings and bodies are not positive autonomy retrieval
+hints, even when priorities/objectives are missing: they may describe exclusions
+or guardrails in any language. The caller question remains the relevance fallback;
+normalized section references, non-goals, guardrails, and constraints still reach
+synthesis unchanged. This does not filter those paths out of eventual coverage
+or change retrieval for non-autonomy repository questions.
+Tracked-path term frequency reduces the influence of ubiquitous vocabulary;
+camel-case and separator normalization support repository-native names without a
+product-specific dictionary. Exact caller paths stay first. A bounded 24-path
+lookahead spreads relevant evidence across directories (at most two from one
+directory per six-file page when another relevant directory is available), rather
+than letting near-neighbor filenames monopolize every initial page. Nonmatching
+paths remain in the bounded inventory, and changed ordering reconciles through the
+existing plan/blob fingerprints. This is retrieval guidance, not an assertion
+that a file contains a defect or permission to generate a task.
+
+Completing a window advances to the next part of the bounded ranked
 inventory, with a persisted window offset and bounded reviewed-blob history.
 Revisions that change earlier evidence rewind the relevant window; unrelated
 revisions need not restart the sweep. A
@@ -310,7 +328,10 @@ force candidates, add a second retrieval-model call, execute suggested checks,
 or bypass scope, validation, and review gates.
 
 RemoteBuddy can schedule a bounded, earlier follow-up after durable discovery
-progress when workers are verified idle. Unknown capacity, publication
+progress when workers are verified idle. These follow-ups wait five seconds rather
+than thirty, keep the same sixteen-attempt per-baseline budget, and reacquire the
+dispatch lock and recheck current capacity and all budgets on each tick. There is
+no concurrent or extra retrieval-model call. Unknown capacity, publication
 backpressure, dispatch backoff, failures, exhausted coverage, and disabled or
 stopped autonomy cannot create a fast discovery loop. Successful dispatch keeps
 the ordinary cadence: a newly enqueued planning request may not yet appear in
