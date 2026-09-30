@@ -41,6 +41,20 @@ Main responsibilities:
 
 ## Job Lifecycle
 
+Docker workers prove shared container, volume, and backend readiness before
+claiming new jobs, including when the optional full startup self-check is
+disabled. A probe has a 60-second work budget; positive evidence is reused for
+at most 30 seconds. Candidate dependency projection and repository hooks still
+run per job, not in the shared readiness probe.
+
+Heartbeats distinguish controller liveness from `details.executionReady`.
+Blocked workers remain alive with `status: error`, do not claim jobs, and retry
+bounded capability probes with backoff capped at five minutes. Permission or
+configuration errors do not receive immediate transient retries. Host-owned
+Docker setup errors carry a phase, retryability, and whether coding actually
+started; an infrastructure failure is not evidence that a proposed code change
+was attempted. Healthy workers remain usable when another worker is blocked.
+
 At a high level:
 
 1. Worker claims or replays a job with exact worker/generation authority.

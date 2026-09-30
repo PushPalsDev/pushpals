@@ -156,6 +156,12 @@ type Snapshot = {
   recent_objectives?: SnapshotOpenObjective[];
   executed_objectives?: SnapshotOpenObjective[];
   executed_outcome_watermark?: string;
+  execution_capability?: {
+    state: "ready" | "blocked" | "unknown";
+    reason?: string;
+    retry_after_ms?: number;
+    observed_at?: string;
+  };
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -229,6 +235,8 @@ type SnapshotOpenObjective = {
   attempt_outcome?: string | null;
   deterministic_repair_failure?: boolean;
   attempt_failure_fingerprint?: string | null;
+  execution_started?: boolean;
+  failure_class?: string | null;
   status: string;
   objective_type?: string;
   component_area?: string;
@@ -1092,6 +1100,7 @@ function isRecentWorkDiversityObjective(
   objective: SnapshotOpenObjective,
   nowMs = Date.now(),
 ): boolean {
+  if (isUnstartedAutonomyInfrastructureOutcome(objective)) return false;
   const updatedAt = Date.parse(asString(objective.updated_at));
   return (
     Number.isFinite(updatedAt) &&
@@ -6394,6 +6403,95 @@ export function autonomyIntegrationBaselineDecision(options: {
 
 const AUTONOMY_CONTROL_HTTP_TIMEOUT_MS = 10_000;
 const AUTONOMY_LLM_ABORT_DRAIN_MS = 1_000;
+// A missed event or a changed analysis provider must not leave discovery asleep
+// indefinitely. Normal ticks still verify evidence and eligibility before this
+// bounded pause; only the redundant RepositoryAgent request is suppressed.
+export const AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS = 30 * 60_000;
+
+function isUnstartedAutonomyInfrastructureOutcome(objective: {
+  job_id?: unknown;
+  status?: unknown;
+  execution_started?: unknown;
+  failure_class?: unknown;
+}): boolean {
+  const failureClass = asString(objective.failure_class).toLowerCase();
+  return Boolean(
+    asString(objective.job_id) &&
+    ["failed", "dead_letter"].includes(asString(objective.status)) &&
+    objective.execution_started === false &&
+    (["infra", "docker_engine", "docker_infrastructure"].includes(failureClass) ||
+      failureClass.startsWith("environment.")),
+  );
+}
+
+export function isExecutedAutonomyImplementationOutcome(objective: {
+  job_id?: unknown;
+  status?: unknown;
+  execution_started?: unknown;
+  failure_class?: unknown;
+}): boolean {
+  return Boolean(
+    asString(objective.job_id) &&
+    ["completed", "failed", "dead_letter"].includes(asString(objective.status)) &&
+    !isUnstartedAutonomyInfrastructureOutcome(objective),
+  );
+}
+
+export function exhaustedDiscoveryKey(options: {
+  repository: { identity: string; revision: string; tree: string };
+  context: Record<string, unknown>;
+  snapshot: Snapshot;
+  config: PushPalsConfig["remotebuddy"]["autonomy"];
+  nowMs?: number;
+}): string {
+  const nowMs = options.nowMs ?? Date.now();
+  const signals = asObject(options.context.runtimeSignals);
+  const exclusions = asObject(options.context.discoveryExclusions);
+  const outcomes = (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : [])
+    .map(asObject)
+    .filter(isExecutedAutonomyImplementationOutcome)
+    .map((objective) => ({
+      job_id: asString(objective.job_id),
+      status: asString(objective.status),
+      vision_objective_id: asString(objective.vision_objective_id),
+      target_paths: asStringArray(objective.target_paths).sort(),
+      attempt_failure_fingerprint: asString(objective.attempt_failure_fingerprint),
+    }))
+    .sort((a, b) => a.job_id.localeCompare(b.job_id));
+  const available = (limits: Record<string, number>, used: Record<string, number>) =>
+    Object.entries(limits)
+      .map(([key, limit]) => [key, (used[key] ?? 0) < limit])
+      .sort(([a], [b]) => String(a).localeCompare(String(b)));
+  return sha256(
+    JSON.stringify({
+      repository: options.repository,
+      vision: options.context.vision,
+      policy: options.context.deterministicPolicy,
+      exclusions: [...new Set(asStringArray(exclusions.targetPaths))].sort(),
+      executedOutcomeWatermark: signals.executedOutcomeWatermark ?? null,
+      outcomes,
+      cooldowns: options.snapshot.active_cooldowns
+        .filter((entry) => Date.parse(entry.cooldown_until) > nowMs)
+        .map((entry) => entry.pattern_key)
+        .sort(),
+      // Compare admission state, not changing counts or wall-clock timestamps.
+      globalEligibility:
+        options.snapshot.dispatch_budget.global_count_last_hour < options.config.maxDispatchPerHour,
+      concurrencyEligibility:
+        options.snapshot.open_objectives.filter((objective) =>
+          isActiveWorkDiversityStatus(objective.status),
+        ).length < options.config.maxConcurrentObjectives,
+      typeEligibility: available(
+        options.config.maxDispatchPerHourByType ?? {},
+        options.snapshot.dispatch_budget.by_type_count_last_hour,
+      ),
+      componentEligibility: available(
+        options.config.maxDispatchPerHourByComponent ?? {},
+        options.snapshot.dispatch_budget.by_component_count_last_hour ?? {},
+      ),
+    }),
+  );
+}
 
 export class RemoteBuddyAutonomousEngine {
   private readonly server: string;
@@ -6437,6 +6535,7 @@ export class RemoteBuddyAutonomousEngine {
   private lastCompletedAtMs = 0;
   private dispatchBackoffUntilMs = 0;
   private dispatchBackoffReason = "";
+  private exhaustedDiscovery: { key: string; recheckAtMs: number } | null = null;
   private lastEnqueueRejectionReason: string | null = null;
   private readonly suppressedFailureTargets = new Map<string, number>();
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
@@ -7411,6 +7510,7 @@ export class RemoteBuddyAutonomousEngine {
     llmCall: Record<string, unknown>;
     result: RepositoryAgentResult | null;
     discoveryProgress: AutonomyDiscoveryProgress | null;
+    deferred?: boolean;
   } | null> {
     if (!this.repositoryAgent) return null;
     const startedAt = Date.now();
@@ -7597,11 +7697,7 @@ export class RemoteBuddyAutonomousEngine {
             params.snapshot.recent_objectives ??
             []
           )
-            .filter(
-              (objective) =>
-                objective.job_id &&
-                ["completed", "failed", "dead_letter"].includes(objective.status),
-            )
+            .filter(isExecutedAutonomyImplementationOutcome)
             .slice(0, 16),
           activeCooldowns: params.snapshot.active_cooldowns.slice(0, 8),
         },
@@ -7614,6 +7710,26 @@ export class RemoteBuddyAutonomousEngine {
           repositoryAgentPrompt: "autonomy-priority-v3",
         }),
       );
+      const discoveryKey = exhaustedDiscoveryKey({
+        repository: {
+          identity: repository.identity,
+          revision: repository.revision,
+          tree: repository.tree,
+        },
+        context,
+        snapshot: params.snapshot,
+        config: this.cfg,
+      });
+      if (
+        this.exhaustedDiscovery?.key === discoveryKey &&
+        Date.now() < this.exhaustedDiscovery.recheckAtMs
+      ) {
+        return {
+          ...deterministicFallbackPhase("repository_discovery_exhausted_backoff"),
+          deferred: true,
+        };
+      }
+      this.exhaustedDiscovery = null;
       const result = await this.repositoryAgent.ask(
         {
           caller: { sessionId: this.sessionId, correlationId: params.runId },
@@ -7649,6 +7765,17 @@ export class RemoteBuddyAutonomousEngine {
             (result as RepositoryAgentResult & { discoveryProgress?: unknown }).discoveryProgress,
           )
         : null;
+      if (
+        candidates.length === 0 &&
+        result.evidence.length > 0 &&
+        discoveryProgress?.boundedCoverageExhausted &&
+        !discoveryProgress.nextWindowAvailable
+      ) {
+        this.exhaustedDiscovery = {
+          key: discoveryKey,
+          recheckAtMs: Date.now() + AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS,
+        };
+      }
       if (discoveryProgress)
         console.log(
           `[RemoteBuddyAutonomousEngine] repositoryDiscoveryProgress=${JSON.stringify({ runId: params.runId, ...discoveryProgress })}`,
@@ -8704,6 +8831,13 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "snapshot_unavailable";
         return;
       }
+      if (snapshot.execution_capability?.state === "blocked") {
+        this.setPhase("execution_capability_backpressure");
+        outcomeDetail = compactStatusDetail(
+          `execution_capability_blocked:${snapshot.execution_capability.reason || "worker_execution_unavailable"}`,
+        );
+        return;
+      }
       const snapshotSafety = asObject(snapshot.safety_state);
       if (asBoolean(snapshotSafety.kill_switch_enabled, false)) {
         outcomeDetail = "kill_switch_enabled";
@@ -8981,6 +9115,11 @@ export class RemoteBuddyAutonomousEngine {
         visionContext,
         cycleDeadline,
       });
+      if (repositoryAgentPhase?.deferred) {
+        this.setPhase("discovery_backoff");
+        outcomeDetail = "repository_discovery_exhausted_backoff";
+        return;
+      }
       if (this.stopped || !this.runtimeEnabled) {
         outcomeDetail = "disabled_during_repository_agent_ideation";
         return;

@@ -1496,6 +1496,94 @@ describe("server AutonomyStore policy gates", () => {
     expect(recovered.executed_outcome_watermark).not.toBe(aged.executed_outcome_watermark);
   });
 
+  test("setup-only Docker failures remain operational evidence without poisoning implementation memory", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-infrastructure-outcomes-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const initial = store.createSnapshot({ sessionId: "s1", runId: "infra-seed" });
+      const capability = {
+        state: "blocked" as const,
+        reason: "Docker unavailable",
+        retry_after_ms: 30_000,
+        observed_at: new Date().toISOString(),
+      };
+      let watermark = initial.executed_outcome_watermark;
+      for (const [index, executionStarted, owner] of [
+        [0, false, "workerpals_main"],
+        [1, true, "workerpals_main"],
+        [2, false, "untrusted_wrapper"],
+        ...Array.from({ length: 17 }, (_, index) => [index + 3, false, "workerpals_main"] as const),
+      ] as const) {
+        const id = `infra-${index}`;
+        const jobId = jobs.enqueue({
+          taskId: id,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { origin: "autonomy" },
+        }).jobId!;
+        expect(jobs.claim(`worker-${index}`).job?.id).toBe(jobId);
+        expect(
+          jobs.fail(jobId, {
+            message: "Docker volume HTTP 500",
+            diagnostics: {
+              terminal: {
+                failureClass: "docker_engine",
+                terminalStage: "docker",
+                metadata: {
+                  classificationOwner: owner,
+                  executionStarted,
+                },
+              },
+            },
+          }).ok,
+        ).toBe(true);
+        expect(
+          store.recordObjectiveDecision({
+            runId: "infra-seed",
+            snapshotId: initial.snapshot_id,
+            sessionId: "s1",
+            objective: {
+              id,
+              title: id,
+              instruction: "Implement a bounded change",
+              objective_type: "small_refactor",
+              component_area: "src",
+              trigger_type: "queue_health",
+              target_paths: [`src/${id}.ts`],
+              scope: { read_anywhere: false, write_globs: [`src/${id}.ts`] },
+              confidence: 0.9,
+              risk_level: "low",
+              expected_validation: ["bun test"],
+              status: "failed",
+            },
+          }).ok,
+        ).toBe(true);
+        (store as any).db
+          .prepare(`UPDATE autonomy_objectives SET job_id = ? WHERE id = ?`)
+          .run(jobId, id);
+        const snapshot = store.createSnapshot({
+          sessionId: "s1",
+          runId: `inspect-${id}`,
+          executionCapability: capability,
+        });
+        expect(snapshot.execution_capability).toEqual(capability);
+        expect(snapshot.recent_objectives.find((o) => o.job_id === jobId)).toMatchObject({
+          failure_class: "docker_engine",
+          attempt_outcome: "environment_blocked",
+          ...(owner === "workerpals_main" ? { execution_started: executionStarted } : {}),
+        });
+        const setupOnly = executionStarted === false && owner === "workerpals_main";
+        expect(snapshot.executed_objectives?.some((o) => o.job_id === jobId)).toBe(!setupOnly);
+        if (setupOnly) expect(snapshot.executed_outcome_watermark).toBe(watermark);
+        else expect(snapshot.executed_outcome_watermark).not.toBe(watermark);
+        watermark = snapshot.executed_outcome_watermark;
+        if (index >= 3) expect(snapshot.executed_objectives).toHaveLength(2);
+      }
+    } finally {
+      jobs.close();
+    }
+  });
+
   test("jobless rejection bursts cannot evict executed outcomes from repository-agent context", () => {
     const { store, dbPath } = makePersistentStore("pushpals-executed-context-");
     const jobs = new JobQueue(dbPath);

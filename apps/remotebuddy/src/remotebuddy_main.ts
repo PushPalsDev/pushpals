@@ -2791,11 +2791,18 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
+  private workerHasIdleExecutionCapacity(worker: WorkerSnapshot): boolean {
+    return (
+      worker.isOnline &&
+      worker.status !== "offline" &&
+      worker.activeJobCount === 0 &&
+      worker.details?.executionReady !== false
+    );
+  }
+
   private pickIdleWorker(workers: WorkerSnapshot[]): WorkerSnapshot | null {
     const idle = workers
-      .filter(
-        (worker) => worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0,
-      )
+      .filter((worker) => this.workerHasIdleExecutionCapacity(worker))
       .sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
     return idle[0] ?? null;
   }
@@ -2804,6 +2811,9 @@ export class RemoteBuddyOrchestrator {
     workers: WorkerSnapshot[],
     preferredWorkerId?: string,
   ): WorkerSnapshot | null {
+    // Registration proves controller liveness even while shared execution is
+    // checking/blocked. Retain that process and its capability retry backoff;
+    // execution admission is a separate predicate, never a spawn/recycle gate.
     const online = workers
       .filter((worker) => worker.isOnline && worker.status !== "offline")
       .sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
@@ -2848,10 +2858,7 @@ export class RemoteBuddyOrchestrator {
       if (preferredWorkerId) {
         const preferred = workers.find(
           (worker) =>
-            worker.workerId === preferredWorkerId &&
-            worker.isOnline &&
-            worker.status !== "offline" &&
-            worker.activeJobCount === 0,
+            worker.workerId === preferredWorkerId && this.workerHasIdleExecutionCapacity(worker),
         );
         if (preferred) return preferred;
       }
@@ -3181,7 +3188,9 @@ export class RemoteBuddyOrchestrator {
       const spawned = await this.spawnWorker();
       if (this.disposed) return;
       if (spawned) {
-        console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
+        console.log(
+          `[RemoteBuddy] Initial WorkerPal controller registered via ${spawned}; execution readiness is reported separately.`,
+        );
         void this.ensureAutoscaledWorkerCapacity("startup warm pool");
         return;
       }
@@ -3240,7 +3249,12 @@ export class RemoteBuddyOrchestrator {
     if (this.autoSpawnWorkers && onlineWorkers.length < this.maxWorkers) {
       const spawned = await this.spawnWorker();
       if (this.disposed) return null;
-      if (spawned) return spawned;
+      if (spawned) {
+        // A fresh heartbeat can register a blocked/checking controller. Do not
+        // pin pending work to it: await usable capacity, or leave routing open.
+        const idle = await this.waitForIdleWorker(this.waitForWorkerMs, spawned);
+        return idle?.workerId ?? null;
+      }
     }
 
     const waited = await this.waitForIdleWorker(this.waitForWorkerMs);

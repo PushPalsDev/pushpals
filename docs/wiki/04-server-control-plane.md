@@ -50,6 +50,26 @@ restart policy. A delay is evidence of late scheduling, not proof of a particula
 root cause or measured downtime; asynchronous operation durations also include
 awaited I/O. History resets on process restart; logs retain emitted evidence.
 
+Health lifecycle events also carry a bounded, typed diagnostics summary separate
+from the textual health-body preview. It preserves the latest lag and slow
+operation after ring eviction and includes process-wide CPU-window deltas, RSS,
+and up to eight active fixed-label operations. These measurements help correlate
+stalls; they do not prove which operation caused one.
+
+Worker heartbeats separately attest execution readiness. Explicitly blocked
+workers cannot acquire a new job, are excluded from idle capacity, and do not
+prevent healthy workers taking their pending targeted work. Existing claims
+remain replayable. Autonomy snapshots expose aggregate `execution_capability`;
+an absent or legacy readiness signal is unknown rather than an indefinite
+bootstrap block.
+
+Review first-pass rate uses actual observed review cohorts and requires a
+successful terminal outcome without revisions. Pre-review failures still lower
+execution success, but do not count as successful reviews; no observed reviews
+means unavailable (`null`) review quality. Proven pre-code infrastructure
+failures remain operational evidence without changing implementation-memory
+watermarks or evicting genuine execution outcomes.
+
 ### 1) Event durability first
 
 Events are persisted before live broadcast. This keeps SSE/WS replay consistent across crashes.

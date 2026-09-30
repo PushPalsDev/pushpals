@@ -55,6 +55,7 @@ import {
 } from "./execute_job.js";
 import {
   DockerExecutionExhaustedError,
+  DockerInfrastructureError,
   DockerExecutor,
   type DockerJobResult,
 } from "./docker_executor.js";
@@ -82,6 +83,11 @@ import {
 } from "shared";
 import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 import { WorkerStartupBudget } from "./startup_budget.js";
+import {
+  WorkerExecutionReadinessGate,
+  checkWorkerExecutionReadiness,
+  shouldUseLegacyWorkerCooldown,
+} from "./execution_readiness.js";
 
 type CommitRef = {
   branch: string;
@@ -739,7 +745,8 @@ export function buildUnhandledWorkerFailureResult(
     error instanceof Error ? error.stack || error.message : String(error),
   );
   const errorSummary = compactWorkerError(error);
-  const dockerFailure = error instanceof DockerExecutionExhaustedError;
+  const dockerFailure =
+    error instanceof DockerExecutionExhaustedError || error instanceof DockerInfrastructureError;
   const workerRuntimeFailure = !dockerFailure && isWorkerRuntimeFailure(detail);
   const failureClass = workerRuntimeFailure
     ? "worker_runtime_failure"
@@ -778,6 +785,17 @@ export function buildUnhandledWorkerFailureResult(
           classificationOwner: "workerpals_main",
           structuredResult: false,
           errorName: error instanceof Error ? error.name : typeof error,
+          ...(dockerFailure
+            ? {
+                phase: error.phase ?? null,
+                ...(typeof error.executionStarted === "boolean"
+                  ? { executionStarted: error.executionStarted }
+                  : {}),
+                ...(error instanceof DockerInfrastructureError
+                  ? { retryable: error.retryable }
+                  : {}),
+              }
+            : {}),
         },
       },
     },
@@ -2303,6 +2321,22 @@ async function workerLoop(
   );
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   const claimTimeoutMs = Math.max(4_000, Math.min(15_000, opts.pollMs * 3));
+  const executionReadiness = dockerExecutor
+    ? new WorkerExecutionReadinessGate({
+        probe: () => dockerExecutor.checkSharedRuntimeReadiness(),
+        failureCooldownMs: opts.failureCooldownMs,
+        classifyFailure: (error) => ({
+          failureClass: "docker_engine",
+          retryable:
+            error instanceof DockerExecutionExhaustedError ||
+            (error instanceof DockerInfrastructureError && error.retryable),
+        }),
+        onFailure: (error) =>
+          console.warn(
+            `[WorkerPals] Shared Docker execution readiness blocked; no jobs will be claimed: ${redactSensitiveText(compactWorkerError(error))}`,
+          ),
+      })
+    : null;
   let lastHeartbeatAt = 0;
   const buildHeartbeatPayload = (
     status: WorkerHeartbeatPayload["status"],
@@ -2322,6 +2356,7 @@ async function workerLoop(
       dockerImage: opts.docker ? opts.dockerImage : null,
       dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
       runtimeGeneration: runtimeGeneration || null,
+      ...(executionReadiness?.details() ?? { executionReady: true }),
     },
   });
 
@@ -2336,10 +2371,29 @@ async function workerLoop(
     if (ok) lastHeartbeatAt = now;
   };
 
-  await maybeHeartbeat("idle", null, true);
+  await maybeHeartbeat(executionReadiness ? "error" : "idle", null, true);
 
   while (!runtimeState.shutdownRequested) {
     try {
+      if (executionReadiness) {
+        const ready = await checkWorkerExecutionReadiness(
+          executionReadiness,
+          (force) =>
+            maybeHeartbeat(
+              executionReadiness.details().executionReady ? "idle" : "error",
+              null,
+              force,
+            ),
+          heartbeatEveryMs,
+        );
+        if (runtimeState.shutdownRequested) break;
+        if (!ready) {
+          await new Promise((resolvePromise) =>
+            setTimeout(resolvePromise, Math.max(250, Math.min(5_000, opts.pollMs))),
+          );
+          continue;
+        }
+      }
       await maybeHeartbeat("idle");
       const claimRes = await postJsonWithTimeout(
         `${opts.server}/jobs/claim`,
@@ -2693,6 +2747,7 @@ async function workerLoop(
                 }
               }
             } catch (preparationError) {
+              executionReadiness?.invalidate();
               result = buildWorkerPreparationFailureResult(preparationError);
               if (directDeadlineLedger?.workExpired()) {
                 result = {
@@ -2798,6 +2853,14 @@ async function workerLoop(
                   ? Math.floor(result.cooldownMs ?? 0)
                   : 0;
             } catch (err) {
+              if (
+                err instanceof DockerInfrastructureError ||
+                err instanceof DockerExecutionExhaustedError
+              ) {
+                executionReadiness?.block(err);
+              } else {
+                executionReadiness?.invalidate();
+              }
               if (err instanceof DockerExecutionExhaustedError) {
                 cooldownAfterJobMs = Math.max(
                   opts.failureCooldownMs,
@@ -3457,7 +3520,12 @@ async function workerLoop(
                 process.exit(recycleExitCode);
               }
             }
-            if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {
+            if (!result?.ok) executionReadiness?.invalidate();
+            const useLegacyCooldown = shouldUseLegacyWorkerCooldown(
+              result?.cooldownMs,
+              executionReadiness?.details(),
+            );
+            if (useLegacyCooldown && job.sessionId && result?.cooldownMs) {
               await transport.queueSessionCommand(
                 job.sessionId,
                 {
@@ -3470,7 +3538,7 @@ async function workerLoop(
                 { priority: "high" },
               );
             }
-            if (result?.cooldownMs && result.cooldownMs > 0) {
+            if (useLegacyCooldown && result?.cooldownMs) {
               const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
               console.warn(
                 `[WorkerPals] Entering cooldown for ${formatDurationMs(cooldownMs)} after retry exhaustion.`,
@@ -3478,7 +3546,11 @@ async function workerLoop(
               await maybeHeartbeat("offline", job.id, true);
               await new Promise((resolvePromise) => setTimeout(resolvePromise, cooldownMs));
             }
-            await maybeHeartbeat("idle", null, true);
+            await maybeHeartbeat(
+              executionReadiness && !executionReadiness.details().executionReady ? "error" : "idle",
+              null,
+              true,
+            );
             runtimeState.currentJobId = null;
             runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;

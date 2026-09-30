@@ -87,6 +87,7 @@ describe("release package payload verification", () => {
         "runtime/sandbox/apps/workerpals/uv.lock",
         "runtime/sandbox/apps/workerpals/src/job_runner.ts",
         "runtime/sandbox/apps/workerpals/src/startup_budget.ts",
+        "runtime/sandbox/apps/workerpals/src/execution_readiness.ts",
         "runtime/sandbox/packages/shared/src/worker_startup.ts",
         "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",
         "runtime/sandbox/apps/workerpals/src/backends/openai_codex/openai_codex_executor.py",
@@ -104,6 +105,20 @@ describe("release package payload verification", () => {
         "runtime/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
         "runtime/sandbox/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
       ]),
+    );
+  });
+
+  test("copies WorkerPal execution readiness before new source files are git-tracked", () => {
+    const source = readFileSync(join(repoRoot, "scripts", "sync-cli-runtime-assets.ts"), "utf8");
+    const explicitCopies = source.slice(
+      source.indexOf("const copyPairs:"),
+      source.indexOf("const trackedSandboxCopyPairs:"),
+    );
+    expect(explicitCopies).toContain(
+      'join(repoRoot, "apps", "workerpals", "src", "execution_readiness.ts")',
+    );
+    expect(explicitCopies).toContain(
+      'join(outDir, "sandbox", "apps", "workerpals", "src", "execution_readiness.ts")',
     );
   });
 
@@ -275,6 +290,7 @@ describe("release package payload verification", () => {
 
   test("rejects packages missing required shared runtime code or the isolated RepositoryAgent prompt", () => {
     const requiredRuntimePaths = [
+      "runtime/sandbox/apps/workerpals/src/execution_readiness.ts",
       "runtime/sandbox/packages/shared/src/memory.ts",
       "runtime/sandbox/packages/shared/src/repository_agent.ts",
       "runtime/sandbox/packages/shared/src/scm_repair_authority.ts",

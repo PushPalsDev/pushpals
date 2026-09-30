@@ -1,11 +1,13 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   RuntimeDiagnostics,
+  summarizeRuntimeDiagnostics,
   type RuntimeDiagnosticEvent,
+  type RuntimeDiagnosticsOptions,
 } from "../packages/shared/src/runtime_diagnostics";
 
 function fixture(
-  options: { maxSamples?: number; onEvent?: (event: RuntimeDiagnosticEvent) => void } = {},
+  options: Pick<RuntimeDiagnosticsOptions, "maxSamples" | "onEvent" | "cpuUsage" | "rssBytes"> = {},
 ) {
   let monotonic = 0;
   let wall = Date.UTC(2026, 8, 28);
@@ -18,6 +20,8 @@ function fixture(
     wallNow: () => wall,
     onEvent: options.onEvent ?? ((event) => logged.push(event)),
     maxSamples: options.maxSamples,
+    cpuUsage: options.cpuUsage ?? (() => ({ user: 0, system: 0 })),
+    rssBytes: options.rssBytes ?? (() => 0),
     schedule(callback, delayMs) {
       scheduled.push({ callback, delayMs });
       pending.add(callback);
@@ -55,7 +59,9 @@ describe("bounded runtime diagnostics", () => {
         unrefs += 1;
       },
     } as unknown as ReturnType<typeof setTimeout>;
-    const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(() => timer);
+    const setTimer = spyOn(globalThis, "setTimeout").mockImplementation(
+      (() => timer) as unknown as typeof setTimeout,
+    );
     const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation(() => undefined);
     try {
       const diagnostics = new RuntimeDiagnostics({ service: "test" });
@@ -99,6 +105,13 @@ describe("bounded runtime diagnostics", () => {
         delayMs: 11_000,
         sampleIntervalMs: 1000,
         observedAt: "2026-09-28T00:00:12.000Z",
+        context: {
+          sampleElapsedMs: 12_000,
+          cpuUserMs: 0,
+          cpuSystemMs: 0,
+          rssBytes: 0,
+          activeOperations: [],
+        },
       },
     ]);
     expect(f.pending.size).toBe(1);
@@ -462,5 +475,128 @@ describe("bounded runtime diagnostics", () => {
     const f = fixture({ maxSamples: 1000 });
     for (let i = 0; i < 100; i += 1) f.diagnostics.run("work", () => f.advance(1000));
     expect(f.diagnostics.snapshot().recentSlowEvents).toHaveLength(64);
+  });
+
+  test("latest loop-delay evidence survives later operation samples evicting its ring entry", () => {
+    const f = fixture({ maxSamples: 1 });
+    f.diagnostics.start();
+    f.advance(11_000);
+    f.tick();
+    f.diagnostics.run("integration_maintenance", () => f.advance(1500));
+    const snapshot = f.diagnostics.snapshot();
+    expect(snapshot.recentSlowEvents).toHaveLength(1);
+    expect(snapshot.recentSlowEvents[0].event).toBe("runtime_slow_operation");
+    expect(summarizeRuntimeDiagnostics(snapshot)).toMatchObject({
+      latestEventLoopDelay: { delayMs: 10_000, observedAt: "2026-09-28T00:00:11.000Z" },
+      latestSlowOperation: { stage: "integration_maintenance", durationMs: 1500 },
+    });
+    f.diagnostics.stop();
+  });
+
+  test("lag context includes process CPU window/RSS and at most eight fixed active labels", async () => {
+    let cpu = { user: 1000, system: 2000 };
+    const f = fixture({ cpuUsage: () => cpu, rssBytes: () => 64 * 1024 * 1024 });
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const operations = Array.from({ length: 20 }, (_, index) =>
+      f.diagnostics.runAsync(
+        index === 0 ? "request body: private text" : `stage${index}`,
+        () => pending,
+      ),
+    );
+    f.diagnostics.start();
+    f.advance(12_000);
+    cpu = { user: 251_000, system: 52_000 };
+    f.tick();
+    const snapshot = f.diagnostics.snapshot();
+    expect(snapshot.latestEventLoopDelay?.context).toMatchObject({
+      sampleElapsedMs: 12_000,
+      cpuUserMs: 250,
+      cpuSystemMs: 50,
+      rssBytes: 64 * 1024 * 1024,
+    });
+    expect(snapshot.activeOperations).toHaveLength(8);
+    expect(snapshot.activeOperations[0]).toEqual({ stage: "operation", elapsedMs: 12_000 });
+    expect(snapshot.latestEventLoopDelay?.context?.activeOperations).toHaveLength(8);
+    snapshot.latestEventLoopDelay!.context!.activeOperations![0].stage = "mutated";
+    expect(
+      f.diagnostics.snapshot().latestEventLoopDelay?.context?.activeOperations?.[0].stage,
+    ).toBe("operation");
+    expect(JSON.stringify(f.diagnostics.snapshot())).not.toContain("private text");
+    finish();
+    await Promise.all(operations);
+    expect(f.diagnostics.snapshot().activeOperations).toEqual([]);
+    f.diagnostics.stop();
+  });
+
+  test("resource counter failures cannot hide a stall or retain completed operation context", async () => {
+    const unavailable = () => {
+      throw new Error("private resource error");
+    };
+    const f = fixture({ cpuUsage: unavailable, rssBytes: unavailable });
+    f.diagnostics.start();
+    f.advance(3000);
+    f.tick();
+    expect(f.logged[0]).toMatchObject({ delayMs: 2000, context: { sampleElapsedMs: 3000 } });
+    expect(f.logged[0].context?.cpuUserMs).toBeUndefined();
+    expect(f.logged[0].context?.rssBytes).toBeUndefined();
+    const failure = new Error("operation failed");
+    await expect(
+      f.diagnostics.runAsync("request", async () => {
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+    expect(f.diagnostics.snapshot().activeOperations).toEqual([]);
+    expect(JSON.stringify(f.logged)).not.toContain("private resource error");
+    expect(f.pending.size).toBe(1);
+    f.diagnostics.stop();
+  });
+
+  test("typed summaries keep only bounded allowlisted incident data from legacy history", () => {
+    const oldEvent = {
+      event: "runtime_event_loop_delay",
+      observedAt: "2026-09-28T00:00:00.000Z",
+      delayMs: 1000,
+      sampleIntervalMs: 1000,
+    };
+    const newest = {
+      ...oldEvent,
+      observedAt: "2026-09-28T09:00:00.000Z",
+      delayMs: 9000,
+      rawError: "private error text",
+      context: {
+        cpuUserMs: 20,
+        rssBytes: 10_000,
+        cpuSystemMs: Infinity,
+        environment: "private environment",
+        activeOperations: Array.from({ length: 100 }, () => ({
+          stage: "x".repeat(96),
+          elapsedMs: 9000,
+          input: "private input",
+        })),
+      },
+    };
+    const summary = summarizeRuntimeDiagnostics({
+      service: "server",
+      maxEventLoopDelayMs: 9000,
+      lastEventLoopDelayMs: -1,
+      secret: "private secret",
+      recentSlowEvents: [...Array(200).fill(oldEvent), newest],
+      activeOperations: [{ stage: "C:/private/path", elapsedMs: 1 }],
+    });
+    expect(summary?.latestEventLoopDelay).toMatchObject({
+      observedAt: newest.observedAt,
+      delayMs: 9000,
+    });
+    expect(summary?.latestEventLoopDelay?.context?.activeOperations).toHaveLength(8);
+    expect(summary?.latestEventLoopDelay?.context?.cpuSystemMs).toBeUndefined();
+    expect(summary?.lastEventLoopDelayMs).toBeUndefined();
+    expect(summary?.activeOperations).toEqual([]);
+    expect(JSON.stringify(summary).length).toBeLessThan(6000);
+    expect(JSON.stringify(summary)).not.toContain("private");
+    expect(summarizeRuntimeDiagnostics({ service: "request body: secret" })).toBeUndefined();
+    expect(summarizeRuntimeDiagnostics(null)).toBeUndefined();
   });
 });

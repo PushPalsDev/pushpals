@@ -37,6 +37,11 @@ on:
       - "tests/integration/workerpals.control-plane.e2e.ts"
       - "tests/workerpals.direct-worktree.test.ts"
       - "tests/workerpals.docker-executor.test.ts"
+      - "tests/workerpals.execution-readiness.test.ts"
+      - "tests/server.worker-execution-readiness.test.ts"
+      - "tests/server.review-quality-metrics.test.ts"
+      - "tests/remotebuddy.worker-autoscale.test.ts"
+      - "tests/shared.runtime-diagnostics.test.ts"
       - "tests/workerpals.runtime-sandbox-mirror.test.ts"
       - "tests/workerpals.sandbox-env.test.ts"
       - "tests/workerpals.windows-sandbox-env.integration.test.ts"
@@ -81,6 +86,11 @@ on:
       - "tests/integration/workerpals.control-plane.e2e.ts"
       - "tests/workerpals.direct-worktree.test.ts"
       - "tests/workerpals.docker-executor.test.ts"
+      - "tests/workerpals.execution-readiness.test.ts"
+      - "tests/server.worker-execution-readiness.test.ts"
+      - "tests/server.review-quality-metrics.test.ts"
+      - "tests/remotebuddy.worker-autoscale.test.ts"
+      - "tests/shared.runtime-diagnostics.test.ts"
       - "tests/workerpals.runtime-sandbox-mirror.test.ts"
       - "tests/workerpals.sandbox-env.test.ts"
       - "tests/workerpals.windows-sandbox-env.integration.test.ts"
@@ -174,6 +184,15 @@ jobs:
 
       - name: Verify health recovery reporting
         run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts tests/cli.shutdown-confirmation.test.ts tests/cli.clear-progress.test.ts
+
+      - name: Verify execution capability and review quality contracts
+        run: >-
+          bun test
+          tests/workerpals.execution-readiness.test.ts
+          tests/server.worker-execution-readiness.test.ts
+          tests/server.review-quality-metrics.test.ts
+          tests/remotebuddy.worker-autoscale.test.ts
+          tests/shared.runtime-diagnostics.test.ts
 
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-

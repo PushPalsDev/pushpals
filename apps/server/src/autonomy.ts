@@ -11,6 +11,7 @@ import {
   type RepositoryAgentMemoryRef,
 } from "shared";
 import { classifyJobTerminalSemantics } from "./job_terminal_semantics.js";
+import type { WorkerExecutionCapability } from "./worker_execution_readiness.js";
 import {
   normalizeAutonomyComponentArea,
   makePatternKey,
@@ -316,6 +317,8 @@ interface OpenObjective {
   attempt_outcome?: AutonomyAttemptOutcome | null;
   deterministic_repair_failure?: boolean;
   attempt_failure_fingerprint?: string | null;
+  execution_started?: boolean;
+  failure_class?: string | null;
   target_paths?: string[];
   scope?: {
     read_anywhere: boolean;
@@ -530,6 +533,7 @@ export interface AutonomySnapshot {
   recent_objectives: OpenObjective[];
   executed_objectives?: OpenObjective[];
   executed_outcome_watermark?: string;
+  execution_capability?: WorkerExecutionCapability;
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -1375,7 +1379,7 @@ function classifyAutonomyAttemptOutcome(input: {
     return "product_quality_failed";
   }
   if (
-    /^(?:environment(?:\.[a-z0-9_-]+)?|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(
+    /^(?:environment(?:\.[a-z0-9_-]+)?|docker_engine|docker_infrastructure|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(
       failureClass,
     ) ||
     /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(
@@ -3713,21 +3717,53 @@ export class AutonomyStore {
          revision_samples AS (
            SELECT sample_key, COUNT(*) AS revision_count
            FROM windowed
-           WHERE terminal = 0
+           WHERE terminal = 0 AND success = 0
            GROUP BY sample_key
+         ),
+         review_samples AS (
+           SELECT CASE
+                    WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
+                    WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
+                    WHEN NULLIF(request_id, '') IS NOT NULL THEN 'request:' || request_id
+                    ELSE 'feedback:' || id
+                  END AS sample_key
+           FROM autonomy_pr_feedback
+           WHERE datetime(created_at) >= datetime(?, '-${hours} hours')
+           UNION SELECT sample_key FROM revision_samples
+         ),
+         retained_revisions AS (
+           SELECT DISTINCT CASE
+                    WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
+                    WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
+                    WHEN NULLIF(request_id, '') IS NOT NULL THEN 'request:' || request_id
+                    ELSE 'outcome:' || id
+                  END AS sample_key
+           FROM autonomy_outcomes WHERE terminal = 0 AND success = 0
          )
          SELECT COUNT(*) AS terminalCount,
                 SUM(CASE WHEN latest_terminal.success = 1 THEN 1 ELSE 0 END) AS successCount,
-                (SELECT COUNT(*) FROM windowed WHERE terminal = 0) AS nonTerminalRevisionCount,
+                (SELECT COUNT(*) FROM windowed WHERE terminal = 0 AND success = 0) AS nonTerminalRevisionCount,
                 (SELECT COUNT(*) FROM revision_samples) AS nonTerminalRevisionObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples) AS reviewObservedObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples r
+                 JOIN retained_revisions revisions ON revisions.sample_key = r.sample_key)
+                  AS reviewRevisedObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples r
+                 JOIN latest_terminal t ON t.sample_key = r.sample_key
+                 WHERE t.success = 1 AND NOT EXISTS (
+                   SELECT 1 FROM retained_revisions revisions WHERE revisions.sample_key = r.sample_key
+                 )) AS firstPassSuccessCount,
                 SUM(CASE WHEN revision_samples.sample_key IS NOT NULL THEN 1 ELSE 0 END)
                   AS revisedTerminalObjectiveCount
          FROM latest_terminal
          LEFT JOIN revision_samples ON revision_samples.sample_key = latest_terminal.sample_key`,
       )
-      .get(nowIso) as {
+      .get(nowIso, nowIso) as {
       terminalCount: number | null;
       successCount: number | null;
+      reviewObservedObjectiveCount: number | null;
+      reviewRevisedObjectiveCount: number | null;
+      firstPassSuccessCount: number | null;
       nonTerminalRevisionCount: number | null;
       nonTerminalRevisionObjectiveCount: number | null;
       revisedTerminalObjectiveCount: number | null;
@@ -3751,7 +3787,11 @@ export class AutonomyStore {
     );
     const reviewObservedObjectiveCount = Math.max(
       0,
-      objectiveTerminalCount + nonTerminalRevisionObjectiveCount - revisedTerminalObjectiveCount,
+      Math.floor(asNumber(objectiveRow?.reviewObservedObjectiveCount, 0)),
+    );
+    const firstPassSuccessCount = Math.max(
+      0,
+      Math.floor(asNumber(objectiveRow?.firstPassSuccessCount, 0)),
     );
 
     let validationRows: Array<{
@@ -3865,12 +3905,12 @@ export class AutonomyStore {
       revisedTerminalObjectiveCount,
       objectiveRevisionRate:
         reviewObservedObjectiveCount > 0
-          ? nonTerminalRevisionObjectiveCount / reviewObservedObjectiveCount
+          ? Math.max(0, Math.floor(asNumber(objectiveRow?.reviewRevisedObjectiveCount, 0))) /
+            reviewObservedObjectiveCount
           : null,
       objectiveFirstPassRate:
         reviewObservedObjectiveCount > 0
-          ? Math.max(0, reviewObservedObjectiveCount - nonTerminalRevisionObjectiveCount) /
-            reviewObservedObjectiveCount
+          ? firstPassSuccessCount / reviewObservedObjectiveCount
           : null,
       durationMs: {
         average:
@@ -5656,6 +5696,7 @@ export class AutonomyStore {
     runId?: string;
     requestSlo?: QueueSloSummary;
     jobSlo?: QueueSloSummary;
+    executionCapability?: WorkerExecutionCapability;
     repoHealthFlags?: {
       is_worktree_dirty?: boolean;
       is_merge_in_progress?: boolean;
@@ -5722,6 +5763,7 @@ export class AutonomyStore {
       job_failure_class: string | null;
       job_terminal_stage: string | null;
       job_summary: string | null;
+      job_terminal_metadata_json: string | null;
       job_validation_passed: number | null;
       job_validation_command: string | null;
       job_validation_failure_class: string | null;
@@ -5734,12 +5776,22 @@ export class AutonomyStore {
     const objectiveJobProjection = includeObjectiveJobOutcomes
       ? `j.status AS job_status, d.failureClass AS job_failure_class,
          d.terminalStage AS job_terminal_stage,
-         COALESCE(d.summary, j.error, j.result) AS job_summary`
+         COALESCE(d.summary, j.error, j.result) AS job_summary,
+         d.metadataJson AS job_terminal_metadata_json`
       : `NULL AS job_status, NULL AS job_failure_class,
-         NULL AS job_terminal_stage, NULL AS job_summary`;
+         NULL AS job_terminal_stage, NULL AS job_summary,
+         NULL AS job_terminal_metadata_json`;
     const objectiveJobJoins = includeObjectiveJobOutcomes
       ? `LEFT JOIN jobs j ON j.id = o.job_id
          LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id`
+      : "";
+    const excludeSetupOnlyOutcomes = includeObjectiveJobOutcomes
+      ? `AND NOT COALESCE(
+      (d.failureClass IN ('docker_engine', 'docker_infrastructure') OR d.failureClass LIKE 'environment.%')
+      AND CASE WHEN json_valid(d.metadataJson) THEN
+        json_type(d.metadataJson, '$.executionStarted') = 'false'
+        AND json_extract(d.metadataJson, '$.classificationOwner') = 'workerpals_main'
+      ELSE 0 END, 0)`
       : "";
     const includeObjectiveValidationOutcomes =
       this.hasTable("jobs") && this.hasTable("job_validation_runs");
@@ -5783,6 +5835,12 @@ export class AutonomyStore {
       )
       .all() as ObjectiveSnapshotRow[];
     const hydrateObjective = (row: ObjectiveSnapshotRow): OpenObjective => {
+      const terminalMetadata = parseJsonObject(row.job_terminal_metadata_json);
+      const executionStarted =
+        terminalMetadata.classificationOwner === "workerpals_main" &&
+        typeof terminalMetadata.executionStarted === "boolean"
+          ? terminalMetadata.executionStarted
+          : undefined;
       const scopeRecord = parseJsonObject(row.scope_json);
       const targetPaths = asStringArray(scopeRecord.targetPaths ?? scopeRecord.target_paths);
       const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
@@ -5824,6 +5882,8 @@ export class AutonomyStore {
         incident_key: row.incident_key ?? null,
         job_id: row.job_id ?? null,
         attempt_outcome: attemptOutcome,
+        execution_started: executionStarted,
+        failure_class: row.job_failure_class,
         deterministic_repair_failure: deterministicRepairFailure,
         attempt_failure_fingerprint: attemptFailureFingerprint,
         target_paths: targetPaths,
@@ -5866,9 +5926,12 @@ export class AutonomyStore {
        WHERE o.job_id IS NOT NULL AND o.job_id <> ''
          AND o.status IN ('completed', 'failed', 'dead_letter')
          AND o.updated_at >= ?
+         ${excludeSetupOnlyOutcomes}
        ORDER BY o.updated_at DESC LIMIT 16`,
       )
       .all(new Date(Date.parse(now) - 24 * 60 * 60_000).toISOString()) as ObjectiveSnapshotRow[];
+    // Filtering happens before LIMIT with the same typed predicate used by the
+    // watermark. Heuristic environment classification is not execution proof.
     const executedObjectives = executedObjectiveRows.map(hydrateObjective);
     // Cache TTLs can exceed the 24-hour narrative window. Keep a stable summary
     // of all retained executed outcomes so aging out of that window cannot
@@ -5877,13 +5940,15 @@ export class AutonomyStore {
     const executedOutcomeSummary = this.db
       .prepare(
         `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-              SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
-              MAX(updated_at) AS latest_update
-       FROM autonomy_objectives
-       WHERE job_id IS NOT NULL AND job_id <> ''
-         AND status IN ('completed', 'failed', 'dead_letter')`,
+              SUM(CASE WHEN o.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN o.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+              SUM(CASE WHEN o.status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+              MAX(o.updated_at) AS latest_update
+       FROM autonomy_objectives o
+       ${objectiveJobJoins}
+       WHERE o.job_id IS NOT NULL AND o.job_id <> ''
+         AND o.status IN ('completed', 'failed', 'dead_letter')
+         ${excludeSetupOnlyOutcomes}`,
       )
       .get();
     const executedOutcomeWatermark = sha256Hex(JSON.stringify(executedOutcomeSummary));
@@ -5916,6 +5981,7 @@ export class AutonomyStore {
       recent_objectives: recentObjectives,
       executed_objectives: executedObjectives,
       executed_outcome_watermark: executedOutcomeWatermark,
+      execution_capability: params.executionCapability,
       repo_health_flags: {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),

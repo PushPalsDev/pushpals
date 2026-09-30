@@ -4,6 +4,10 @@ import {
 } from "../packages/shared/src/bounded_fetch.js";
 import { terminateProcessTree } from "../packages/shared/src/bounded_process.js";
 import {
+  summarizeRuntimeDiagnostics,
+  type RuntimeDiagnosticsSummary,
+} from "../packages/shared/src/runtime_diagnostics.js";
+import {
   SCM_REPAIR_AUTHORITY_SECRET_ENV,
   copyEnvWithoutScmRepairAuthoritySecret,
 } from "../packages/shared/src/scm_repair_authority.js";
@@ -105,6 +109,8 @@ export type ManagedServiceHealthResult = {
   responseHeadersMs?: number;
   /** Timer/transport scheduling overrun is evidence, not an attribution to service CPU or GC. */
   probeDeadlineOverrunMs?: number;
+  /** Allowlisted incident context, separate from the bounded human-readable detail. */
+  diagnostics?: RuntimeDiagnosticsSummary;
 };
 
 export type ManagedServiceExitFingerprintContext = {
@@ -180,6 +186,7 @@ export type ManagedServiceLifecycleEvent =
       failureStage?: ManagedServiceHealthFailureStage | null;
       responseHeadersMs?: number | null;
       probeDeadlineOverrunMs?: number | null;
+      diagnostics?: RuntimeDiagnosticsSummary;
       /** Recovery counts/duration describe this process; pre-restart failures are in earlier events. */
       recoveryMetricsScope?: "current_process";
       recoveredAfterFailures?: number;
@@ -292,10 +299,18 @@ export async function defaultProbeServiceHealth(
       timeoutMessage: `Managed service health probe timed out after ${timeoutMs}ms`,
     });
     const detail = await response.text();
+    let diagnostics: RuntimeDiagnosticsSummary | undefined;
+    try {
+      diagnostics = summarizeRuntimeDiagnostics(JSON.parse(detail)?.diagnostics);
+    } catch {
+      // Plain-text/malformed bodies remain valid health responses; telemetry
+      // parsing must not change HTTP health semantics or the probe deadline.
+    }
     return {
       ok: response.ok,
       detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
       responseStatus: response.status,
+      ...(diagnostics ? { diagnostics } : {}),
       ...probeTiming(),
       ...(!response.ok
         ? { failureKind: "unhealthy_response" as const, failureStage: "http_status" as const }
@@ -944,6 +959,7 @@ export class ServiceManager {
               failureStage: null,
               responseHeadersMs: health.responseHeadersMs ?? null,
               probeDeadlineOverrunMs: health.probeDeadlineOverrunMs ?? null,
+              ...(health.diagnostics ? { diagnostics: health.diagnostics } : {}),
               ...(!initiallyReady
                 ? {
                     recoveryMetricsScope: "current_process" as const,
@@ -1036,6 +1052,7 @@ export class ServiceManager {
           failureStage: health.failureStage ?? null,
           responseHeadersMs: health.responseHeadersMs ?? null,
           probeDeadlineOverrunMs: health.probeDeadlineOverrunMs ?? null,
+          ...(health.diagnostics ? { diagnostics: health.diagnostics } : {}),
           lastHealthyAt:
             state.lastHealthyAtMs === null ? null : new Date(state.lastHealthyAtMs).toISOString(),
           restartOnFailure: healthCheck.restartOnFailure !== false,

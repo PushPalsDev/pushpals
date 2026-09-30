@@ -1,10 +1,33 @@
+export type RuntimeActiveOperation = { stage: string; elapsedMs: number };
+export type RuntimeDiagnosticContext = {
+  /** CPU is process-wide over the sampler window, not attributed to one operation. */
+  sampleElapsedMs?: number;
+  cpuUserMs?: number;
+  cpuSystemMs?: number;
+  rssBytes?: number;
+  activeOperations?: RuntimeActiveOperation[];
+};
+
 export type RuntimeDiagnosticEvent = {
   service: string;
   observedAt: string;
+  context?: RuntimeDiagnosticContext;
 } & (
   | { event: "runtime_event_loop_delay"; delayMs: number; sampleIntervalMs: number }
   | { event: "runtime_slow_operation"; stage: string; durationMs: number }
 );
+
+/** A fixed-size, allowlisted view suitable for health lifecycle telemetry. */
+export type RuntimeDiagnosticsSummary = {
+  service: string;
+  lastEventLoopDelayMs?: number;
+  maxEventLoopDelayMs?: number;
+  slowEventLoopSamples?: number;
+  slowOperationSamples?: number;
+  latestEventLoopDelay?: RuntimeDiagnosticEvent;
+  latestSlowOperation?: RuntimeDiagnosticEvent;
+  activeOperations?: RuntimeActiveOperation[];
+};
 
 export interface RuntimeDiagnosticsOptions {
   service: string;
@@ -14,11 +37,121 @@ export interface RuntimeDiagnosticsOptions {
   sampleIntervalMs?: number;
   slowThresholdMs?: number;
   maxSamples?: number;
+  /** Optional process-wide counters. Failures only omit resource context. */
+  cpuUsage?: () => { user: number; system: number };
+  rssBytes?: () => number;
   /** Test seam. Return a cancellation function; production timers are unref'd. */
   schedule?: (callback: () => void, delayMs: number) => () => void;
 }
 
 const LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+const MAX_ACTIVE_OPERATIONS = 8;
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function finiteMeasurement(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= Number.MAX_SAFE_INTEGER
+  );
+}
+
+function activeOperationSummary(value: unknown): RuntimeActiveOperation[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.slice(0, MAX_ACTIVE_OPERATIONS).flatMap((entry) => {
+    const item = recordValue(entry);
+    return item &&
+      typeof item.stage === "string" &&
+      LABEL.test(item.stage) &&
+      finiteMeasurement(item.elapsedMs)
+      ? [{ stage: item.stage, elapsedMs: item.elapsedMs }]
+      : [];
+  });
+}
+
+function diagnosticContext(value: unknown): RuntimeDiagnosticContext | undefined {
+  const input = recordValue(value);
+  if (!input) return undefined;
+  const context: RuntimeDiagnosticContext = {};
+  for (const key of ["sampleElapsedMs", "cpuUserMs", "cpuSystemMs", "rssBytes"] as const) {
+    if (finiteMeasurement(input[key])) context[key] = input[key];
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations) context.activeOperations = activeOperations;
+  return Object.keys(context).length ? context : undefined;
+}
+
+function diagnosticEvent(value: unknown, service: string): RuntimeDiagnosticEvent | undefined {
+  const input = recordValue(value);
+  if (
+    !input ||
+    typeof input.observedAt !== "string" ||
+    input.observedAt.length > 32 ||
+    !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(input.observedAt) ||
+    !Number.isFinite(Date.parse(input.observedAt))
+  )
+    return undefined;
+  const context = diagnosticContext(input.context);
+  const base = { service, observedAt: input.observedAt, ...(context ? { context } : {}) };
+  if (
+    input.event === "runtime_event_loop_delay" &&
+    finiteMeasurement(input.delayMs) &&
+    finiteMeasurement(input.sampleIntervalMs)
+  ) {
+    return {
+      ...base,
+      event: input.event,
+      delayMs: input.delayMs,
+      sampleIntervalMs: input.sampleIntervalMs,
+    };
+  }
+  if (
+    input.event === "runtime_slow_operation" &&
+    typeof input.stage === "string" &&
+    LABEL.test(input.stage) &&
+    finiteMeasurement(input.durationMs)
+  ) {
+    return { ...base, event: input.event, stage: input.stage, durationMs: input.durationMs };
+  }
+  return undefined;
+}
+
+/** Never forward arbitrary health body fields, paths, errors, or unbounded history. */
+export function summarizeRuntimeDiagnostics(value: unknown): RuntimeDiagnosticsSummary | undefined {
+  const input = recordValue(value);
+  if (!input || typeof input.service !== "string" || !LABEL.test(input.service)) return undefined;
+  const summary: RuntimeDiagnosticsSummary = { service: input.service };
+  for (const key of [
+    "lastEventLoopDelayMs",
+    "maxEventLoopDelayMs",
+    "slowEventLoopSamples",
+    "slowOperationSamples",
+  ] as const) {
+    if (finiteMeasurement(input[key])) summary[key] = input[key];
+  }
+  // Old runtimes expose only the chronological ring. Inspect at most its last
+  // 64 entries; never let its oldest sample hide the incident that just ended.
+  const recent = Array.isArray(input.recentSlowEvents) ? input.recentSlowEvents.slice(-64) : [];
+  for (const value of [...recent, input.latestEventLoopDelay, input.latestSlowOperation]) {
+    const event = diagnosticEvent(value, input.service);
+    if (!event) continue;
+    if (event.event === "runtime_event_loop_delay") summary.latestEventLoopDelay = event;
+    else summary.latestSlowOperation = event;
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations) summary.activeOperations = activeOperations;
+  return summary;
+}
+
+function copyEvent(event: RuntimeDiagnosticEvent): RuntimeDiagnosticEvent {
+  return { ...event, ...(event.context ? { context: diagnosticContext(event.context) } : {}) };
+}
 
 function boundedInteger(value: number, name: string, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
@@ -42,6 +175,8 @@ export class RuntimeDiagnostics {
   private readonly slowThresholdMs: number;
   private readonly maxSamples: number;
   private readonly schedule: NonNullable<RuntimeDiagnosticsOptions["schedule"]>;
+  private readonly cpuUsage: NonNullable<RuntimeDiagnosticsOptions["cpuUsage"]>;
+  private readonly rssBytes: NonNullable<RuntimeDiagnosticsOptions["rssBytes"]>;
   private running = false;
   private generation = 0;
   private cancelTimer: (() => void) | null = null;
@@ -52,6 +187,9 @@ export class RuntimeDiagnostics {
   private suppressedLogEvents = 0;
   private lastLoggedAt = -Infinity;
   private readonly recentSlowEvents: RuntimeDiagnosticEvent[] = [];
+  private latestEventLoopDelay: RuntimeDiagnosticEvent | undefined;
+  private latestSlowOperation: RuntimeDiagnosticEvent | undefined;
+  private readonly activeOperations = new Map<symbol, { stage: string; startedAt: number }>();
 
   constructor(options: RuntimeDiagnosticsOptions) {
     if (typeof options.service !== "string" || !LABEL.test(options.service)) {
@@ -72,7 +210,7 @@ export class RuntimeDiagnostics {
       64,
       boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER),
     );
-    for (const name of ["now", "wallNow", "onEvent", "schedule"] as const) {
+    for (const name of ["now", "wallNow", "onEvent", "schedule", "cpuUsage", "rssBytes"] as const) {
       if (options[name] !== undefined && typeof options[name] !== "function") {
         throw new TypeError(`${name} must be a function`);
       }
@@ -80,6 +218,8 @@ export class RuntimeDiagnostics {
     this.now = options.now ?? (() => performance.now());
     this.wallNow = options.wallNow ?? Date.now;
     this.onEvent = options.onEvent;
+    this.cpuUsage = options.cpuUsage ?? (() => process.cpuUsage());
+    this.rssBytes = options.rssBytes ?? (() => process.memoryUsage.rss());
     this.schedule =
       options.schedule ??
       ((callback, delayMs) => {
@@ -119,24 +259,35 @@ export class RuntimeDiagnostics {
       slowEventLoopSamples: this.slowEventLoopSamples,
       slowOperationSamples: this.slowOperationSamples,
       suppressedLogEvents: this.suppressedLogEvents,
-      recentSlowEvents: this.recentSlowEvents.map((event) => ({ ...event })),
+      latestEventLoopDelay: this.latestEventLoopDelay
+        ? copyEvent(this.latestEventLoopDelay)
+        : undefined,
+      latestSlowOperation: this.latestSlowOperation
+        ? copyEvent(this.latestSlowOperation)
+        : undefined,
+      activeOperations: this.activeOperationSnapshot(),
+      recentSlowEvents: this.recentSlowEvents.map(copyEvent),
     };
   }
 
   run<T>(stage: string, fn: () => T): T {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return fn();
     } finally {
+      if (operation) this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
 
   async runAsync<T>(stage: string, fn: () => Promise<T>): Promise<T> {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return await fn();
     } finally {
+      if (operation) this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
@@ -148,6 +299,7 @@ export class RuntimeDiagnostics {
       return;
     }
     const expectedAt = startedAt + this.sampleIntervalMs;
+    const cpuBefore = this.readCpuUsage();
     const callback = () => {
       if (!this.running || this.generation !== generation) return;
       this.cancelTimer = null;
@@ -170,6 +322,7 @@ export class RuntimeDiagnostics {
                 observedAt: new Date(this.wallNow()).toISOString(),
                 delayMs,
                 sampleIntervalMs: this.sampleIntervalMs,
+                context: this.sampleContext(startedAt, observed, cpuBefore),
               },
               observed,
             );
@@ -198,6 +351,57 @@ export class RuntimeDiagnostics {
     }
   }
 
+  private trackOperation(stage: string, startedAt: number | null): symbol | undefined {
+    if (startedAt === null || this.activeOperations.size >= MAX_ACTIVE_OPERATIONS) return undefined;
+    const key = Symbol();
+    this.activeOperations.set(key, {
+      stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+      startedAt,
+    });
+    return key;
+  }
+
+  private activeOperationSnapshot(): RuntimeActiveOperation[] {
+    const now = this.readNow();
+    if (now === null) return [];
+    return [...this.activeOperations.values()].map(({ stage, startedAt }) => ({
+      stage,
+      elapsedMs: Math.max(0, now - startedAt),
+    }));
+  }
+
+  private readCpuUsage(): { user: number; system: number } | null {
+    try {
+      const usage = this.cpuUsage();
+      return finiteMeasurement(usage.user) && finiteMeasurement(usage.system) ? usage : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private sampleContext(
+    startedAt: number,
+    observed: number,
+    before: { user: number; system: number } | null,
+  ): RuntimeDiagnosticContext {
+    const context: RuntimeDiagnosticContext = {
+      sampleElapsedMs: Math.max(0, observed - startedAt),
+      activeOperations: this.activeOperationSnapshot(),
+    };
+    const after = this.readCpuUsage();
+    if (before && after && after.user >= before.user && after.system >= before.system) {
+      context.cpuUserMs = (after.user - before.user) / 1000;
+      context.cpuSystemMs = (after.system - before.system) / 1000;
+    }
+    try {
+      const rss = this.rssBytes();
+      if (finiteMeasurement(rss)) context.rssBytes = rss;
+    } catch {
+      // Missing/failed resource APIs cannot hide the timer-delay observation.
+    }
+    return context;
+  }
+
   private observeOperation(stage: string, startedAt: number | null): void {
     try {
       if (startedAt === null) return;
@@ -222,6 +426,8 @@ export class RuntimeDiagnostics {
   }
 
   private record(event: RuntimeDiagnosticEvent, observed: number): void {
+    if (event.event === "runtime_event_loop_delay") this.latestEventLoopDelay = event;
+    else this.latestSlowOperation = event;
     this.recentSlowEvents.push(event);
     if (this.recentSlowEvents.length > this.maxSamples) this.recentSlowEvents.shift();
     if (!this.onEvent) return;
@@ -232,7 +438,7 @@ export class RuntimeDiagnostics {
     this.lastLoggedAt = observed;
     try {
       // Copy before handing to the sink; tolerate accidental async sinks too.
-      void Promise.resolve(this.onEvent({ ...event })).catch(() => undefined);
+      void Promise.resolve(this.onEvent(copyEvent(event))).catch(() => undefined);
     } catch {
       // Logging is best effort and cannot break the instrumented operation.
     }

@@ -50,6 +50,10 @@ const copyPairs: Array<[string, string]> = [
     join(outDir, "sandbox", "apps", "workerpals", "src", "startup_budget.ts"),
   ],
   [
+    join(repoRoot, "apps", "workerpals", "src", "execution_readiness.ts"),
+    join(outDir, "sandbox", "apps", "workerpals", "src", "execution_readiness.ts"),
+  ],
+  [
     join(repoRoot, "packages", "shared", "src", "bounded_fetch.ts"),
     join(outDir, "sandbox", "packages", "shared", "src", "bounded_fetch.ts"),
   ],

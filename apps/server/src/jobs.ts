@@ -2906,9 +2906,12 @@ export class JobQueue {
     const workerId = row?.workerId?.trim() ?? "";
     if (!workerId) return null;
     const worker = this.db
-      .prepare(`SELECT status, lastHeartbeat FROM workers WHERE workerId = ?`)
-      .get(workerId) as { status: string | null; lastHeartbeat: string | null } | undefined;
+      .prepare(`SELECT status, lastHeartbeat, details FROM workers WHERE workerId = ?`)
+      .get(workerId) as
+      | { status: string | null; lastHeartbeat: string | null; details: string | null }
+      | undefined;
     if (!worker) return null;
+    if (parseObjectJson(worker.details).executionReady === false) return null;
     if (
       String(worker.status ?? "")
         .trim()
@@ -2982,6 +2985,7 @@ export class JobQueue {
                  FROM workers tw
                  WHERE tw.workerId = jobs.targetWorkerId
                    AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                    AND tw.lastHeartbeat >= ?
                )
              )
@@ -3049,6 +3053,7 @@ export class JobQueue {
                FROM workers tw
                WHERE tw.workerId = jobs.targetWorkerId
                  AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                  AND tw.lastHeartbeat >= ?
              )
          )
@@ -3368,6 +3373,7 @@ export class JobQueue {
     queueWaitMs?: number;
     replayed?: boolean;
     code?: "worker_runtime_generation_mismatch";
+    executionBlocked?: boolean;
     message?: string;
   } {
     const workerId = normalizeJobWorkerId(workerIdRaw);
@@ -3435,6 +3441,16 @@ export class JobQueue {
         };
       }
 
+      // Do not consume a pending job/attempt while this worker reports a
+      // failed capability probe. Existing claims above remain replayable so
+      // readiness changes cannot strand work already owned by the worker.
+      const readiness = this.db
+        .prepare(`SELECT details FROM workers WHERE workerId = ?`)
+        .get(workerId) as { details: string | null } | undefined;
+      if (parseObjectJson(readiness?.details ?? null).executionReady === false) {
+        return { executionBlocked: true as const };
+      }
+
       const row = this.db
         .prepare(
           `SELECT * FROM jobs
@@ -3447,6 +3463,7 @@ export class JobQueue {
                  FROM workers tw
                  WHERE tw.workerId = jobs.targetWorkerId
                    AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                    AND tw.lastHeartbeat >= ?
                )
              )
@@ -3578,6 +3595,7 @@ export class JobQueue {
 
     const claimed = tx();
     if (!claimed) return { ok: false, message: "No pending jobs" };
+    if ("executionBlocked" in claimed) return { ok: true, executionBlocked: true };
     if ("runtimeGenerationMismatch" in claimed) {
       return {
         ok: false,
@@ -5431,6 +5449,7 @@ export class JobQueue {
                FROM workers tw
                WHERE tw.workerId = jobs.targetWorkerId
                  AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                  AND tw.lastHeartbeat >= ?
              )
            )`,

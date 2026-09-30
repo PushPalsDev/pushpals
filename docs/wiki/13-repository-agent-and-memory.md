@@ -380,6 +380,17 @@ The caller should log the RepositoryAgent request ID and correlation ID so a dur
 
 ## Debugging Checklist
 
+RemoteBuddy skips expensive autonomous analysis while fresh workers explicitly
+report blocked execution capability. A confirmed empty, final-window-exhausted
+analysis pauses identical RepositoryAgent requests for at most 30 minutes.
+Normal ticks still inspect fresh repository evidence and eligibility; changes
+to the revision/tree, vision/policy, cooldowns, target exclusions, budgets, or
+implementation outcomes reopen discovery immediately. The pause is constant-size,
+process-local state, never an indefinite freeze or a reason to fabricate work.
+Host-attested infrastructure failures before coding do not impose the normal
+six-hour target-diversity cooldown. Ordinary user requests remain unaffected by
+this discovery backpressure.
+
 When a RepositoryAgent call appears stuck or wrong:
 
 1. Confirm the submitted deadline is still in the future.

@@ -731,6 +731,15 @@ jobs:
           tests/vscode.http-deadline.test.ts
           tests/start.runtime-services.test.ts
 
+      - name: Verify execution capability and review quality contracts
+        run: >-
+          bun test
+          tests/workerpals.execution-readiness.test.ts
+          tests/server.worker-execution-readiness.test.ts
+          tests/server.review-quality-metrics.test.ts
+          tests/remotebuddy.worker-autoscale.test.ts
+          tests/shared.runtime-diagnostics.test.ts
+
       - name: Download Windows runtime artifacts
         uses: actions/download-artifact@v8
         with:

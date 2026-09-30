@@ -107,6 +107,111 @@ function createOrchestrator(
 }
 
 describe("RemoteBuddy worker autoscaling", () => {
+  test("keeps blocked controllers online without selecting them as idle execution capacity", async () => {
+    const orchestrator = createOrchestrator(makeTempDir()) as any;
+    const blocked = {
+      workerId: "blocked",
+      isOnline: true,
+      status: "error",
+      activeJobCount: 0,
+      details: { executionReady: false },
+      lastHeartbeat: "2026-09-30T12:00:02.000Z",
+    };
+    const ready = {
+      ...blocked,
+      workerId: "ready",
+      status: "idle",
+      details: { executionReady: true },
+      lastHeartbeat: "2026-09-30T12:00:01.000Z",
+    };
+    try {
+      expect(orchestrator.pickOnlineWorker([blocked], "blocked")).toBe(blocked);
+      expect(orchestrator.onlineWorkers([blocked, ready])).toHaveLength(2);
+      expect(orchestrator.pickIdleWorker([ready, blocked])).toBe(ready);
+      expect(orchestrator.pickIdleWorker([{ ...blocked, status: "idle" }])).toBeNull();
+      expect(orchestrator.pickIdleWorker([{ ...ready, details: {} }])?.workerId).toBe("ready");
+      orchestrator.fetchWorkers = async () => [blocked, ready];
+      expect((await orchestrator.waitForIdleWorker(0, "blocked"))?.workerId).toBe("ready");
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("newly registered blocked workers do not receive pinned jobs", async () => {
+    const orchestrator = createOrchestrator(makeTempDir()) as any;
+    const workers: any[] = [];
+    let spawns = 0;
+    orchestrator.waitForWorkerMs = 0;
+    orchestrator.maxWorkers = 2;
+    orchestrator.fetchWorkers = async () => workers;
+    orchestrator.spawnWorker = async () => {
+      spawns++;
+      workers.push({
+        workerId: "blocked",
+        isOnline: true,
+        status: "error",
+        activeJobCount: 0,
+        details: { executionReady: false },
+      });
+      return "blocked";
+    };
+    try {
+      expect(await orchestrator.selectTargetWorkerForJob()).toBeNull();
+      expect(spawns).toBe(1);
+      workers[0].status = "idle";
+      workers[0].details.executionReady = true;
+      expect(await orchestrator.selectTargetWorkerForJob()).toBe("blocked");
+      expect(spawns).toBe(1);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("a fresh blocked heartbeat completes registration without restarting its capability backoff", async () => {
+    let spawnedId = "";
+    let spawns = 0;
+    let terminations = 0;
+    let finishExit!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      finishExit = resolve;
+    });
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => {
+      terminations++;
+      finishExit(0);
+    }) as any;
+    orchestrator.minWorkers = 1;
+    orchestrator.maxWorkers = 1;
+    orchestrator.fetchWorkers = async () => [
+      {
+        workerId: spawnedId,
+        isOnline: true,
+        status: "error",
+        activeJobCount: 0,
+        details: { executionReady: false },
+        lastHeartbeat: new Date().toISOString(),
+      },
+    ];
+    orchestrator.fetchWorkerAutoscaleSnapshot = async () => ({
+      workers: { online: 1, busy: 0, idle: 0 },
+      jobs: { pending: 0, autoscalablePending: 0 },
+      prs: { openUnmerged: 0 },
+    });
+    (Bun as any).spawn = (command: string[]) => {
+      spawns++;
+      spawnedId = command[command.indexOf("--workerId") + 1];
+      return { pid: 12345, exited, stdout: null, stderr: null, kill() {} };
+    };
+    try {
+      expect(await orchestrator.spawnWorker()).toBe(spawnedId);
+      await orchestrator.ensureAutoscaledWorkerCapacity("blocked readiness");
+      expect(spawns).toBe(1);
+      expect(terminations).toBe(0);
+      expect(orchestrator.managedWorkers.size).toBe(1);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
   test("a prewarm fetch completing after disposal cannot spawn a worker", async () => {
     const orchestrator = createOrchestrator(makeTempDir());
     let releaseFetch!: (workers: unknown[]) => void;

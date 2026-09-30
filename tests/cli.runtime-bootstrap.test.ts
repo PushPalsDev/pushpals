@@ -2504,6 +2504,33 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     });
   });
 
+  test.each([
+    ["blocked", "blocked"],
+    ["checking", "warming"],
+  ] as const)(
+    "live worker with %s execution capability is reported as %s, not ready",
+    async (status, expected) => {
+      const result = await resolveWorkerExecutionReadiness({
+        serverUrl: "http://127.0.0.1:3001",
+        ttlMs: 15_000,
+        autoSpawnWorkerpals: true,
+        dockerEnabled: true,
+        requireDocker: true,
+        fetchWorkersFn: async () => [
+          {
+            workerId: "blocked",
+            status: "error",
+            isOnline: true,
+            activeJobCount: 0,
+            details: { executionReady: false, executionReadiness: { status } },
+          },
+        ],
+      });
+      expect(result.state).toBe(expected);
+      expect(result.detail).toContain("online");
+    },
+  );
+
   test("resolveWorkerExecutionReadiness reports blocked when required Docker-backed auto-spawn cannot start", async () => {
     const result = await resolveWorkerExecutionReadiness({
       serverUrl: "http://127.0.0.1:3001",

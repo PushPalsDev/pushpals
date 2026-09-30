@@ -5,8 +5,13 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   autonomyIntegrationBaselineDecision,
+  AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS,
+  exhaustedDiscoveryKey,
+  filterCandidatesForWorkDiversity,
+  isExecutedAutonomyImplementationOutcome,
   RemoteBuddyAutonomousEngine,
   resolveAutonomyGitCommandTimeoutMs,
+  workDiversityPenaltyForCandidate,
 } from "../apps/remotebuddy/src/autonomous_engine";
 import {
   REPOSITORY_AGENT_SCHEMA_VERSION,
@@ -589,8 +594,12 @@ describe("RepositoryAgent autonomy ideation", () => {
 
     let submitted: Record<string, unknown> | null = null;
     let returnEmpty = false;
+    let exhausted = false;
+    let nextWindowAvailable = false;
+    let askCalls = 0;
     const repositoryAgent = {
       async ask(input: Record<string, unknown>) {
+        askCalls++;
         submitted = input;
         const repository = input.repository as Record<string, unknown>;
         return {
@@ -632,7 +641,8 @@ describe("RepositoryAgent autonomy ideation", () => {
             page: 1,
             pageCount: 3,
             advanced: true,
-            boundedCoverageExhausted: false,
+            boundedCoverageExhausted: exhausted,
+            ...(nextWindowAvailable ? { nextWindowAvailable: true } : {}),
             retryEligible: true,
             excludedCandidateCount: 1,
           },
@@ -722,6 +732,14 @@ describe("RepositoryAgent autonomy ideation", () => {
         ],
         recent_objectives: [
           {
+            job_id: "setup-only",
+            status: "failed",
+            execution_started: false,
+            failure_class: "docker_engine",
+            target_paths: ["src/setup-only.ts"],
+            updated_at: new Date().toISOString(),
+          },
+          {
             status: "completed",
             target_paths: ["src/recent.ts"],
             updated_at: new Date().toISOString(),
@@ -731,6 +749,21 @@ describe("RepositoryAgent autonomy ideation", () => {
             target_paths: ["src/old.ts"],
             updated_at: "2000-01-01T00:00:00.000Z",
           },
+        ],
+        executed_objectives: [
+          {
+            job_id: "setup-only",
+            status: "failed",
+            execution_started: false,
+            failure_class: "docker_engine",
+          },
+          {
+            job_id: "code-started",
+            status: "failed",
+            execution_started: true,
+            failure_class: "docker_engine",
+          },
+          { job_id: "legacy", status: "failed" },
         ],
       },
     });
@@ -747,7 +780,39 @@ describe("RepositoryAgent autonomy ideation", () => {
       retryEligible: true,
       excludedCandidateCount: 1,
     });
-  });
+    expect(
+      ((submitted?.context as any).runtimeSignals.recentObjectives as any[]).map(
+        (row) => row.job_id,
+      ),
+    ).toEqual(["code-started", "legacy"]);
+
+    exhausted = true;
+    nextWindowAvailable = true;
+    await (engine as any).repositoryAgentIdeation(ideationInput);
+    expect((engine as any).exhaustedDiscovery).toBeNull();
+    nextWindowAvailable = false;
+    await (engine as any).repositoryAgentIdeation(ideationInput);
+    const firstRecheckAt = (engine as any).exhaustedDiscovery.recheckAtMs;
+    expect(firstRecheckAt - Date.now()).toBeGreaterThan(
+      AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS - 1_000,
+    );
+    const callsAtExhaustion = askCalls;
+    const paused = await (engine as any).repositoryAgentIdeation({
+      ...ideationInput,
+      snapshot: { ...ideationInput.snapshot, snapshot_id: "new-observation" },
+    });
+    expect(paused.deferred).toBe(true);
+    expect(askCalls).toBe(callsAtExhaustion);
+    expect((engine as any).exhaustedDiscovery.recheckAtMs).toBe(firstRecheckAt);
+
+    (engine as any).exhaustedDiscovery.recheckAtMs = Date.now();
+    expect((await (engine as any).repositoryAgentIdeation(ideationInput)).deferred).toBeUndefined();
+    expect(askCalls).toBe(callsAtExhaustion + 1);
+    writeFileSync(join(root, "service.ts"), "export const ready = 'changed evidence';\n");
+    expect((await (engine as any).repositoryAgentIdeation(ideationInput)).deferred).toBeUndefined();
+    expect(askCalls).toBe(callsAtExhaustion + 2);
+    engine.stop();
+  }, 30_000);
 
   test("cancels in-flight repository ideation when autonomy is disabled and returns deterministic fallback", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-agent-abort-"));
@@ -1043,6 +1108,156 @@ const durableDiscoveryProgress = {
   excludedCandidateCount: 0,
 };
 
+describe("exhausted discovery evidence and eligibility key", () => {
+  const nowMs = Date.parse("2026-09-30T12:00:00.000Z");
+  function input(): Parameters<typeof exhaustedDiscoveryKey>[0] {
+    return {
+      repository: { identity: "repo", revision: "revision", tree: "tree" },
+      context: {
+        vision: { sha256: "vision" },
+        deterministicPolicy: { maxCandidates: 3 },
+        discoveryExclusions: { targetPaths: ["src/a.ts", "src/b.ts"] },
+        runtimeSignals: { recentObjectives: [], executedOutcomeWatermark: "outcomes" },
+      },
+      snapshot: makeSnapshot() as any,
+      config: makeConfig().remotebuddy.autonomy,
+      nowMs,
+    };
+  }
+
+  test("ignores observation timestamps, ordering and transient health noise", () => {
+    const before = input();
+    const after = input();
+    after.snapshot.snapshot_id = "another-snapshot";
+    after.snapshot.snapshot_created_at = new Date(nowMs + 60_000).toISOString();
+    after.snapshot.top_signals = [
+      { signal_id: "queue", type: "queue", value: 2, evidence: "noise" },
+    ];
+    after.context.discoveryExclusions = { targetPaths: ["src/b.ts", "src/a.ts", "src/a.ts"] };
+    expect(exhaustedDiscoveryKey(after)).toBe(exhaustedDiscoveryKey(before));
+  });
+
+  test.each([
+    "tree",
+    "revision",
+    "vision",
+    "policy",
+    "exclusion_added",
+    "exclusion_removed",
+    "outcome",
+    "cooldown",
+    "budget",
+  ])("resumes on a relevant %s change", (change) => {
+    const before = input();
+    const after = input();
+    if (change === "tree" || change === "revision") after.repository[change] = "changed";
+    if (change === "vision") after.context.vision = { sha256: "changed" };
+    if (change === "policy") after.context.deterministicPolicy = { maxCandidates: 1 };
+    if (change === "exclusion_added")
+      after.context.discoveryExclusions = { targetPaths: ["src/a.ts", "src/b.ts", "src/c.ts"] };
+    if (change === "exclusion_removed")
+      after.context.discoveryExclusions = { targetPaths: ["src/a.ts"] };
+    if (change === "outcome")
+      after.context.runtimeSignals = { executedOutcomeWatermark: "changed" };
+    if (change === "cooldown")
+      after.snapshot.active_cooldowns = [
+        { pattern_key: "candidate", cooldown_until: new Date(nowMs + 1).toISOString() },
+      ];
+    if (change === "budget") {
+      before.config.maxDispatchPerHourByType = { small_refactor: 2 };
+      after.config.maxDispatchPerHourByType = { small_refactor: 2 };
+      after.snapshot.dispatch_budget.by_type_count_last_hour = { small_refactor: 2 };
+    }
+    expect(exhaustedDiscoveryKey(after)).not.toBe(exhaustedDiscoveryKey(before));
+  });
+
+  test("cooldown expiry resumes without a new server event", () => {
+    const before = input();
+    before.snapshot.active_cooldowns = [
+      { pattern_key: "candidate", cooldown_until: new Date(nowMs + 1).toISOString() },
+    ];
+    expect(exhaustedDiscoveryKey({ ...before, nowMs: nowMs + 1 })).not.toBe(
+      exhaustedDiscoveryKey(before),
+    );
+  });
+
+  test("excludes only explicitly unstarted infrastructure failures from implementation evidence", () => {
+    for (const failure_class of [
+      "infra",
+      "docker_engine",
+      "docker_infrastructure",
+      "environment.missing_tool",
+    ]) {
+      const outcome = {
+        job_id: "failed-job",
+        status: "failed",
+        execution_started: false,
+        failure_class,
+      };
+      expect(isExecutedAutonomyImplementationOutcome(outcome)).toBe(false);
+      expect(isExecutedAutonomyImplementationOutcome({ ...outcome, execution_started: true })).toBe(
+        true,
+      );
+      expect(
+        isExecutedAutonomyImplementationOutcome({ ...outcome, execution_started: undefined }),
+      ).toBe(true);
+    }
+    expect(isExecutedAutonomyImplementationOutcome({ job_id: "legacy", status: "failed" })).toBe(
+      true,
+    );
+    expect(
+      isExecutedAutonomyImplementationOutcome({
+        job_id: "code",
+        status: "failed",
+        execution_started: false,
+        failure_class: "code",
+      }),
+    ).toBe(true);
+    expect(isExecutedAutonomyImplementationOutcome({ status: "failed" })).toBe(false);
+    expect(isExecutedAutonomyImplementationOutcome({ job_id: "running", status: "running" })).toBe(
+      false,
+    );
+  });
+});
+
+describe("setup-only infrastructure work diversity", () => {
+  test("recovered capacity can retry untouched targets without a six-hour penalty", () => {
+    const candidate = {
+      id: "candidate",
+      objective_type: "small_refactor",
+      component_area: "src",
+      target_paths: ["src/a.ts"],
+    };
+    const objective = {
+      objective_id: "objective",
+      pattern_key: "pattern",
+      job_id: "job",
+      status: "failed",
+      execution_started: false,
+      failure_class: "docker_engine",
+      target_paths: ["src/a.ts"],
+      updated_at: new Date().toISOString(),
+    };
+    const options = { rows: [{ candidate }], recentObjectives: [objective] };
+    expect(filterCandidatesForWorkDiversity(options).rows).toHaveLength(1);
+    expect(
+      workDiversityPenaltyForCandidate({ candidate, recentObjectives: [objective] }),
+    ).toBeNull();
+    for (const retained of [
+      { ...objective, execution_started: true },
+      { ...objective, execution_started: undefined },
+      { ...objective, failure_class: "code" },
+    ]) {
+      expect(
+        filterCandidatesForWorkDiversity({ ...options, recentObjectives: [retained] }).rows,
+      ).toHaveLength(0);
+      expect(
+        workDiversityPenaltyForCandidate({ candidate, recentObjectives: [retained] }),
+      ).not.toBeNull();
+    }
+  });
+});
+
 function healthyDiscoveryLoad(): any {
   return {
     discoveryCapacityVerified: true,
@@ -1144,6 +1359,51 @@ function discoveryTestEngine(): RemoteBuddyAutonomousEngine {
 }
 
 describe("bounded autonomy discovery followups", () => {
+  test("blocked execution capability stops normal discovery and a fresh ready snapshot resumes it", async () => {
+    mockGitSpawnForTest();
+    const engine = discoveryTestEngine() as any;
+    const snapshot: any = makeSnapshot();
+    let analyses = 0;
+    const ideation = engine.repositoryAgentIdeation;
+    engine.repositoryAgentIdeation = async (...args: unknown[]) => {
+      analyses++;
+      return ideation(...args);
+    };
+    engine.fetchSnapshot = async () => snapshot;
+    snapshot.execution_capability = { state: "blocked", reason: "docker_engine" };
+    await engine.tick();
+    expect(analyses).toBe(0);
+    expect(engine.lastDetail).toBe("execution_capability_blocked:docker_engine");
+    expect(engine.discoveryFollowupTimer).toBeNull();
+    snapshot.execution_capability = { state: "ready" };
+    await engine.tick();
+    expect(analyses).toBe(1);
+    expect(engine.lastDetail).toBe("no_eligible_candidates");
+    engine.stop();
+  });
+
+  test("a deferred exhausted discovery does not manufacture another empty objective", async () => {
+    mockGitSpawnForTest();
+    const engine = discoveryTestEngine() as any;
+    let objectives = 0;
+    engine.postObjective = async () => {
+      objectives++;
+      return true;
+    };
+    engine.repositoryAgentIdeation = async () => ({
+      json: { candidates: [] },
+      llmCall: {},
+      result: null,
+      discoveryProgress: null,
+      deferred: true,
+    });
+    await engine.tick();
+    expect(objectives).toBe(0);
+    expect(engine.lastDetail).toBe("repository_discovery_exhausted_backoff");
+    expect(engine.discoveryFollowupTimer).toBeNull();
+    engine.stop();
+  });
+
   test("continues at a durable discovery-window boundary without bypassing followup budgets", async () => {
     await withCapturedAutonomyTimers(({ timers, fire }) => {
       const engine = discoveryTestEngine() as any;

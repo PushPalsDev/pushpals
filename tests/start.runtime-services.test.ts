@@ -154,6 +154,66 @@ describe("start runtime service helpers", () => {
     );
   });
 
+  test("health probes retain typed latest diagnostics beyond the 500-character detail prefix", async () => {
+    const oldEvent = {
+      event: "runtime_event_loop_delay",
+      observedAt: "2026-09-30T08:45:09.701Z",
+      delayMs: 1492,
+      sampleIntervalMs: 1000,
+    };
+    const latestEvent = {
+      ...oldEvent,
+      observedAt: "2026-09-30T14:55:43.524Z",
+      delayMs: 9393,
+      context: { cpuUserMs: 10, cpuSystemMs: 2, rssBytes: 64_000_000, error: "private error" },
+    };
+    const result = await defaultProbeServiceHealth({ url: "http://127.0.0.1/health" }, async () =>
+      Response.json({
+        healthy: true,
+        precedingStatus: "x".repeat(2000),
+        diagnostics: {
+          service: "server",
+          recentSlowEvents: [oldEvent, latestEvent],
+          environment: "private secret",
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    expect(result.detail.length).toBe(500);
+    expect(result.diagnostics?.latestEventLoopDelay).toMatchObject({
+      observedAt: latestEvent.observedAt,
+      delayMs: 9393,
+      context: { cpuUserMs: 10, cpuSystemMs: 2, rssBytes: 64_000_000 },
+    });
+    expect(JSON.stringify(result.diagnostics)).not.toContain("private");
+    expect(JSON.stringify(result.diagnostics)).not.toContain(oldEvent.observedAt);
+  });
+
+  test("optional diagnostic parsing cannot change plain-text, malformed, or unhealthy HTTP outcomes", async () => {
+    for (const body of [
+      "ok",
+      "{incomplete",
+      JSON.stringify({ diagnostics: { service: "invalid private label" } }),
+    ]) {
+      const result = await defaultProbeServiceHealth(
+        { url: "http://127.0.0.1/health" },
+        async () => new Response(body),
+      );
+      expect(result.ok).toBe(true);
+      expect(result.diagnostics).toBeUndefined();
+    }
+    const failed = await defaultProbeServiceHealth({ url: "http://127.0.0.1/health" }, async () =>
+      Response.json(
+        { diagnostics: { service: "server", maxEventLoopDelayMs: 1234 } },
+        { status: 503 },
+      ),
+    );
+    expect(failed.ok).toBe(false);
+    expect(failed.failureKind).toBe("unhealthy_response");
+    expect(failed.failureStage).toBe("http_status");
+    expect(failed.diagnostics).toEqual({ service: "server", maxEventLoopDelayMs: 1234 });
+  });
+
   test("three brief transport timeouts cannot kill validation, but sustained failure remains bounded", () => {
     const failure = {
       failureKind: "transport_error" as const,
@@ -419,6 +479,7 @@ describe("start runtime service helpers", () => {
       probeTimeoutMs: 2_500,
       responseHeadersMs: 2,
       probeDeadlineOverrunMs: 0,
+      diagnostics: { service: "fixture", maxEventLoopDelayMs: 9393 },
     };
     const timeout: ManagedServiceHealthResult = {
       ok: false,
@@ -515,6 +576,7 @@ describe("start runtime service helpers", () => {
         failureStage: null,
         responseHeadersMs: 2,
         probeDeadlineOverrunMs: 0,
+        diagnostics: healthy.diagnostics,
       });
       now = 18_500;
       await resolveProbe("server", healthy);
@@ -526,6 +588,7 @@ describe("start runtime service helpers", () => {
         recoveredAfterFailures: 2,
         recoveredWithoutRestart: true,
         failureDurationMs: 8_500,
+        diagnostics: healthy.diagnostics,
       });
       expect(logs).toContain(
         "Managed source_control_manager health recovered without a process restart (metricsScope=current_process, failedProbes=2, observedFailureDurationMs=7500, probeDurationMs=3).",
@@ -743,6 +806,7 @@ describe("start runtime service helpers", () => {
         responseStatus: 503,
         probeDurationMs: 7,
         probeTimeoutMs: 2_500,
+        diagnostics: { service: "source_control_manager", maxEventLoopDelayMs: 9000 },
       }),
       spawnService: (spec) => ({
         name: spec.name,
@@ -788,6 +852,7 @@ describe("start runtime service helpers", () => {
         failureDurationMs: 100,
         probeDurationMs: 7,
         probeTimeoutMs: 2_500,
+        diagnostics: { service: "source_control_manager", maxEventLoopDelayMs: 9000 },
       });
     } finally {
       manager.stop();

@@ -2446,6 +2446,288 @@ function createRepositoryAgentServiceClients(options) {
     }
   });
 }
+// packages/shared/src/runtime_diagnostics.ts
+var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+var MAX_ACTIVE_OPERATIONS = 8;
+function recordValue(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function finiteMeasurement(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+function activeOperationSummary(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.slice(0, MAX_ACTIVE_OPERATIONS).flatMap((entry) => {
+    const item = recordValue(entry);
+    return item && typeof item.stage === "string" && LABEL.test(item.stage) && finiteMeasurement(item.elapsedMs) ? [{ stage: item.stage, elapsedMs: item.elapsedMs }] : [];
+  });
+}
+function diagnosticContext(value) {
+  const input = recordValue(value);
+  if (!input)
+    return;
+  const context = {};
+  for (const key of ["sampleElapsedMs", "cpuUserMs", "cpuSystemMs", "rssBytes"]) {
+    if (finiteMeasurement(input[key]))
+      context[key] = input[key];
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations)
+    context.activeOperations = activeOperations;
+  return Object.keys(context).length ? context : undefined;
+}
+function copyEvent(event) {
+  return { ...event, ...event.context ? { context: diagnosticContext(event.context) } : {} };
+}
+function boundedInteger(value, name, maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
+  }
+  return value;
+}
+
+class RuntimeDiagnostics {
+  service;
+  now;
+  wallNow;
+  onEvent;
+  sampleIntervalMs;
+  slowThresholdMs;
+  maxSamples;
+  schedule;
+  cpuUsage;
+  rssBytes;
+  running = false;
+  generation = 0;
+  cancelTimer = null;
+  lastEventLoopDelayMs = null;
+  maxEventLoopDelayMs = 0;
+  slowEventLoopSamples = 0;
+  slowOperationSamples = 0;
+  suppressedLogEvents = 0;
+  lastLoggedAt = -Infinity;
+  recentSlowEvents = [];
+  latestEventLoopDelay;
+  latestSlowOperation;
+  activeOperations = new Map;
+  constructor(options) {
+    if (typeof options.service !== "string" || !LABEL.test(options.service)) {
+      throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
+    }
+    this.service = options.service;
+    this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
+    this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
+    this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
+    for (const name of ["now", "wallNow", "onEvent", "schedule", "cpuUsage", "rssBytes"]) {
+      if (options[name] !== undefined && typeof options[name] !== "function") {
+        throw new TypeError(`${name} must be a function`);
+      }
+    }
+    this.now = options.now ?? (() => performance.now());
+    this.wallNow = options.wallNow ?? Date.now;
+    this.onEvent = options.onEvent;
+    this.cpuUsage = options.cpuUsage ?? (() => process.cpuUsage());
+    this.rssBytes = options.rssBytes ?? (() => process.memoryUsage.rss());
+    this.schedule = options.schedule ?? ((callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return () => clearTimeout(timer);
+    });
+  }
+  start() {
+    if (this.running)
+      return;
+    this.running = true;
+    this.scheduleNext(++this.generation);
+  }
+  stop() {
+    this.running = false;
+    this.generation += 1;
+    const cancel = this.cancelTimer;
+    this.cancelTimer = null;
+    try {
+      cancel?.();
+    } catch {}
+  }
+  snapshot() {
+    return {
+      service: this.service,
+      running: this.running,
+      measurement: "Timer lateness is measured delay, not proof of root cause or service downtime.",
+      sampleIntervalMs: this.sampleIntervalMs,
+      slowThresholdMs: this.slowThresholdMs,
+      lastEventLoopDelayMs: this.lastEventLoopDelayMs,
+      maxEventLoopDelayMs: this.maxEventLoopDelayMs,
+      slowEventLoopSamples: this.slowEventLoopSamples,
+      slowOperationSamples: this.slowOperationSamples,
+      suppressedLogEvents: this.suppressedLogEvents,
+      latestEventLoopDelay: this.latestEventLoopDelay ? copyEvent(this.latestEventLoopDelay) : undefined,
+      latestSlowOperation: this.latestSlowOperation ? copyEvent(this.latestSlowOperation) : undefined,
+      activeOperations: this.activeOperationSnapshot(),
+      recentSlowEvents: this.recentSlowEvents.map(copyEvent)
+    };
+  }
+  run(stage, fn) {
+    const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
+    try {
+      return fn();
+    } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  async runAsync(stage, fn) {
+    const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
+    try {
+      return await fn();
+    } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  scheduleNext(generation) {
+    const startedAt = this.readNow();
+    if (startedAt === null) {
+      this.stop();
+      return;
+    }
+    const expectedAt = startedAt + this.sampleIntervalMs;
+    const cpuBefore = this.readCpuUsage();
+    const callback = () => {
+      if (!this.running || this.generation !== generation)
+        return;
+      this.cancelTimer = null;
+      try {
+        const observed = this.readNow();
+        if (observed === null) {
+          this.stop();
+          return;
+        }
+        const delayMs = Math.max(0, observed - expectedAt);
+        if (Number.isFinite(delayMs)) {
+          this.lastEventLoopDelayMs = delayMs;
+          this.maxEventLoopDelayMs = Math.max(this.maxEventLoopDelayMs, delayMs);
+          if (delayMs >= this.slowThresholdMs) {
+            this.slowEventLoopSamples += 1;
+            this.record({
+              event: "runtime_event_loop_delay",
+              service: this.service,
+              observedAt: new Date(this.wallNow()).toISOString(),
+              delayMs,
+              sampleIntervalMs: this.sampleIntervalMs,
+              context: this.sampleContext(startedAt, observed, cpuBefore)
+            }, observed);
+          }
+        }
+      } catch {}
+      if (this.running && this.generation === generation)
+        this.scheduleNext(generation);
+    };
+    try {
+      this.cancelTimer = this.schedule(callback, this.sampleIntervalMs);
+    } catch {
+      this.stop();
+    }
+  }
+  readNow() {
+    try {
+      const value = this.now();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  trackOperation(stage, startedAt) {
+    if (startedAt === null || this.activeOperations.size >= MAX_ACTIVE_OPERATIONS)
+      return;
+    const key = Symbol();
+    this.activeOperations.set(key, {
+      stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+      startedAt
+    });
+    return key;
+  }
+  activeOperationSnapshot() {
+    const now = this.readNow();
+    if (now === null)
+      return [];
+    return [...this.activeOperations.values()].map(({ stage, startedAt }) => ({
+      stage,
+      elapsedMs: Math.max(0, now - startedAt)
+    }));
+  }
+  readCpuUsage() {
+    try {
+      const usage = this.cpuUsage();
+      return finiteMeasurement(usage.user) && finiteMeasurement(usage.system) ? usage : null;
+    } catch {
+      return null;
+    }
+  }
+  sampleContext(startedAt, observed, before) {
+    const context = {
+      sampleElapsedMs: Math.max(0, observed - startedAt),
+      activeOperations: this.activeOperationSnapshot()
+    };
+    const after = this.readCpuUsage();
+    if (before && after && after.user >= before.user && after.system >= before.system) {
+      context.cpuUserMs = (after.user - before.user) / 1000;
+      context.cpuSystemMs = (after.system - before.system) / 1000;
+    }
+    try {
+      const rss = this.rssBytes();
+      if (finiteMeasurement(rss))
+        context.rssBytes = rss;
+    } catch {}
+    return context;
+  }
+  observeOperation(stage, startedAt) {
+    try {
+      if (startedAt === null)
+        return;
+      const observed = this.readNow();
+      if (observed === null)
+        return;
+      const durationMs = Math.max(0, observed - startedAt);
+      if (!Number.isFinite(durationMs) || durationMs < this.slowThresholdMs)
+        return;
+      this.slowOperationSamples += 1;
+      this.record({
+        event: "runtime_slow_operation",
+        service: this.service,
+        observedAt: new Date(this.wallNow()).toISOString(),
+        stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+        durationMs
+      }, observed);
+    } catch {}
+  }
+  record(event, observed) {
+    if (event.event === "runtime_event_loop_delay")
+      this.latestEventLoopDelay = event;
+    else
+      this.latestSlowOperation = event;
+    this.recentSlowEvents.push(event);
+    if (this.recentSlowEvents.length > this.maxSamples)
+      this.recentSlowEvents.shift();
+    if (!this.onEvent)
+      return;
+    if (observed - this.lastLoggedAt < 1000) {
+      this.suppressedLogEvents += 1;
+      return;
+    }
+    this.lastLoggedAt = observed;
+    try {
+      Promise.resolve(this.onEvent(copyEvent(event))).catch(() => {
+        return;
+      });
+    } catch {}
+  }
+}
 // packages/shared/src/scm_repair_authority.ts
 var SCM_REPAIR_AUTHORITY_SECRET_ENV = "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET";
 var SCM_REPAIR_AUTHORITY_MAX_AGE_MS = 2 * 60000;
@@ -18492,16 +18774,42 @@ function buildLinuxWorktreeAddArgs(worktreePath, baseRef, force = false) {
     baseRef
   ];
 }
+function isTransientDockerControlFailure(result) {
+  const text = `${result.stderr ?? ""}
+${result.stdout ?? ""}`;
+  if (/permission denied|access is denied|access denied|unauthorized|forbidden|invalid (?:mount|reference|argument)|no such image|pull access denied|client version .+ too (?:old|new)/i.test(text)) {
+    return false;
+  }
+  return Boolean(result.timedOut) || /internal server error|\b(?:bad gateway|service unavailable|gateway timeout)\b|cannot connect to (?:the )?docker|failed to connect to (?:the )?docker|\b(?:econnrefused|econnreset|etimedout)\b|connection (?:refused|reset|closed)|context deadline exceeded|tls handshake timeout/i.test(text);
+}
+
+class DockerInfrastructureError extends Error {
+  phase;
+  retryable;
+  exitCode;
+  executionStarted = false;
+  constructor(phase, message, retryable, exitCode) {
+    super(message);
+    this.phase = phase;
+    this.retryable = retryable;
+    this.exitCode = exitCode;
+    this.name = "DockerInfrastructureError";
+  }
+}
 
 class DockerExecutionExhaustedError extends Error {
   cooldownMs;
   category;
+  phase;
+  executionStarted;
   candidateState;
-  constructor(category, message, cooldownMs) {
+  constructor(category, message, cooldownMs, cause) {
     super(message);
     this.name = "DockerExecutionExhaustedError";
     this.category = category;
     this.cooldownMs = Math.max(0, Math.floor(cooldownMs));
+    this.phase = cause?.phase;
+    this.executionStarted = cause?.executionStarted;
   }
 }
 function addHostScmReviewPassUsage(accumulator, result, pass) {
@@ -18784,6 +19092,8 @@ class DockerExecutor {
   warmAgentPort = 39231;
   idleTimer = null;
   activeJobs = 0;
+  sharedReadinessActive = 0;
+  shuttingDown = false;
   warmAgentStartupTimeoutMs;
   warmAgentStartupPollMs = 200;
   warmSetupMaxAttempts;
@@ -18851,6 +19161,7 @@ class DockerExecutor {
     let worktreeBaselineSha = null;
     let worktreeCreationStarted = false;
     let preserveWorktreeForCandidateRecovery = false;
+    let executionStarted = false;
     const accumulatedUsage = new UsageAccumulator;
     const finish = (result) => {
       terminalResult = accumulatedUsage.apply(result);
@@ -18885,7 +19196,11 @@ class DockerExecutor {
         const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
-          let result = isHostScmOwnedReviewParams(deadlineBoundJob.params) ? await this.runHostScmOwnedReviewJob(worktreePath, deadlineBoundJob, deadlineLedger, onLog) : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+          if (isHostScmOwnedReviewParams(deadlineBoundJob.params))
+            executionStarted = true;
+          let result = isHostScmOwnedReviewParams(deadlineBoundJob.params) ? await this.runHostScmOwnedReviewJob(worktreePath, deadlineBoundJob, deadlineLedger, onLog) : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger, () => {
+            executionStarted = true;
+          });
           addDockerTransportAttemptUsage(accumulatedUsage, result, attempt);
           if (result.ok && shouldCommit(effectiveJob.kind, this.config) && !isHostScmOwnedReviewParams(effectiveJob.params) && (!result.commit || !result.commit.branch || !result.commit.sha)) {
             result = {
@@ -18956,7 +19271,7 @@ class DockerExecutor {
           const hasBudgetForRetry = retryableError && attempt < this.jobRetryMaxAttempts && this.hasBudgetForJobRetry(attempt, attemptElapsedMs, timeoutMs, onLog);
           if (attempt >= this.jobRetryMaxAttempts || !retryableError || !hasBudgetForRetry) {
             if (retryableError && attempt >= this.jobRetryMaxAttempts && !(err instanceof DockerExecutionExhaustedError)) {
-              throw new DockerExecutionExhaustedError("job_execution", `Docker execution retries exhausted after ${this.jobRetryMaxAttempts} attempts: ${this.compactError(err)}`, this.failureCooldownMs);
+              throw new DockerExecutionExhaustedError("job_execution", `Docker execution retries exhausted after ${this.jobRetryMaxAttempts} attempts: ${this.compactError(err)}`, this.failureCooldownMs, err instanceof DockerInfrastructureError ? err : undefined);
             }
             throw err;
           }
@@ -18989,6 +19304,10 @@ class DockerExecutor {
         }));
       }
       const propagatedError = error instanceof Error ? error : new Error(String(error));
+      if (propagatedError instanceof DockerInfrastructureError || propagatedError instanceof DockerExecutionExhaustedError) {
+        if (propagatedError.executionStarted !== undefined)
+          propagatedError.executionStarted = executionStarted;
+      }
       const usageSnapshot = accumulatedUsage.apply({
         ok: false,
         summary: `Docker execution threw before completion: ${this.compactError(propagatedError)}`
@@ -19072,6 +19391,47 @@ class DockerExecutor {
         Object.assign(postCleanupResult, dockerAbsoluteDeadlineResult(job, deadlineLedger, "worktree finalization", postCleanupResult));
       }
       this.scheduleIdleShutdown();
+    }
+  }
+  async checkSharedRuntimeReadiness(timeoutMs = 60000) {
+    this.assertDockerPreparationAllowed();
+    this.sharedReadinessActive += 1;
+    this.activeJobs += 1;
+    this.clearIdleTimer();
+    try {
+      const ledger = new JobDeadlineLedger({
+        executionBudgetMs: Math.max(1000, Math.min(120000, Number.isFinite(timeoutMs) ? timeoutMs : 60000)),
+        finalizationBudgetMs: 0,
+        now: this.deadlineWallNow,
+        monotonicNow: this.deadlineMonotonicNow
+      });
+      const backend = this.currentBackend();
+      this.warmedBackends.delete(backend);
+      await this.ensureWarmRuntimeReady({
+        id: "shared-readiness",
+        taskId: "shared-readiness",
+        sessionId: "",
+        kind: "warmup",
+        params: {}
+      }, undefined, ledger);
+      this.assertDockerPreparationAllowed();
+      const canary = await this.runWarmShell(buildDockerRuntimeCapabilityCanaryCommand(backend), {
+        timeoutMs: ledger.capWorkTimeout(15000)
+      }).catch((error) => {
+        if (error instanceof DockerInfrastructureError)
+          throw error;
+        const detail = this.compactError(error);
+        throw new DockerInfrastructureError("runtime_canary", detail, isTransientDockerControlFailure({ stderr: detail }));
+      });
+      if (!canary.ok || ledger.workExpired()) {
+        throw new DockerInfrastructureError("runtime_canary", `Shared Docker runtime capability check failed: ${canary.stderr || canary.stdout || `exit ${canary.exitCode}`}`, ledger.workExpired() || isTransientDockerControlFailure(canary), canary.exitCode);
+      }
+      this.assertDockerPreparationAllowed();
+    } finally {
+      this.sharedReadinessActive = Math.max(0, this.sharedReadinessActive - 1);
+      this.activeJobs = Math.max(0, this.activeJobs - 1);
+      if (!this.shuttingDown)
+        this.scheduleIdleShutdown();
     }
   }
   async validateWorktreeGitInterop() {
@@ -19391,6 +19751,8 @@ class DockerExecutor {
     return { attempts, sleepSeconds };
   }
   scheduleIdleShutdown() {
+    if (this.shuttingDown)
+      return;
     if (this.options.idleTimeoutMs <= 0)
       return;
     if (this.activeJobs > 0)
@@ -19405,6 +19767,7 @@ class DockerExecutor {
     }, this.options.idleTimeoutMs);
   }
   async startWarmContainer(deadlineLedger) {
+    this.assertDockerPreparationAllowed();
     const stopTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
     if (stopTimeoutMs <= 0) {
       throw new Error("Warm-container startup was cancelled by the absolute job work deadline.");
@@ -19469,11 +19832,11 @@ class DockerExecutor {
       console.log("[DockerExecutor] Mounting host extra CA trust into the warm container (read-only).");
     }
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
-    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
+    const result = await this.runDockerPreparationCommand("container_start", [resolveDockerExecutable(), ...args], {
       timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS
     });
     if (result.timedOut || result.exitCode !== 0) {
-      throw new Error(`Failed to start warm container (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`);
+      throw new DockerInfrastructureError("container_start", `Failed to start warm container (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`, isTransientDockerControlFailure(result), result.exitCode);
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
     await this.reconcileContainerDependencyStore(deadlineLedger);
@@ -19502,7 +19865,7 @@ class DockerExecutor {
     }
   }
   async ensureNamedVolume(name, component, deadlineLedger) {
-    const result = await this.runDockerCommandCapture([
+    const result = await this.runDockerPreparationCommand("volume_prepare", [
       resolveDockerExecutable(),
       "volume",
       "create",
@@ -19515,7 +19878,7 @@ class DockerExecutor {
       timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS
     });
     if (result.timedOut || result.exitCode !== 0) {
-      throw new Error(`Failed to prepare ${component} volume (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`);
+      throw new DockerInfrastructureError("volume_prepare", `Failed to prepare ${component} volume (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`, isTransientDockerControlFailure(result), result.exitCode);
     }
   }
   openaiCodexAuthMount(backend) {
@@ -19553,7 +19916,7 @@ class DockerExecutor {
     return { args, containerHome: containerCodexHome, hostAuthMounted: true };
   }
   async ensureWarmContainer(deadlineLedger) {
-    const inspect = await this.runDockerCommandCapture([
+    const inspect = await this.runDockerPreparationCommand("container_inspect", [
       resolveDockerExecutable(),
       "inspect",
       "-f",
@@ -19573,6 +19936,10 @@ class DockerExecutor {
       if (running && networkMode && networkMode !== this.options.networkMode) {
         console.warn(`[DockerExecutor] Warm container network mismatch (${networkMode} != ${this.options.networkMode}); recreating...`);
       }
+    }
+    if (inspect.timedOut || inspect.exitCode !== 0 && !/no such (?:object|container)/i.test(`${inspect.stderr}
+${inspect.stdout}`)) {
+      throw new DockerInfrastructureError("container_inspect", `Failed to inspect warm container: ${inspect.stderr || inspect.stdout || `exit ${inspect.exitCode}`}`, isTransientDockerControlFailure(inspect), inspect.exitCode);
     }
     await this.startWarmContainer(deadlineLedger);
   }
@@ -19919,6 +20286,11 @@ ${text}` : `
     this.warmedBackends.clear();
   }
   async shutdown() {
+    this.shuttingDown = true;
+    this.clearIdleTimer();
+    if (this.sharedReadinessActive > 0) {
+      await Promise.all([...this.startupProcesses].map((proc) => terminateDockerExecProcessTree(proc)));
+    }
     if (this.startupBudget && !this.startupCleanupLedger) {
       this.startupCleanupLedger = new JobDeadlineLedger({
         executionBudgetMs: this.startupBudget.capTimeout(WORKER_STARTUP_CLEANUP_GRACE_MS, true),
@@ -19955,10 +20327,10 @@ ${text}` : `
     await this.shutdown();
   }
   trackStartupProcess(proc) {
-    if (!this.startupBudget)
+    if (!this.startupBudget && !(this.sharedReadinessActive > 0))
       return;
     this.startupProcesses.add(proc);
-    proc.exited.then(() => this.startupProcesses.delete(proc));
+    proc.exited.then(() => this.startupProcesses.delete(proc), () => this.startupProcesses.delete(proc));
   }
   encodeJobSpec(job) {
     return Buffer.from(JSON.stringify({
@@ -20104,7 +20476,7 @@ ${text}` : `
       throw attachHostScmUsageToError(accumulatedUsage, error, activePass);
     }
   }
-  async runInWarmContainer(worktreePath, job, onLog, deadlineLedger) {
+  async runInWarmContainer(worktreePath, job, onLog, deadlineLedger, onExecutionStart) {
     if (deadlineLedger?.workExpired()) {
       return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container setup");
     }
@@ -20136,6 +20508,7 @@ ${text}` : `
         stdout: "pipe",
         stderr: "pipe"
       });
+      onExecutionStart?.();
     } catch (err) {
       throw new Error(`failed to spawn warm-container docker exec (${this.warmContainerName}, cwd=${containerWorktreePath}, argv_chars=${dockerArgv.join("\x00").length}, spec_chars=${base64Spec.length}): ${this.compactError(err)}`);
     }
@@ -20805,14 +21178,24 @@ ${text}` : `
     let attempt = 1;
     let recoveredMissingImage = false;
     while (attempt <= this.warmSetupMaxAttempts) {
+      this.assertDockerPreparationAllowed();
       if (deadlineLedger?.workExpired()) {
-        throw new Error(`Warm runtime setup for ${job.id} stopped at the absolute job work deadline.`);
+        throw new DockerInfrastructureError("backend_readiness", `Warm runtime setup for ${job.id} stopped at the absolute job work deadline.`, true, 124);
       }
       try {
         await this.ensureWarmContainer(deadlineLedger);
-        await this.ensureBackendWarmup(backend, deadlineLedger);
+        this.assertDockerPreparationAllowed();
+        try {
+          await this.ensureBackendWarmup(backend, deadlineLedger);
+        } catch (error) {
+          if (error instanceof DockerInfrastructureError)
+            throw error;
+          const detail = this.compactError(error);
+          throw new DockerInfrastructureError("backend_readiness", `Docker backend readiness failed: ${detail}`, isTransientDockerControlFailure({ stderr: detail }));
+        }
         return;
       } catch (err) {
+        this.assertDockerPreparationAllowed();
         if (this.isMissingDockerImageError(err) && !recoveredMissingImage) {
           recoveredMissingImage = true;
           const rebuildNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is missing locally; rebuilding before retrying warm container startup.`;
@@ -20822,6 +21205,7 @@ ${text}` : `
           if (recoveryTimeoutMs <= 0)
             throw err;
           await this.stopWarmContainer("missing image recovery", true, recoveryTimeoutMs);
+          this.assertDockerPreparationAllowed();
           this.warmedBackends.clear();
           if (await this.pullImage(deadlineLedger)) {
             const retryNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is available again; retrying warm container startup.`;
@@ -20833,7 +21217,7 @@ ${text}` : `
         const retryable = this.isRetryableError(err);
         if (attempt >= this.warmSetupMaxAttempts || !retryable) {
           if (retryable && attempt >= this.warmSetupMaxAttempts && !(err instanceof DockerExecutionExhaustedError)) {
-            throw new DockerExecutionExhaustedError("warm_setup", `Warm runtime setup retries exhausted after ${this.warmSetupMaxAttempts} attempts: ${this.compactError(err)}`, this.failureCooldownMs);
+            throw new DockerExecutionExhaustedError("warm_setup", `Warm runtime setup retries exhausted after ${this.warmSetupMaxAttempts} attempts: ${this.compactError(err)}`, this.failureCooldownMs, err instanceof DockerInfrastructureError ? err : undefined);
           }
           throw err;
         }
@@ -20847,7 +21231,7 @@ ${text}` : `
         await this.stopWarmContainer("warm setup retry", true, retryRecoveryTimeoutMs);
         const boundedRetryInMs = deadlineLedger ? deadlineLedger.capWorkTimeout(retryInMs) : retryInMs;
         if (boundedRetryInMs < retryInMs) {
-          throw new Error(`Warm runtime retry for ${job.id} was cancelled to preserve the finalization reserve.`);
+          throw new DockerInfrastructureError(err instanceof DockerInfrastructureError ? err.phase : "backend_readiness", `Warm runtime retry for ${job.id} was cancelled to preserve the finalization reserve.`, true, 124);
         }
         await this.sleep(boundedRetryInMs);
         attempt += 1;
@@ -20855,6 +21239,7 @@ ${text}` : `
     }
   }
   async ensureBackendWarmup(backend, deadlineLedger) {
+    this.assertDockerPreparationAllowed();
     if (this.warmedBackends.has(backend))
       return;
     const spec = getDockerBackendSpec(backend);
@@ -20863,14 +21248,18 @@ ${text}` : `
       await spec.ensureWarmRuntime({
         ...warmContext,
         warmContainerName: this.warmContainerName,
-        runWarmShell: (command) => this.runWarmShell(command, {
-          timeoutMs: deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ?? this.warmAgentStartupTimeoutMs
-        }),
+        runWarmShell: (command) => {
+          this.assertDockerPreparationAllowed();
+          return this.runWarmShell(command, {
+            timeoutMs: deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ?? this.warmAgentStartupTimeoutMs
+          });
+        },
         restartWarmContainer: async () => {
           await this.startWarmContainer(deadlineLedger);
         },
         collectWarmDiagnostics: async () => deadlineLedger?.workExpired() ? "Warm-runtime diagnostics skipped because the absolute job work deadline expired." : this.collectWarmRuntimeDiagnostics(backend, deadlineLedger)
       });
+      this.assertDockerPreparationAllowed();
       this.warmedBackends.add(backend);
       return;
     }
@@ -20885,6 +21274,7 @@ ${text}` : `
         throw new Error(`${backend} runtime warmup failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`);
       }
     }
+    this.assertDockerPreparationAllowed();
     this.warmedBackends.add(backend);
   }
   backoffDelayMs(baseMs, attempt) {
@@ -20979,6 +21369,27 @@ ${text}` : `
       drainTimedOut
     };
   }
+  async runDockerPreparationCommand(phase, command, options) {
+    this.assertDockerPreparationAllowed();
+    try {
+      const result = await this.runDockerCommandCapture(command, options);
+      if (this.shuttingDown && phase === "container_start") {
+        await this.stopWarmContainer("cancelled shared preparation", true, 5000);
+      }
+      this.assertDockerPreparationAllowed();
+      return result;
+    } catch (error) {
+      if (error instanceof DockerInfrastructureError)
+        throw error;
+      const detail = this.compactError(error);
+      throw new DockerInfrastructureError(phase, detail, isTransientDockerControlFailure({ stderr: detail }));
+    }
+  }
+  assertDockerPreparationAllowed() {
+    if (this.shuttingDown) {
+      throw new DockerInfrastructureError("backend_readiness", "Docker executor is shutting down; preparation is cancelled.", false);
+    }
+  }
   async runDockerCommandCapture(command, opts = {}) {
     return this.runHostCommandCapture(command, opts);
   }
@@ -21039,6 +21450,8 @@ ${text}` : `
     return `${normalized.slice(0, 277)}...`;
   }
   isRetryableError(err) {
+    if (err instanceof DockerInfrastructureError)
+      return err.retryable;
     const text = this.compactError(err).toLowerCase();
     return this.matchesRetryablePattern(text);
   }
@@ -21753,6 +22166,119 @@ class WorkerStartupBudget {
   }
 }
 
+// apps/workerpals/src/execution_readiness.ts
+function shouldUseLegacyWorkerCooldown(cooldownMs, readiness) {
+  return typeof cooldownMs === "number" && Number.isFinite(cooldownMs) && cooldownMs > 0 && readiness?.executionReadiness.status !== "blocked";
+}
+
+class WorkerExecutionReadinessGate {
+  options;
+  state = {
+    status: "checking",
+    checkedAt: null,
+    retryAt: null,
+    failureClass: null
+  };
+  readyUntil = 0;
+  retryAfter = 0;
+  failures = 0;
+  generation = 0;
+  flight = null;
+  now;
+  monotonicNow;
+  constructor(options) {
+    this.options = options;
+    this.now = options.now ?? Date.now;
+    this.monotonicNow = options.monotonicNow ?? options.now ?? (() => performance.now());
+  }
+  details() {
+    return {
+      executionReady: this.state.status === "ready",
+      executionReadiness: { ...this.state }
+    };
+  }
+  invalidate() {
+    this.generation += 1;
+    this.readyUntil = 0;
+    if (this.state.status === "blocked")
+      return;
+    this.state = { ...this.state, status: "checking", retryAt: null, failureClass: null };
+  }
+  block(error) {
+    this.generation += 1;
+    this.readyUntil = 0;
+    this.failures = Math.min(this.failures + 1, 8);
+    const failure = this.options.classifyFailure(error);
+    const configured = Number(this.options.failureCooldownMs ?? 20000);
+    const baseMs = Number.isFinite(configured) ? Math.max(1000, configured) : 20000;
+    const delayMs = failure.retryable ? Math.min(300000, baseMs * 2 ** (this.failures - 1)) : 300000;
+    this.retryAfter = this.monotonicNow() + delayMs;
+    this.state = {
+      status: "blocked",
+      checkedAt: new Date(this.now()).toISOString(),
+      retryAt: new Date(this.now() + delayMs).toISOString(),
+      failureClass: failure.failureClass
+    };
+    try {
+      this.options.onFailure?.(error);
+    } catch {}
+  }
+  ensureReady() {
+    if (this.flight)
+      return this.flight;
+    const now = this.monotonicNow();
+    if (this.state.status === "ready" && now < this.readyUntil)
+      return Promise.resolve(true);
+    if (this.state.status === "blocked" && now < this.retryAfter)
+      return Promise.resolve(false);
+    this.state = { ...this.state, status: "checking", retryAt: null };
+    const generation = this.generation;
+    const flight = Promise.resolve().then(() => this.options.probe()).then(() => {
+      if (generation !== this.generation)
+        return false;
+      this.failures = 0;
+      const configured = Number(this.options.cacheMs ?? 30000);
+      const cacheMs = Number.isFinite(configured) ? Math.max(0, Math.min(30000, configured)) : 30000;
+      this.readyUntil = this.monotonicNow() + cacheMs;
+      this.state = {
+        status: "ready",
+        checkedAt: new Date(this.now()).toISOString(),
+        retryAt: null,
+        failureClass: null
+      };
+      return true;
+    }, (error) => {
+      if (generation === this.generation)
+        this.block(error);
+      return false;
+    }).finally(() => {
+      if (this.flight === flight)
+        this.flight = null;
+    });
+    this.flight = flight;
+    return flight;
+  }
+}
+async function checkWorkerExecutionReadiness(gate, heartbeat, heartbeatMs) {
+  const pending = gate.ensureReady();
+  if (gate.details().executionReadiness.status !== "checking") {
+    const ready = await pending;
+    await heartbeat(false);
+    return ready;
+  }
+  const timer = setInterval(() => {
+    heartbeat(false).catch(() => {});
+  }, Math.max(1000, heartbeatMs));
+  try {
+    await heartbeat(true);
+    const ready = await pending;
+    await heartbeat(true);
+    return ready;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 // apps/workerpals/src/workerpals_main.ts
 var DEFAULT_LLM_MODEL = "local-model";
 var CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
@@ -22163,7 +22689,7 @@ function isWorkerRuntimeFailure(text) {
 function buildUnhandledWorkerFailureResult(error, executorBackend = resolveExecutor(CONFIG)) {
   const detail = redactSensitiveText(error instanceof Error ? error.stack || error.message : String(error));
   const errorSummary = compactWorkerError(error);
-  const dockerFailure = error instanceof DockerExecutionExhaustedError;
+  const dockerFailure = error instanceof DockerExecutionExhaustedError || error instanceof DockerInfrastructureError;
   const workerRuntimeFailure = !dockerFailure && isWorkerRuntimeFailure(detail);
   const failureClass = workerRuntimeFailure ? "worker_runtime_failure" : dockerFailure ? "docker_engine" : "worker_failure";
   const terminalStage = workerRuntimeFailure ? "worker_runtime" : dockerFailure ? "docker" : "worker";
@@ -22187,7 +22713,12 @@ function buildUnhandledWorkerFailureResult(error, executorBackend = resolveExecu
         metadata: {
           classificationOwner: "workerpals_main",
           structuredResult: false,
-          errorName: error instanceof Error ? error.name : typeof error
+          errorName: error instanceof Error ? error.name : typeof error,
+          ...dockerFailure ? {
+            phase: error.phase ?? null,
+            ...typeof error.executionStarted === "boolean" ? { executionStarted: error.executionStarted } : {},
+            ...error instanceof DockerInfrastructureError ? { retryable: error.retryable } : {}
+          } : {}
         }
       }
     }
@@ -23260,6 +23791,15 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
   console.log(`[WorkerPals ${opts.workerId}] Runtime generation: ${runtimeGeneration || "server-assigned"}`);
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   const claimTimeoutMs = Math.max(4000, Math.min(15000, opts.pollMs * 3));
+  const executionReadiness = dockerExecutor ? new WorkerExecutionReadinessGate({
+    probe: () => dockerExecutor.checkSharedRuntimeReadiness(),
+    failureCooldownMs: opts.failureCooldownMs,
+    classifyFailure: (error) => ({
+      failureClass: "docker_engine",
+      retryable: error instanceof DockerExecutionExhaustedError || error instanceof DockerInfrastructureError && error.retryable
+    }),
+    onFailure: (error) => console.warn(`[WorkerPals] Shared Docker execution readiness blocked; no jobs will be claimed: ${redactSensitiveText(compactWorkerError(error))}`)
+  }) : null;
   let lastHeartbeatAt = 0;
   const buildHeartbeatPayload = (status, currentJobId) => ({
     status,
@@ -23275,7 +23815,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
       baseRef: opts.worktreeBaseRef,
       dockerImage: opts.docker ? opts.dockerImage : null,
       dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
-      runtimeGeneration: runtimeGeneration || null
+      runtimeGeneration: runtimeGeneration || null,
+      ...executionReadiness?.details() ?? { executionReady: true }
     }
   });
   const maybeHeartbeat = async (status, currentJobId = null, force = false) => {
@@ -23286,9 +23827,18 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
     if (ok)
       lastHeartbeatAt = now;
   };
-  await maybeHeartbeat("idle", null, true);
+  await maybeHeartbeat(executionReadiness ? "error" : "idle", null, true);
   while (!runtimeState.shutdownRequested) {
     try {
+      if (executionReadiness) {
+        const ready = await checkWorkerExecutionReadiness(executionReadiness, (force) => maybeHeartbeat(executionReadiness.details().executionReady ? "idle" : "error", null, force), heartbeatEveryMs);
+        if (runtimeState.shutdownRequested)
+          break;
+        if (!ready) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.max(250, Math.min(5000, opts.pollMs))));
+          continue;
+        }
+      }
       await maybeHeartbeat("idle");
       const claimRes = await postJsonWithTimeout(`${opts.server}/jobs/claim`, headers, {
         workerId: opts.workerId,
@@ -23498,6 +24048,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                 }
               }
             } catch (preparationError) {
+              executionReadiness?.invalidate();
               result = buildWorkerPreparationFailureResult(preparationError);
               if (directDeadlineLedger?.workExpired()) {
                 result = {
@@ -23566,6 +24117,11 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
               result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog, directDeadlineLedger);
               cooldownAfterJobMs = Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0 ? Math.floor(result.cooldownMs ?? 0) : 0;
             } catch (err) {
+              if (err instanceof DockerInfrastructureError || err instanceof DockerExecutionExhaustedError) {
+                executionReadiness?.block(err);
+              } else {
+                executionReadiness?.invalidate();
+              }
               if (err instanceof DockerExecutionExhaustedError) {
                 cooldownAfterJobMs = Math.max(opts.failureCooldownMs, Number.isFinite(err.cooldownMs) ? err.cooldownMs : 0);
               }
@@ -23996,7 +24552,10 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                 process.exit(recycleExitCode);
               }
             }
-            if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {
+            if (!result?.ok)
+              executionReadiness?.invalidate();
+            const useLegacyCooldown = shouldUseLegacyWorkerCooldown(result?.cooldownMs, executionReadiness?.details());
+            if (useLegacyCooldown && job.sessionId && result?.cooldownMs) {
               await transport.queueSessionCommand(job.sessionId, {
                 type: "assistant_message",
                 payload: {
@@ -24005,13 +24564,13 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                 from: `worker:${opts.workerId}`
               }, { priority: "high" });
             }
-            if (result?.cooldownMs && result.cooldownMs > 0) {
+            if (useLegacyCooldown && result?.cooldownMs) {
               const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
               console.warn(`[WorkerPals] Entering cooldown for ${formatDurationMs(cooldownMs)} after retry exhaustion.`);
               await maybeHeartbeat("offline", job.id, true);
               await new Promise((resolvePromise) => setTimeout(resolvePromise, cooldownMs));
             }
-            await maybeHeartbeat("idle", null, true);
+            await maybeHeartbeat(executionReadiness && !executionReadiness.details().executionReady ? "error" : "idle", null, true);
             runtimeState.currentJobId = null;
             runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;

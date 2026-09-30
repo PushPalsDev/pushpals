@@ -163,6 +163,7 @@ type WorkerStatusRow = {
   status?: unknown;
   isOnline?: unknown;
   activeJobCount?: unknown;
+  details?: { executionReady?: unknown; executionReadiness?: { status?: unknown } };
 };
 
 type RemoteBuddySessionConsumerHealth = {
@@ -606,6 +607,8 @@ export function createEmbeddedRuntimeHealthChangeReporter(
 function summarizeWorkerStatusRows(workers: WorkerStatusRow[]): {
   onlineWorkers: number;
   idleWorkers: number;
+  unreadyWorkers: number;
+  checkingWorkers: number;
 } {
   const onlineWorkers = workers.filter(
     (worker) =>
@@ -614,10 +617,23 @@ function summarizeWorkerStatusRows(workers: WorkerStatusRow[]): {
         .trim()
         .toLowerCase() !== "offline",
   );
-  const idleWorkers = onlineWorkers.filter((worker) => Number(worker?.activeJobCount ?? 0) <= 0);
+  const idleWorkers = onlineWorkers.filter(
+    (worker) =>
+      Number(worker?.activeJobCount ?? 0) <= 0 &&
+      worker.status !== "busy" &&
+      worker.status !== "error" &&
+      worker.details?.executionReady !== false,
+  );
   return {
     onlineWorkers: onlineWorkers.length,
     idleWorkers: idleWorkers.length,
+    unreadyWorkers: onlineWorkers.filter((worker) => worker.details?.executionReady === false)
+      .length,
+    checkingWorkers: onlineWorkers.filter(
+      (worker) =>
+        worker.details?.executionReady === false &&
+        worker.details.executionReadiness?.status === "checking",
+    ).length,
   };
 }
 
@@ -652,7 +668,20 @@ export async function resolveWorkerExecutionReadiness(opts: {
     };
   }
 
-  const { onlineWorkers, idleWorkers } = summarizeWorkerStatusRows(workers);
+  const { onlineWorkers, idleWorkers, unreadyWorkers, checkingWorkers } =
+    summarizeWorkerStatusRows(workers);
+  if (onlineWorkers > 0 && unreadyWorkers === onlineWorkers) {
+    const checking = checkingWorkers === onlineWorkers;
+    return {
+      state: checking ? "warming" : "blocked",
+      detail: checking
+        ? "WorkerPal controllers are online; execution capability checks are running"
+        : "WorkerPal controllers are online, but execution infrastructure is blocked",
+      action: checking
+        ? "Wait for the bounded worker capability check, then rerun /status."
+        : "Inspect WorkerPal infrastructure diagnostics. Bounded recovery probes continue automatically.",
+    };
+  }
   let dockerPrecheck = opts.dockerPrecheck ?? null;
   const shouldProbeDockerAvailability =
     onlineWorkers === 0 &&

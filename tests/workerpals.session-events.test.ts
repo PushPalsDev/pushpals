@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DockerInfrastructureError,
+  DockerExecutionExhaustedError,
+} from "../apps/workerpals/src/docker_executor";
+import {
   buildPhaseSpanDiagnostics,
   buildUnhandledWorkerFailureResult,
   buildWorkerJobClaimAuthority,
@@ -109,6 +113,36 @@ describe("workerpals session event emission", () => {
     ).toBe("v1.2.39");
     expect(resolveWorkerRuntimeGeneration({})).toBe("");
   });
+
+  test.each([true, false])(
+    "keeps typed Docker setup failures out of generic worker failures (transient=%s)",
+    (retryable) => {
+      const error = new DockerInfrastructureError(
+        "volume_prepare",
+        "Docker volume preparation failed",
+        retryable,
+        1,
+      );
+      const result = buildUnhandledWorkerFailureResult(error, "openai_codex");
+      expect(result.diagnostics?.terminal).toMatchObject({
+        failureClass: "docker_engine",
+        terminalStage: "docker",
+        metadata: { phase: "volume_prepare", executionStarted: false, retryable },
+      });
+      expect(inferWorkerTerminalFailureClass(result)).toBe("docker_engine");
+      error.executionStarted = true;
+      const exhausted = new DockerExecutionExhaustedError(
+        "warm_setup",
+        "setup retries exhausted",
+        20_000,
+        error,
+      );
+      expect(
+        buildUnhandledWorkerFailureResult(exhausted, "openai_codex").diagnostics?.terminal?.metadata
+          ?.executionStarted,
+      ).toBe(true);
+    },
+  );
 
   test("classifies an unhandled WorkerPal stack at its owning runtime boundary", () => {
     const error = new ReferenceError("Cannot access 'timedOut' before initialization");

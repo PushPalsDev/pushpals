@@ -1499,7 +1499,15 @@ function executedAutonomyOutcomes(request: RepositoryAgentRequest) {
         isRecord(entry) &&
         typeof entry.job_id === "string" &&
         compactText(entry.job_id, 256) &&
-        ["completed", "failed", "dead_letter"].includes(String(entry.status)),
+        ["completed", "failed", "dead_letter"].includes(String(entry.status)) &&
+        !(
+          ["failed", "dead_letter"].includes(String(entry.status)) &&
+          entry.execution_started === false &&
+          (["infra", "docker_engine", "docker_infrastructure"].includes(
+            String(entry.failure_class).toLowerCase(),
+          ) ||
+            String(entry.failure_class).toLowerCase().startsWith("environment."))
+        ),
     )
     .slice(0, 16)
     .map((entry) => {

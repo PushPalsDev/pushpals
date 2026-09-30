@@ -10515,6 +10515,38 @@ function createRepositoryAgentServiceClients(options) {
 }
 // packages/shared/src/runtime_diagnostics.ts
 var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+var MAX_ACTIVE_OPERATIONS = 8;
+function recordValue(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function finiteMeasurement(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+function activeOperationSummary(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.slice(0, MAX_ACTIVE_OPERATIONS).flatMap((entry) => {
+    const item = recordValue(entry);
+    return item && typeof item.stage === "string" && LABEL.test(item.stage) && finiteMeasurement(item.elapsedMs) ? [{ stage: item.stage, elapsedMs: item.elapsedMs }] : [];
+  });
+}
+function diagnosticContext(value) {
+  const input = recordValue(value);
+  if (!input)
+    return;
+  const context = {};
+  for (const key of ["sampleElapsedMs", "cpuUserMs", "cpuSystemMs", "rssBytes"]) {
+    if (finiteMeasurement(input[key]))
+      context[key] = input[key];
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations)
+    context.activeOperations = activeOperations;
+  return Object.keys(context).length ? context : undefined;
+}
+function copyEvent(event) {
+  return { ...event, ...event.context ? { context: diagnosticContext(event.context) } : {} };
+}
 function boundedInteger(value, name, maximum) {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
@@ -10531,6 +10563,8 @@ class RuntimeDiagnostics {
   slowThresholdMs;
   maxSamples;
   schedule;
+  cpuUsage;
+  rssBytes;
   running = false;
   generation = 0;
   cancelTimer = null;
@@ -10541,6 +10575,9 @@ class RuntimeDiagnostics {
   suppressedLogEvents = 0;
   lastLoggedAt = -Infinity;
   recentSlowEvents = [];
+  latestEventLoopDelay;
+  latestSlowOperation;
+  activeOperations = new Map;
   constructor(options) {
     if (typeof options.service !== "string" || !LABEL.test(options.service)) {
       throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
@@ -10549,7 +10586,7 @@ class RuntimeDiagnostics {
     this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
     this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
     this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
-    for (const name of ["now", "wallNow", "onEvent", "schedule"]) {
+    for (const name of ["now", "wallNow", "onEvent", "schedule", "cpuUsage", "rssBytes"]) {
       if (options[name] !== undefined && typeof options[name] !== "function") {
         throw new TypeError(`${name} must be a function`);
       }
@@ -10557,6 +10594,8 @@ class RuntimeDiagnostics {
     this.now = options.now ?? (() => performance.now());
     this.wallNow = options.wallNow ?? Date.now;
     this.onEvent = options.onEvent;
+    this.cpuUsage = options.cpuUsage ?? (() => process.cpuUsage());
+    this.rssBytes = options.rssBytes ?? (() => process.memoryUsage.rss());
     this.schedule = options.schedule ?? ((callback, delayMs) => {
       const timer = setTimeout(callback, delayMs);
       timer.unref();
@@ -10590,22 +10629,31 @@ class RuntimeDiagnostics {
       slowEventLoopSamples: this.slowEventLoopSamples,
       slowOperationSamples: this.slowOperationSamples,
       suppressedLogEvents: this.suppressedLogEvents,
-      recentSlowEvents: this.recentSlowEvents.map((event) => ({ ...event }))
+      latestEventLoopDelay: this.latestEventLoopDelay ? copyEvent(this.latestEventLoopDelay) : undefined,
+      latestSlowOperation: this.latestSlowOperation ? copyEvent(this.latestSlowOperation) : undefined,
+      activeOperations: this.activeOperationSnapshot(),
+      recentSlowEvents: this.recentSlowEvents.map(copyEvent)
     };
   }
   run(stage, fn) {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return fn();
     } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
   async runAsync(stage, fn) {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return await fn();
     } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
@@ -10616,6 +10664,7 @@ class RuntimeDiagnostics {
       return;
     }
     const expectedAt = startedAt + this.sampleIntervalMs;
+    const cpuBefore = this.readCpuUsage();
     const callback = () => {
       if (!this.running || this.generation !== generation)
         return;
@@ -10637,7 +10686,8 @@ class RuntimeDiagnostics {
               service: this.service,
               observedAt: new Date(this.wallNow()).toISOString(),
               delayMs,
-              sampleIntervalMs: this.sampleIntervalMs
+              sampleIntervalMs: this.sampleIntervalMs,
+              context: this.sampleContext(startedAt, observed, cpuBefore)
             }, observed);
           }
         }
@@ -10658,6 +10708,50 @@ class RuntimeDiagnostics {
     } catch {
       return null;
     }
+  }
+  trackOperation(stage, startedAt) {
+    if (startedAt === null || this.activeOperations.size >= MAX_ACTIVE_OPERATIONS)
+      return;
+    const key = Symbol();
+    this.activeOperations.set(key, {
+      stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+      startedAt
+    });
+    return key;
+  }
+  activeOperationSnapshot() {
+    const now = this.readNow();
+    if (now === null)
+      return [];
+    return [...this.activeOperations.values()].map(({ stage, startedAt }) => ({
+      stage,
+      elapsedMs: Math.max(0, now - startedAt)
+    }));
+  }
+  readCpuUsage() {
+    try {
+      const usage = this.cpuUsage();
+      return finiteMeasurement(usage.user) && finiteMeasurement(usage.system) ? usage : null;
+    } catch {
+      return null;
+    }
+  }
+  sampleContext(startedAt, observed, before) {
+    const context = {
+      sampleElapsedMs: Math.max(0, observed - startedAt),
+      activeOperations: this.activeOperationSnapshot()
+    };
+    const after = this.readCpuUsage();
+    if (before && after && after.user >= before.user && after.system >= before.system) {
+      context.cpuUserMs = (after.user - before.user) / 1000;
+      context.cpuSystemMs = (after.system - before.system) / 1000;
+    }
+    try {
+      const rss = this.rssBytes();
+      if (finiteMeasurement(rss))
+        context.rssBytes = rss;
+    } catch {}
+    return context;
   }
   observeOperation(stage, startedAt) {
     try {
@@ -10680,6 +10774,10 @@ class RuntimeDiagnostics {
     } catch {}
   }
   record(event, observed) {
+    if (event.event === "runtime_event_loop_delay")
+      this.latestEventLoopDelay = event;
+    else
+      this.latestSlowOperation = event;
     this.recentSlowEvents.push(event);
     if (this.recentSlowEvents.length > this.maxSamples)
       this.recentSlowEvents.shift();
@@ -10691,7 +10789,7 @@ class RuntimeDiagnostics {
     }
     this.lastLoggedAt = observed;
     try {
-      Promise.resolve(this.onEvent({ ...event })).catch(() => {
+      Promise.resolve(this.onEvent(copyEvent(event))).catch(() => {
         return;
       });
     } catch {}
@@ -14816,8 +14914,10 @@ class JobQueue {
     const workerId = row?.workerId?.trim() ?? "";
     if (!workerId)
       return null;
-    const worker = this.db.prepare(`SELECT status, lastHeartbeat FROM workers WHERE workerId = ?`).get(workerId);
+    const worker = this.db.prepare(`SELECT status, lastHeartbeat, details FROM workers WHERE workerId = ?`).get(workerId);
     if (!worker)
+      return null;
+    if (parseObjectJson(worker.details).executionReady === false)
       return null;
     if (String(worker.status ?? "").trim().toLowerCase() === "offline")
       return null;
@@ -14869,6 +14969,7 @@ class JobQueue {
                  FROM workers tw
                  WHERE tw.workerId = jobs.targetWorkerId
                    AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                    AND tw.lastHeartbeat >= ?
                )
              )
@@ -14922,6 +15023,7 @@ class JobQueue {
                FROM workers tw
                WHERE tw.workerId = jobs.targetWorkerId
                  AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                  AND tw.lastHeartbeat >= ?
              )
          )
@@ -15176,6 +15278,10 @@ class JobQueue {
           reusedActiveClaim: true
         };
       }
+      const readiness = this.db.prepare(`SELECT details FROM workers WHERE workerId = ?`).get(workerId);
+      if (parseObjectJson(readiness?.details ?? null).executionReady === false) {
+        return { executionBlocked: true };
+      }
       const row = this.db.prepare(`SELECT * FROM jobs
            WHERE status = 'pending'
              AND (
@@ -15186,6 +15292,7 @@ class JobQueue {
                  FROM workers tw
                  WHERE tw.workerId = jobs.targetWorkerId
                    AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                    AND tw.lastHeartbeat >= ?
                )
              )
@@ -15282,6 +15389,8 @@ class JobQueue {
     const claimed = tx();
     if (!claimed)
       return { ok: false, message: "No pending jobs" };
+    if ("executionBlocked" in claimed)
+      return { ok: true, executionBlocked: true };
     if ("runtimeGenerationMismatch" in claimed) {
       return {
         ok: false,
@@ -16367,6 +16476,7 @@ class JobQueue {
                FROM workers tw
                WHERE tw.workerId = jobs.targetWorkerId
                  AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND (CASE WHEN json_valid(tw.details) THEN json_type(tw.details, '$.executionReady') END) IS NOT 'false'
                  AND tw.lastHeartbeat >= ?
              )
            )`).get(normalizedKind, now, targetWorkerCutoff);
@@ -21178,7 +21288,7 @@ function classifyAutonomyAttemptOutcome(input) {
   if (/critic[_ -]?rejected|quality[_ -]?(?:rejected|failed|revision[_ -]?exhausted)|revision[_ -]?budget[_ -]?exhausted|deterministic[_ -]?quality[_ -]?failed/.test(text)) {
     return "product_quality_failed";
   }
-  if (/^(?:environment(?:\.[a-z0-9_-]+)?|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(failureClass) || /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(`${failureClass} ${summary}`)) {
+  if (/^(?:environment(?:\.[a-z0-9_-]+)?|docker_engine|docker_infrastructure|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(failureClass) || /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(`${failureClass} ${summary}`)) {
     return "environment_blocked";
   }
   if (/trusted[_ -]?validation|validation[_ -]?(?:blocked|failed)|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(text)) {
@@ -22883,23 +22993,53 @@ class AutonomyStore {
          revision_samples AS (
            SELECT sample_key, COUNT(*) AS revision_count
            FROM windowed
-           WHERE terminal = 0
+           WHERE terminal = 0 AND success = 0
            GROUP BY sample_key
+         ),
+         review_samples AS (
+           SELECT CASE
+                    WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
+                    WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
+                    WHEN NULLIF(request_id, '') IS NOT NULL THEN 'request:' || request_id
+                    ELSE 'feedback:' || id
+                  END AS sample_key
+           FROM autonomy_pr_feedback
+           WHERE datetime(created_at) >= datetime(?, '-${hours} hours')
+           UNION SELECT sample_key FROM revision_samples
+         ),
+         retained_revisions AS (
+           SELECT DISTINCT CASE
+                    WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
+                    WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
+                    WHEN NULLIF(request_id, '') IS NOT NULL THEN 'request:' || request_id
+                    ELSE 'outcome:' || id
+                  END AS sample_key
+           FROM autonomy_outcomes WHERE terminal = 0 AND success = 0
          )
          SELECT COUNT(*) AS terminalCount,
                 SUM(CASE WHEN latest_terminal.success = 1 THEN 1 ELSE 0 END) AS successCount,
-                (SELECT COUNT(*) FROM windowed WHERE terminal = 0) AS nonTerminalRevisionCount,
+                (SELECT COUNT(*) FROM windowed WHERE terminal = 0 AND success = 0) AS nonTerminalRevisionCount,
                 (SELECT COUNT(*) FROM revision_samples) AS nonTerminalRevisionObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples) AS reviewObservedObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples r
+                 JOIN retained_revisions revisions ON revisions.sample_key = r.sample_key)
+                  AS reviewRevisedObjectiveCount,
+                (SELECT COUNT(*) FROM review_samples r
+                 JOIN latest_terminal t ON t.sample_key = r.sample_key
+                 WHERE t.success = 1 AND NOT EXISTS (
+                   SELECT 1 FROM retained_revisions revisions WHERE revisions.sample_key = r.sample_key
+                 )) AS firstPassSuccessCount,
                 SUM(CASE WHEN revision_samples.sample_key IS NOT NULL THEN 1 ELSE 0 END)
                   AS revisedTerminalObjectiveCount
          FROM latest_terminal
-         LEFT JOIN revision_samples ON revision_samples.sample_key = latest_terminal.sample_key`).get(nowIso);
+         LEFT JOIN revision_samples ON revision_samples.sample_key = latest_terminal.sample_key`).get(nowIso, nowIso);
     const objectiveTerminalCount = Math.max(0, Math.floor(asNumber(objectiveRow?.terminalCount, 0)));
     const objectiveSuccessCount = Math.max(0, Math.floor(asNumber(objectiveRow?.successCount, 0)));
     const nonTerminalRevisionCount = Math.max(0, Math.floor(asNumber(objectiveRow?.nonTerminalRevisionCount, 0)));
     const nonTerminalRevisionObjectiveCount = Math.max(0, Math.floor(asNumber(objectiveRow?.nonTerminalRevisionObjectiveCount, 0)));
     const revisedTerminalObjectiveCount = Math.max(0, Math.floor(asNumber(objectiveRow?.revisedTerminalObjectiveCount, 0)));
-    const reviewObservedObjectiveCount = Math.max(0, objectiveTerminalCount + nonTerminalRevisionObjectiveCount - revisedTerminalObjectiveCount);
+    const reviewObservedObjectiveCount = Math.max(0, Math.floor(asNumber(objectiveRow?.reviewObservedObjectiveCount, 0)));
+    const firstPassSuccessCount = Math.max(0, Math.floor(asNumber(objectiveRow?.firstPassSuccessCount, 0)));
     let validationRows = [];
     if (this.hasTable("job_validation_runs") && this.hasTable("jobs")) {
       validationRows = this.db.prepare(`SELECT v.jobId, v.command, v.attempt, v.passed, v.failureClass,
@@ -22984,8 +23124,8 @@ ${attempt}`);
       nonTerminalRevisionCount,
       nonTerminalRevisionObjectiveCount,
       revisedTerminalObjectiveCount,
-      objectiveRevisionRate: reviewObservedObjectiveCount > 0 ? nonTerminalRevisionObjectiveCount / reviewObservedObjectiveCount : null,
-      objectiveFirstPassRate: reviewObservedObjectiveCount > 0 ? Math.max(0, reviewObservedObjectiveCount - nonTerminalRevisionObjectiveCount) / reviewObservedObjectiveCount : null,
+      objectiveRevisionRate: reviewObservedObjectiveCount > 0 ? Math.max(0, Math.floor(asNumber(objectiveRow?.reviewRevisedObjectiveCount, 0))) / reviewObservedObjectiveCount : null,
+      objectiveFirstPassRate: reviewObservedObjectiveCount > 0 ? firstPassSuccessCount / reviewObservedObjectiveCount : null,
       durationMs: {
         average: durations.length > 0 ? Math.floor(durations.reduce((sum, value) => sum + value, 0) / durations.length) : null,
         p50: percentileValue(durations, 50),
@@ -24267,10 +24407,18 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const includeObjectiveJobOutcomes = this.hasTable("jobs") && this.hasTable("job_terminal_diagnostics");
     const objectiveJobProjection = includeObjectiveJobOutcomes ? `j.status AS job_status, d.failureClass AS job_failure_class,
          d.terminalStage AS job_terminal_stage,
-         COALESCE(d.summary, j.error, j.result) AS job_summary` : `NULL AS job_status, NULL AS job_failure_class,
-         NULL AS job_terminal_stage, NULL AS job_summary`;
+         COALESCE(d.summary, j.error, j.result) AS job_summary,
+         d.metadataJson AS job_terminal_metadata_json` : `NULL AS job_status, NULL AS job_failure_class,
+         NULL AS job_terminal_stage, NULL AS job_summary,
+         NULL AS job_terminal_metadata_json`;
     const objectiveJobJoins = includeObjectiveJobOutcomes ? `LEFT JOIN jobs j ON j.id = o.job_id
          LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id` : "";
+    const excludeSetupOnlyOutcomes = includeObjectiveJobOutcomes ? `AND NOT COALESCE(
+      (d.failureClass IN ('docker_engine', 'docker_infrastructure') OR d.failureClass LIKE 'environment.%')
+      AND CASE WHEN json_valid(d.metadataJson) THEN
+        json_type(d.metadataJson, '$.executionStarted') = 'false'
+        AND json_extract(d.metadataJson, '$.classificationOwner') = 'workerpals_main'
+      ELSE 0 END, 0)` : "";
     const includeObjectiveValidationOutcomes = this.hasTable("jobs") && this.hasTable("job_validation_runs");
     const objectiveValidationProjection = includeObjectiveValidationOutcomes ? `v.passed AS job_validation_passed,
          v.command AS job_validation_command,
@@ -24304,6 +24452,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
                   o.id DESC
          LIMIT 200`).all();
     const hydrateObjective = (row) => {
+      const terminalMetadata = parseJsonObject(row.job_terminal_metadata_json);
+      const executionStarted = terminalMetadata.classificationOwner === "workerpals_main" && typeof terminalMetadata.executionStarted === "boolean" ? terminalMetadata.executionStarted : undefined;
       const scopeRecord = parseJsonObject(row.scope_json);
       const targetPaths = asStringArray3(scopeRecord.targetPaths ?? scopeRecord.target_paths);
       const writeGlobs = asStringArray3(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
@@ -24335,6 +24485,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         incident_key: row.incident_key ?? null,
         job_id: row.job_id ?? null,
         attempt_outcome: attemptOutcome,
+        execution_started: executionStarted,
+        failure_class: row.job_failure_class,
         deterministic_repair_failure: deterministicRepairFailure,
         attempt_failure_fingerprint: attemptFailureFingerprint,
         target_paths: targetPaths,
@@ -24369,16 +24521,19 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
        WHERE o.job_id IS NOT NULL AND o.job_id <> ''
          AND o.status IN ('completed', 'failed', 'dead_letter')
          AND o.updated_at >= ?
+         ${excludeSetupOnlyOutcomes}
        ORDER BY o.updated_at DESC LIMIT 16`).all(new Date(Date.parse(now) - 24 * 60 * 60000).toISOString());
     const executedObjectives = executedObjectiveRows.map(hydrateObjective);
     const executedOutcomeSummary = this.db.prepare(`SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-              SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
-              MAX(updated_at) AS latest_update
-       FROM autonomy_objectives
-       WHERE job_id IS NOT NULL AND job_id <> ''
-         AND status IN ('completed', 'failed', 'dead_letter')`).get();
+              SUM(CASE WHEN o.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN o.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+              SUM(CASE WHEN o.status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+              MAX(o.updated_at) AS latest_update
+       FROM autonomy_objectives o
+       ${objectiveJobJoins}
+       WHERE o.job_id IS NOT NULL AND o.job_id <> ''
+         AND o.status IN ('completed', 'failed', 'dead_letter')
+         ${excludeSetupOnlyOutcomes}`).get();
     const executedOutcomeWatermark = sha256Hex(JSON.stringify(executedOutcomeSummary));
     const dispatchBudget = this.getDispatchCountsLastHour(now);
     const resourceBudget = this.resourceBudgetSnapshot(now);
@@ -24408,6 +24563,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       recent_objectives: recentObjectives,
       executed_objectives: executedObjectives,
       executed_outcome_watermark: executedOutcomeWatermark,
+      execution_capability: params.executionCapability,
       repo_health_flags: {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),
@@ -27234,6 +27390,36 @@ Apply this clarification while keeping changes scoped to the existing objective 
   close() {
     this.db.close();
   }
+}
+
+// apps/server/src/worker_execution_readiness.ts
+function workerExecutionBlocked(worker) {
+  return worker.isOnline && worker.details.executionReady === false;
+}
+function workerExecutionIdle(worker) {
+  return worker.isOnline && !workerExecutionBlocked(worker) && worker.status === "idle" && worker.activeJobCount === 0;
+}
+function summarizeWorkerExecutionCapability(workers, nowMs = Date.now()) {
+  const observed_at = new Date(nowMs).toISOString();
+  const online = workers.filter((worker) => worker.isOnline);
+  if (online.some((worker) => worker.details.executionReady === true)) {
+    return { state: "ready", observed_at };
+  }
+  if (online.length === 0 || online.some((worker) => !workerExecutionBlocked(worker))) {
+    return { state: "unknown", observed_at };
+  }
+  const delays = online.map((worker) => {
+    const readiness = worker.details.executionReadiness;
+    const retryAt = readiness && typeof readiness === "object" ? readiness.retryAt : null;
+    const retryMs = typeof retryAt === "string" ? Date.parse(retryAt) : Number.NaN;
+    return Number.isFinite(retryMs) ? Math.max(1000, retryMs - nowMs) : 30000;
+  });
+  return {
+    state: "blocked",
+    reason: "All online workers are checking or blocked on execution infrastructure",
+    retry_after_ms: Math.min(30 * 60000, ...delays),
+    observed_at
+  };
 }
 
 // apps/server/src/memory_store.ts
@@ -31287,7 +31473,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             total: workers.length,
             online: onlineWorkers.length,
             busy: busyWorkers,
-            idle: Math.max(0, onlineWorkers.length - busyWorkers)
+            idle: workers.filter(workerExecutionIdle).length,
+            executionCapability: summarizeWorkerExecutionCapability(workers)
           },
           jobs: {
             pending: taskExecutePending,
@@ -31370,7 +31557,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             total: workers.length,
             online: onlineWorkers.length,
             busy: busyWorkers,
-            idle: Math.max(0, onlineWorkers.length - busyWorkers)
+            idle: workers.filter(workerExecutionIdle).length,
+            executionCapability: summarizeWorkerExecutionCapability(workers)
           },
           queues: {
             requests: requestCounts,
@@ -31522,6 +31710,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const snapshot = autonomyStore.createSnapshot({
           sessionId,
           runId,
+          executionCapability: summarizeWorkerExecutionCapability(jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS)),
           requestSlo: requestQueue.sloSummary(24),
           jobSlo: jobQueue.sloSummary(24),
           repoHealthFlags: {

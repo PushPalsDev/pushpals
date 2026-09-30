@@ -104,6 +104,34 @@ describe("release workflow action runtimes", () => {
     },
   );
 
+  test.each(["cli-e2e.yml", "release-cli.yml"])(
+    "%s gates execution capability and review quality contracts on Windows",
+    (filename) => {
+      const text = readFileSync(join(workflowRoot, filename), "utf8");
+      const jobName =
+        filename === "cli-e2e.yml" ? "windows_worker_path_contract" : "smoke_windows_runtime";
+      const job = text.split(`  ${jobName}:`)[1]?.split(/\n  [a-z][a-z0-9_]*:/)[0] ?? "";
+      expect(job).toMatch(/runs-on: windows-(?:latest|\d{4})(?:\s|$)/);
+      const step = job
+        .split("- name: Verify execution capability and review quality contracts")[1]
+        ?.split("- name:")[0];
+      expect(step).toContain("bun test");
+      for (const file of [
+        "workerpals.execution-readiness",
+        "server.worker-execution-readiness",
+        "server.review-quality-metrics",
+        "remotebuddy.worker-autoscale",
+        "shared.runtime-diagnostics",
+      ]) {
+        expect(step).toContain(`tests/${file}.test.ts`);
+        if (filename === "cli-e2e.yml") {
+          expect(text.split(`- "tests/${file}.test.ts"`)).toHaveLength(3);
+        }
+      }
+      expect(step).not.toContain("continue-on-error");
+    },
+  );
+
   test("uses Node-24-native action generations", () => {
     const text = workflowText();
 

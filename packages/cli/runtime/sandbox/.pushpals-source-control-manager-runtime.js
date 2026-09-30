@@ -1774,6 +1774,38 @@ async function resolveGitTokenForRemote(options) {
 
 // packages/shared/src/runtime_diagnostics.ts
 var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+var MAX_ACTIVE_OPERATIONS = 8;
+function recordValue(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function finiteMeasurement(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+function activeOperationSummary(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.slice(0, MAX_ACTIVE_OPERATIONS).flatMap((entry) => {
+    const item = recordValue(entry);
+    return item && typeof item.stage === "string" && LABEL.test(item.stage) && finiteMeasurement(item.elapsedMs) ? [{ stage: item.stage, elapsedMs: item.elapsedMs }] : [];
+  });
+}
+function diagnosticContext(value) {
+  const input = recordValue(value);
+  if (!input)
+    return;
+  const context = {};
+  for (const key of ["sampleElapsedMs", "cpuUserMs", "cpuSystemMs", "rssBytes"]) {
+    if (finiteMeasurement(input[key]))
+      context[key] = input[key];
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations)
+    context.activeOperations = activeOperations;
+  return Object.keys(context).length ? context : undefined;
+}
+function copyEvent(event) {
+  return { ...event, ...event.context ? { context: diagnosticContext(event.context) } : {} };
+}
 function boundedInteger(value, name, maximum) {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
@@ -1790,6 +1822,8 @@ class RuntimeDiagnostics {
   slowThresholdMs;
   maxSamples;
   schedule;
+  cpuUsage;
+  rssBytes;
   running = false;
   generation = 0;
   cancelTimer = null;
@@ -1800,6 +1834,9 @@ class RuntimeDiagnostics {
   suppressedLogEvents = 0;
   lastLoggedAt = -Infinity;
   recentSlowEvents = [];
+  latestEventLoopDelay;
+  latestSlowOperation;
+  activeOperations = new Map;
   constructor(options) {
     if (typeof options.service !== "string" || !LABEL.test(options.service)) {
       throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
@@ -1808,7 +1845,7 @@ class RuntimeDiagnostics {
     this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
     this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
     this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
-    for (const name of ["now", "wallNow", "onEvent", "schedule"]) {
+    for (const name of ["now", "wallNow", "onEvent", "schedule", "cpuUsage", "rssBytes"]) {
       if (options[name] !== undefined && typeof options[name] !== "function") {
         throw new TypeError(`${name} must be a function`);
       }
@@ -1816,6 +1853,8 @@ class RuntimeDiagnostics {
     this.now = options.now ?? (() => performance.now());
     this.wallNow = options.wallNow ?? Date.now;
     this.onEvent = options.onEvent;
+    this.cpuUsage = options.cpuUsage ?? (() => process.cpuUsage());
+    this.rssBytes = options.rssBytes ?? (() => process.memoryUsage.rss());
     this.schedule = options.schedule ?? ((callback, delayMs) => {
       const timer = setTimeout(callback, delayMs);
       timer.unref();
@@ -1849,22 +1888,31 @@ class RuntimeDiagnostics {
       slowEventLoopSamples: this.slowEventLoopSamples,
       slowOperationSamples: this.slowOperationSamples,
       suppressedLogEvents: this.suppressedLogEvents,
-      recentSlowEvents: this.recentSlowEvents.map((event) => ({ ...event }))
+      latestEventLoopDelay: this.latestEventLoopDelay ? copyEvent(this.latestEventLoopDelay) : undefined,
+      latestSlowOperation: this.latestSlowOperation ? copyEvent(this.latestSlowOperation) : undefined,
+      activeOperations: this.activeOperationSnapshot(),
+      recentSlowEvents: this.recentSlowEvents.map(copyEvent)
     };
   }
   run(stage, fn) {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return fn();
     } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
   async runAsync(stage, fn) {
     const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
     try {
       return await fn();
     } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
       this.observeOperation(stage, startedAt);
     }
   }
@@ -1875,6 +1923,7 @@ class RuntimeDiagnostics {
       return;
     }
     const expectedAt = startedAt + this.sampleIntervalMs;
+    const cpuBefore = this.readCpuUsage();
     const callback = () => {
       if (!this.running || this.generation !== generation)
         return;
@@ -1896,7 +1945,8 @@ class RuntimeDiagnostics {
               service: this.service,
               observedAt: new Date(this.wallNow()).toISOString(),
               delayMs,
-              sampleIntervalMs: this.sampleIntervalMs
+              sampleIntervalMs: this.sampleIntervalMs,
+              context: this.sampleContext(startedAt, observed, cpuBefore)
             }, observed);
           }
         }
@@ -1917,6 +1967,50 @@ class RuntimeDiagnostics {
     } catch {
       return null;
     }
+  }
+  trackOperation(stage, startedAt) {
+    if (startedAt === null || this.activeOperations.size >= MAX_ACTIVE_OPERATIONS)
+      return;
+    const key = Symbol();
+    this.activeOperations.set(key, {
+      stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+      startedAt
+    });
+    return key;
+  }
+  activeOperationSnapshot() {
+    const now = this.readNow();
+    if (now === null)
+      return [];
+    return [...this.activeOperations.values()].map(({ stage, startedAt }) => ({
+      stage,
+      elapsedMs: Math.max(0, now - startedAt)
+    }));
+  }
+  readCpuUsage() {
+    try {
+      const usage = this.cpuUsage();
+      return finiteMeasurement(usage.user) && finiteMeasurement(usage.system) ? usage : null;
+    } catch {
+      return null;
+    }
+  }
+  sampleContext(startedAt, observed, before) {
+    const context = {
+      sampleElapsedMs: Math.max(0, observed - startedAt),
+      activeOperations: this.activeOperationSnapshot()
+    };
+    const after = this.readCpuUsage();
+    if (before && after && after.user >= before.user && after.system >= before.system) {
+      context.cpuUserMs = (after.user - before.user) / 1000;
+      context.cpuSystemMs = (after.system - before.system) / 1000;
+    }
+    try {
+      const rss = this.rssBytes();
+      if (finiteMeasurement(rss))
+        context.rssBytes = rss;
+    } catch {}
+    return context;
   }
   observeOperation(stage, startedAt) {
     try {
@@ -1939,6 +2033,10 @@ class RuntimeDiagnostics {
     } catch {}
   }
   record(event, observed) {
+    if (event.event === "runtime_event_loop_delay")
+      this.latestEventLoopDelay = event;
+    else
+      this.latestSlowOperation = event;
     this.recentSlowEvents.push(event);
     if (this.recentSlowEvents.length > this.maxSamples)
       this.recentSlowEvents.shift();
@@ -1950,7 +2048,7 @@ class RuntimeDiagnostics {
     }
     this.lastLoggedAt = observed;
     try {
-      Promise.resolve(this.onEvent({ ...event })).catch(() => {
+      Promise.resolve(this.onEvent(copyEvent(event))).catch(() => {
         return;
       });
     } catch {}

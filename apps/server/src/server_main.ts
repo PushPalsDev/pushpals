@@ -13,6 +13,10 @@ import {
 import { RequestQueue } from "./requests.js";
 import { COMPLETION_HANDOFF_CONFLICT_CODE, CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
+import {
+  summarizeWorkerExecutionCapability,
+  workerExecutionIdle,
+} from "./worker_execution_readiness.js";
 import { SqliteMemoryStore } from "./memory_store.js";
 import {
   RepositoryAgentQueue,
@@ -2604,7 +2608,8 @@ export function createRequestHandler() {
             total: workers.length,
             online: onlineWorkers.length,
             busy: busyWorkers,
-            idle: Math.max(0, onlineWorkers.length - busyWorkers),
+            idle: workers.filter(workerExecutionIdle).length,
+            executionCapability: summarizeWorkerExecutionCapability(workers),
           },
           jobs: {
             pending: taskExecutePending,
@@ -2707,7 +2712,8 @@ export function createRequestHandler() {
             total: workers.length,
             online: onlineWorkers.length,
             busy: busyWorkers,
-            idle: Math.max(0, onlineWorkers.length - busyWorkers),
+            idle: workers.filter(workerExecutionIdle).length,
+            executionCapability: summarizeWorkerExecutionCapability(workers),
           },
           queues: {
             requests: requestCounts,
@@ -2873,6 +2879,9 @@ export function createRequestHandler() {
         const snapshot = autonomyStore.createSnapshot({
           sessionId,
           runId,
+          executionCapability: summarizeWorkerExecutionCapability(
+            jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS),
+          ),
           requestSlo: requestQueue.sloSummary(24),
           jobSlo: jobQueue.sloSummary(24),
           repoHealthFlags: {

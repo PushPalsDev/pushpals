@@ -2438,6 +2438,66 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     ]);
   }, 20_000);
 
+  test("setup-only infrastructure failures neither invalidate nor contaminate implementation evidence", async () => {
+    const repo = createRepository();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    const base = await requestFor(repo, {
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: { path: "vision.md", sha256: "e".repeat(64) },
+        runtimeSignals: { recentObjectives: [] },
+      },
+    });
+    await worker.analyze("before-setup-failure", base);
+    const setupOnly = [
+      "docker_engine",
+      "docker_infrastructure",
+      "environment.missing_tool",
+      "infra",
+    ].map((failure_class) => ({
+      job_id: `setup-${failure_class}`,
+      status: "failed",
+      execution_started: false,
+      failure_class,
+      target_paths: ["src/index.ts"],
+    }));
+    const afterSetup = await worker.analyze("after-setup-failure", {
+      ...base,
+      context: { ...base.context, runtimeSignals: { recentObjectives: setupOnly } },
+    });
+    expect(afterSetup.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+    const implementationFailures = [
+      {
+        job_id: "started",
+        status: "failed",
+        execution_started: true,
+        failure_class: "docker_engine",
+      },
+      { job_id: "legacy", status: "failed", failure_class: "docker_engine" },
+      { job_id: "code", status: "failed", execution_started: false, failure_class: "code" },
+    ];
+    const afterImplementation = await worker.analyze("after-implementation-failure", {
+      ...base,
+      context: {
+        ...base.context,
+        runtimeSignals: { recentObjectives: [...setupOnly, ...implementationFailures] },
+      },
+    });
+    expect(afterImplementation.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(2);
+    const payload = JSON.parse(llm.analysisCalls[1]!.messages[0]!.content);
+    expect(
+      payload.request.context.runtimeSignals.recentObjectives.map((row: any) => row.job_id),
+    ).toEqual(["code", "legacy", "started"]);
+  });
+
   test("an outcome watermark prevents reuse after executed details age out of a long-lived cache", async () => {
     const repo = createRepository();
     const llm = new FakeLlm();

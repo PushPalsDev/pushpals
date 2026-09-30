@@ -36,6 +36,7 @@ export const REQUIRED_CLI_PACKAGE_PATHS = [
   "runtime/sandbox/apps/workerpals/uv.lock",
   "runtime/sandbox/apps/workerpals/src/job_runner.ts",
   "runtime/sandbox/apps/workerpals/src/startup_budget.ts",
+  "runtime/sandbox/apps/workerpals/src/execution_readiness.ts",
   "runtime/sandbox/packages/shared/src/worker_startup.ts",
   "runtime/sandbox/apps/workerpals/src/workerpals_main.ts",
   "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",

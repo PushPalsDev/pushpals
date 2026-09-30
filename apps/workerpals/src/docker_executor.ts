@@ -722,16 +722,66 @@ export function buildLinuxWorktreeAddArgs(
   ];
 }
 
+export function isTransientDockerControlFailure(result: {
+  timedOut?: boolean;
+  stdout?: string;
+  stderr?: string;
+}): boolean {
+  const text = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+  if (
+    /permission denied|access is denied|access denied|unauthorized|forbidden|invalid (?:mount|reference|argument)|no such image|pull access denied|client version .+ too (?:old|new)/i.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+  return (
+    Boolean(result.timedOut) ||
+    /internal server error|\b(?:bad gateway|service unavailable|gateway timeout)\b|cannot connect to (?:the )?docker|failed to connect to (?:the )?docker|\b(?:econnrefused|econnreset|etimedout)\b|connection (?:refused|reset|closed)|context deadline exceeded|tls handshake timeout/i.test(
+      text,
+    )
+  );
+}
+
+/** Only constructed at host-controlled Docker/runtime preparation boundaries. */
+export class DockerInfrastructureError extends Error {
+  executionStarted = false;
+
+  constructor(
+    readonly phase:
+      | "volume_prepare"
+      | "container_inspect"
+      | "container_start"
+      | "runtime_canary"
+      | "backend_readiness",
+    message: string,
+    readonly retryable: boolean,
+    readonly exitCode?: number,
+  ) {
+    super(message);
+    this.name = "DockerInfrastructureError";
+  }
+}
+
 export class DockerExecutionExhaustedError extends Error {
   readonly cooldownMs: number;
   readonly category: "warm_setup" | "job_execution";
+  readonly phase?: DockerInfrastructureError["phase"];
+  executionStarted?: boolean;
   candidateState?: JobCandidateState;
 
-  constructor(category: "warm_setup" | "job_execution", message: string, cooldownMs: number) {
+  constructor(
+    category: "warm_setup" | "job_execution",
+    message: string,
+    cooldownMs: number,
+    cause?: DockerInfrastructureError,
+  ) {
     super(message);
     this.name = "DockerExecutionExhaustedError";
     this.category = category;
     this.cooldownMs = Math.max(0, Math.floor(cooldownMs));
+    this.phase = cause?.phase;
+    this.executionStarted = cause?.executionStarted;
   }
 }
 
@@ -1215,6 +1265,8 @@ export class DockerExecutor {
   private warmAgentPort = 39231;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private activeJobs = 0;
+  private sharedReadinessActive = 0;
+  private shuttingDown = false;
   private readonly warmAgentStartupTimeoutMs: number;
   private readonly warmAgentStartupPollMs: number = 200;
   private readonly warmSetupMaxAttempts: number;
@@ -1347,6 +1399,7 @@ export class DockerExecutor {
     let worktreeBaselineSha: string | null = null;
     let worktreeCreationStarted = false;
     let preserveWorktreeForCandidateRecovery = false;
+    let executionStarted = false;
     const accumulatedUsage = new UsageAccumulator();
     const finish = (result: DockerJobResult): DockerJobResult => {
       terminalResult = accumulatedUsage.apply(result);
@@ -1403,6 +1456,7 @@ export class DockerExecutor {
         const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
+          if (isHostScmOwnedReviewParams(deadlineBoundJob.params)) executionStarted = true;
           let result = isHostScmOwnedReviewParams(deadlineBoundJob.params)
             ? await this.runHostScmOwnedReviewJob(
                 worktreePath,
@@ -1410,7 +1464,15 @@ export class DockerExecutor {
                 deadlineLedger,
                 onLog,
               )
-            : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+            : await this.runInWarmContainer(
+                worktreePath,
+                deadlineBoundJob,
+                onLog,
+                deadlineLedger,
+                () => {
+                  executionStarted = true;
+                },
+              );
           addDockerTransportAttemptUsage(accumulatedUsage, result, attempt);
           if (
             result.ok &&
@@ -1548,6 +1610,7 @@ export class DockerExecutor {
                   err,
                 )}`,
                 this.failureCooldownMs,
+                err instanceof DockerInfrastructureError ? err : undefined,
               );
             }
             throw err;
@@ -1602,6 +1665,13 @@ export class DockerExecutor {
         );
       }
       const propagatedError = error instanceof Error ? error : new Error(String(error));
+      if (
+        propagatedError instanceof DockerInfrastructureError ||
+        propagatedError instanceof DockerExecutionExhaustedError
+      ) {
+        if (propagatedError.executionStarted !== undefined)
+          propagatedError.executionStarted = executionStarted;
+      }
       const usageSnapshot = accumulatedUsage.apply<DockerJobResult>({
         ok: false,
         summary: `Docker execution threw before completion: ${this.compactError(propagatedError)}`,
@@ -1744,6 +1814,63 @@ export class DockerExecutor {
         );
       }
       this.scheduleIdleShutdown();
+    }
+  }
+
+  /** Shared capability only: never installs candidate dependencies or runs repository hooks. */
+  async checkSharedRuntimeReadiness(timeoutMs = 60_000): Promise<void> {
+    this.assertDockerPreparationAllowed();
+    this.sharedReadinessActive += 1;
+    this.activeJobs += 1;
+    this.clearIdleTimer();
+    try {
+      const ledger = new JobDeadlineLedger({
+        executionBudgetMs: Math.max(
+          1_000,
+          Math.min(120_000, Number.isFinite(timeoutMs) ? timeoutMs : 60_000),
+        ),
+        finalizationBudgetMs: 0,
+        now: this.deadlineWallNow,
+        monotonicNow: this.deadlineMonotonicNow,
+      });
+      const backend = this.currentBackend();
+      this.warmedBackends.delete(backend);
+      await this.ensureWarmRuntimeReady(
+        {
+          id: "shared-readiness",
+          taskId: "shared-readiness",
+          sessionId: "",
+          kind: "warmup",
+          params: {},
+        },
+        undefined,
+        ledger,
+      );
+      this.assertDockerPreparationAllowed();
+      const canary = await this.runWarmShell(buildDockerRuntimeCapabilityCanaryCommand(backend), {
+        timeoutMs: ledger.capWorkTimeout(15_000),
+      }).catch((error) => {
+        if (error instanceof DockerInfrastructureError) throw error;
+        const detail = this.compactError(error);
+        throw new DockerInfrastructureError(
+          "runtime_canary",
+          detail,
+          isTransientDockerControlFailure({ stderr: detail }),
+        );
+      });
+      if (!canary.ok || ledger.workExpired()) {
+        throw new DockerInfrastructureError(
+          "runtime_canary",
+          `Shared Docker runtime capability check failed: ${canary.stderr || canary.stdout || `exit ${canary.exitCode}`}`,
+          ledger.workExpired() || isTransientDockerControlFailure(canary),
+          canary.exitCode,
+        );
+      }
+      this.assertDockerPreparationAllowed();
+    } finally {
+      this.sharedReadinessActive = Math.max(0, this.sharedReadinessActive - 1);
+      this.activeJobs = Math.max(0, this.activeJobs - 1);
+      if (!this.shuttingDown) this.scheduleIdleShutdown();
     }
   }
 
@@ -2266,6 +2393,7 @@ export class DockerExecutor {
   }
 
   private scheduleIdleShutdown(): void {
+    if (this.shuttingDown) return;
     if (this.options.idleTimeoutMs <= 0) return;
     if (this.activeJobs > 0) return;
 
@@ -2281,6 +2409,7 @@ export class DockerExecutor {
   }
 
   private async startWarmContainer(deadlineLedger?: JobDeadlineLedger): Promise<void> {
+    this.assertDockerPreparationAllowed();
     const stopTimeoutMs = deadlineLedger
       ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS)
       : DOCKER_CONTROL_TIMEOUT_MS;
@@ -2364,15 +2493,22 @@ export class DockerExecutor {
 
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
-    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
-      timeoutMs:
-        deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS,
-    });
+    const result = await this.runDockerPreparationCommand(
+      "container_start",
+      [resolveDockerExecutable(), ...args],
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS,
+      },
+    );
     if (result.timedOut || result.exitCode !== 0) {
-      throw new Error(
+      throw new DockerInfrastructureError(
+        "container_start",
         `Failed to start warm container (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${
           result.stderr || result.stdout || "no docker output"
         }`,
+        isTransientDockerControlFailure(result),
+        result.exitCode,
       );
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
@@ -2416,7 +2552,8 @@ export class DockerExecutor {
     component: string,
     deadlineLedger?: JobDeadlineLedger,
   ): Promise<void> {
-    const result = await this.runDockerCommandCapture(
+    const result = await this.runDockerPreparationCommand(
+      "volume_prepare",
       [
         resolveDockerExecutable(),
         "volume",
@@ -2433,10 +2570,13 @@ export class DockerExecutor {
       },
     );
     if (result.timedOut || result.exitCode !== 0) {
-      throw new Error(
+      throw new DockerInfrastructureError(
+        "volume_prepare",
         `Failed to prepare ${component} volume (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${
           result.stderr || result.stdout || "no docker output"
         }`,
+        isTransientDockerControlFailure(result),
+        result.exitCode,
       );
     }
   }
@@ -2503,7 +2643,8 @@ export class DockerExecutor {
   }
 
   private async ensureWarmContainer(deadlineLedger?: JobDeadlineLedger): Promise<void> {
-    const inspect = await this.runDockerCommandCapture(
+    const inspect = await this.runDockerPreparationCommand(
+      "container_inspect",
       [
         resolveDockerExecutable(),
         "inspect",
@@ -2529,6 +2670,18 @@ export class DockerExecutor {
           `[DockerExecutor] Warm container network mismatch (${networkMode} != ${this.options.networkMode}); recreating...`,
         );
       }
+    }
+    if (
+      inspect.timedOut ||
+      (inspect.exitCode !== 0 &&
+        !/no such (?:object|container)/i.test(`${inspect.stderr}\n${inspect.stdout}`))
+    ) {
+      throw new DockerInfrastructureError(
+        "container_inspect",
+        `Failed to inspect warm container: ${inspect.stderr || inspect.stdout || `exit ${inspect.exitCode}`}`,
+        isTransientDockerControlFailure(inspect),
+        inspect.exitCode,
+      );
     }
     await this.startWarmContainer(deadlineLedger);
   }
@@ -2970,6 +3123,13 @@ export class DockerExecutor {
   }
 
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.clearIdleTimer();
+    if (this.sharedReadinessActive > 0) {
+      await Promise.all(
+        [...this.startupProcesses].map((proc) => terminateDockerExecProcessTree(proc)),
+      );
+    }
     if (this.startupBudget && !this.startupCleanupLedger) {
       this.startupCleanupLedger = new JobDeadlineLedger({
         executionBudgetMs: this.startupBudget.capTimeout(WORKER_STARTUP_CLEANUP_GRACE_MS, true),
@@ -3014,9 +3174,14 @@ export class DockerExecutor {
   }
 
   private trackStartupProcess(proc: ReturnType<typeof Bun.spawn>): void {
-    if (!this.startupBudget) return;
+    // Shared-readiness probes also own cancellable subprocesses even after the
+    // launch-only startup budget has been cleared.
+    if (!this.startupBudget && !(this.sharedReadinessActive > 0)) return;
     this.startupProcesses.add(proc);
-    void proc.exited.then(() => this.startupProcesses.delete(proc));
+    void proc.exited.then(
+      () => this.startupProcesses.delete(proc),
+      () => this.startupProcesses.delete(proc),
+    );
   }
 
   private encodeJobSpec(job: Job): string {
@@ -3270,6 +3435,7 @@ export class DockerExecutor {
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
     deadlineLedger?: JobDeadlineLedger,
+    onExecutionStart?: () => void,
   ): Promise<DockerJobResult> {
     if (deadlineLedger?.workExpired()) {
       return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container setup");
@@ -3319,6 +3485,7 @@ export class DockerExecutor {
         stdout: "pipe",
         stderr: "pipe",
       });
+      onExecutionStart?.();
     } catch (err) {
       throw new Error(
         `failed to spawn warm-container docker exec (${this.warmContainerName}, cwd=${containerWorktreePath}, argv_chars=${dockerArgv.join("\u0000").length}, spec_chars=${base64Spec.length}): ${this.compactError(
@@ -4224,16 +4391,32 @@ export class DockerExecutor {
     let attempt = 1;
     let recoveredMissingImage = false;
     while (attempt <= this.warmSetupMaxAttempts) {
+      this.assertDockerPreparationAllowed();
       if (deadlineLedger?.workExpired()) {
-        throw new Error(
+        throw new DockerInfrastructureError(
+          "backend_readiness",
           `Warm runtime setup for ${job.id} stopped at the absolute job work deadline.`,
+          true,
+          124,
         );
       }
       try {
         await this.ensureWarmContainer(deadlineLedger);
-        await this.ensureBackendWarmup(backend, deadlineLedger);
+        this.assertDockerPreparationAllowed();
+        try {
+          await this.ensureBackendWarmup(backend, deadlineLedger);
+        } catch (error) {
+          if (error instanceof DockerInfrastructureError) throw error;
+          const detail = this.compactError(error);
+          throw new DockerInfrastructureError(
+            "backend_readiness",
+            `Docker backend readiness failed: ${detail}`,
+            isTransientDockerControlFailure({ stderr: detail }),
+          );
+        }
         return;
       } catch (err) {
+        this.assertDockerPreparationAllowed();
         if (this.isMissingDockerImageError(err) && !recoveredMissingImage) {
           recoveredMissingImage = true;
           const rebuildNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is missing locally; rebuilding before retrying warm container startup.`;
@@ -4244,6 +4427,7 @@ export class DockerExecutor {
             : DOCKER_CONTROL_TIMEOUT_MS;
           if (recoveryTimeoutMs <= 0) throw err;
           await this.stopWarmContainer("missing image recovery", true, recoveryTimeoutMs);
+          this.assertDockerPreparationAllowed();
           this.warmedBackends.clear();
           if (await this.pullImage(deadlineLedger)) {
             const retryNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is available again; retrying warm container startup.`;
@@ -4265,6 +4449,7 @@ export class DockerExecutor {
                 err,
               )}`,
               this.failureCooldownMs,
+              err instanceof DockerInfrastructureError ? err : undefined,
             );
           }
           throw err;
@@ -4284,8 +4469,11 @@ export class DockerExecutor {
           ? deadlineLedger.capWorkTimeout(retryInMs)
           : retryInMs;
         if (boundedRetryInMs < retryInMs) {
-          throw new Error(
+          throw new DockerInfrastructureError(
+            err instanceof DockerInfrastructureError ? err.phase : "backend_readiness",
             `Warm runtime retry for ${job.id} was cancelled to preserve the finalization reserve.`,
+            true,
+            124,
           );
         }
         await this.sleep(boundedRetryInMs);
@@ -4298,6 +4486,7 @@ export class DockerExecutor {
     backend: ExecutorBackend,
     deadlineLedger?: JobDeadlineLedger,
   ): Promise<void> {
+    this.assertDockerPreparationAllowed();
     if (this.warmedBackends.has(backend)) return;
     const spec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
@@ -4305,12 +4494,14 @@ export class DockerExecutor {
       await spec.ensureWarmRuntime({
         ...warmContext,
         warmContainerName: this.warmContainerName,
-        runWarmShell: (command: string): Promise<DockerWarmShellResult> =>
-          this.runWarmShell(command, {
+        runWarmShell: (command: string): Promise<DockerWarmShellResult> => {
+          this.assertDockerPreparationAllowed();
+          return this.runWarmShell(command, {
             timeoutMs:
               deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ??
               this.warmAgentStartupTimeoutMs,
-          }),
+          });
+        },
         restartWarmContainer: async () => {
           await this.startWarmContainer(deadlineLedger);
         },
@@ -4319,6 +4510,7 @@ export class DockerExecutor {
             ? "Warm-runtime diagnostics skipped because the absolute job work deadline expired."
             : this.collectWarmRuntimeDiagnostics(backend, deadlineLedger),
       });
+      this.assertDockerPreparationAllowed();
       this.warmedBackends.add(backend);
       return;
     }
@@ -4336,6 +4528,7 @@ export class DockerExecutor {
         );
       }
     }
+    this.assertDockerPreparationAllowed();
     this.warmedBackends.add(backend);
   }
 
@@ -4476,6 +4669,40 @@ export class DockerExecutor {
     };
   }
 
+  private async runDockerPreparationCommand(
+    phase: DockerInfrastructureError["phase"],
+    command: string[],
+    options: { timeoutMs?: number },
+  ): Promise<Awaited<ReturnType<DockerExecutor["runDockerCommandCapture"]>>> {
+    this.assertDockerPreparationAllowed();
+    try {
+      const result = await this.runDockerCommandCapture(command, options);
+      if (this.shuttingDown && phase === "container_start") {
+        await this.stopWarmContainer("cancelled shared preparation", true, 5_000);
+      }
+      this.assertDockerPreparationAllowed();
+      return result;
+    } catch (error) {
+      if (error instanceof DockerInfrastructureError) throw error;
+      const detail = this.compactError(error);
+      throw new DockerInfrastructureError(
+        phase,
+        detail,
+        isTransientDockerControlFailure({ stderr: detail }),
+      );
+    }
+  }
+
+  private assertDockerPreparationAllowed(): void {
+    if (this.shuttingDown) {
+      throw new DockerInfrastructureError(
+        "backend_readiness",
+        "Docker executor is shutting down; preparation is cancelled.",
+        false,
+      );
+    }
+  }
+
   private async runDockerCommandCapture(
     command: string[],
     opts: {
@@ -4564,6 +4791,7 @@ export class DockerExecutor {
   }
 
   private isRetryableError(err: unknown): boolean {
+    if (err instanceof DockerInfrastructureError) return err.retryable;
     const text = this.compactError(err).toLowerCase();
     return this.matchesRetryablePattern(text);
   }

@@ -7,6 +7,9 @@ import {
   buildWorktreeDependencyPreparationCommand,
   collectPrunableEphemeralWorktrees,
   DockerExecutor,
+  DockerInfrastructureError,
+  DockerExecutionExhaustedError,
+  isTransientDockerControlFailure,
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
   prependWorkerpalRuntimeCaStartup,
@@ -43,6 +46,206 @@ function createExecutor() {
 }
 
 describe("workerpals docker executor internals", () => {
+  test("tracks preparation processes only with an active readiness or startup lifecycle", async () => {
+    const executor = Object.create(DockerExecutor.prototype) as any;
+    const proc = { exited: Promise.resolve(0) };
+    // Minimal prototype fixtures have no lifecycle fields and must stay idle.
+    expect(() => executor.trackStartupProcess(proc)).not.toThrow();
+    executor.sharedReadinessActive = 1;
+    executor.startupProcesses = new Set();
+    executor.trackStartupProcess(proc);
+    expect(executor.startupProcesses.has(proc)).toBe(true);
+    await proc.exited;
+    expect(executor.startupProcesses.size).toBe(0);
+  });
+
+  test.each([
+    [
+      "request returned Internal Server Error for API route and version http://docker/v1.46/volumes/create, check if the server supports the requested API version",
+      true,
+    ],
+    ["Cannot connect to the Docker daemon", true],
+    ["permission denied while contacting Docker", false],
+    ["Error response from daemon: No such image: worker:missing", false],
+    ["invalid mount config for type bind", false],
+    ["client version 1.20 is too old", false],
+    ["unexpected setup failure", false],
+  ])("classifies Docker control diagnostic without broad setup retries: %s", (stderr, expected) => {
+    expect(isTransientDockerControlFailure({ stderr: String(stderr) })).toBe(expected);
+  });
+
+  test("types volume preparation HTTP 500 failures before coding begins", async () => {
+    const executor = createExecutor() as any;
+    executor.runDockerCommandCapture = async () => ({
+      exitCode: 1,
+      timedOut: false,
+      stdout: "",
+      stderr: "request returned Internal Server Error for API route /volumes/create",
+    });
+    let failure: unknown;
+    try {
+      await executor.ensureNamedVolume("fixture-volume", "workerpals-dependencies");
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(DockerInfrastructureError);
+    expect(failure).toMatchObject({
+      phase: "volume_prepare",
+      retryable: true,
+      executionStarted: false,
+      exitCode: 1,
+    });
+  });
+
+  test("does not treat a broken Docker inspect as a missing container", async () => {
+    const executor = createExecutor() as any;
+    let starts = 0;
+    executor.runDockerCommandCapture = async () => ({
+      exitCode: 1,
+      timedOut: false,
+      stdout: "",
+      stderr: "request returned Internal Server Error for API route /containers/inspect",
+    });
+    executor.startWarmContainer = async () => {
+      starts += 1;
+    };
+    await expect(executor.ensureWarmContainer()).rejects.toThrow(
+      "Failed to inspect warm container",
+    );
+    expect(starts).toBe(0);
+    executor.runDockerCommandCapture = async () => ({
+      exitCode: 1,
+      timedOut: false,
+      stdout: "",
+      stderr: "Error: No such object: fixture-warm",
+    });
+    await executor.ensureWarmContainer();
+    expect(starts).toBe(1);
+  });
+
+  test.each([true, false])(
+    "bounds typed Docker preparation retries (transient=%s)",
+    async (retryable) => {
+      const executor = createExecutor() as any;
+      executor.warmSetupMaxAttempts = 2;
+      executor.sleep = async () => {};
+      executor.stopWarmContainer = async () => {};
+      let attempts = 0;
+      executor.ensureWarmContainer = async () => {
+        attempts += 1;
+        throw new DockerInfrastructureError(
+          "volume_prepare",
+          "fixture volume failure",
+          retryable,
+          1,
+        );
+      };
+      let failure: unknown;
+      try {
+        await executor.ensureWarmRuntimeReady({ id: "fixture", kind: "warmup", params: {} });
+      } catch (error) {
+        failure = error;
+      }
+      expect(attempts).toBe(retryable ? 2 : 1);
+      expect(failure).toBeInstanceOf(
+        retryable ? DockerExecutionExhaustedError : DockerInfrastructureError,
+      );
+      expect(failure).toMatchObject({ phase: "volume_prepare", executionStarted: false });
+    },
+  );
+
+  test("shared readiness cannot recreate resources after shutdown while a probe is pending", async () => {
+    const executor = createExecutor() as any;
+    let release!: () => void;
+    let canaries = 0;
+    executor.ensureWarmRuntimeReady = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    executor.runWarmShell = async () => {
+      canaries += 1;
+      return { ok: true };
+    };
+    executor.stopWarmContainer = async () => {};
+    const pending = executor.checkSharedRuntimeReadiness();
+    expect(executor.activeJobs).toBe(1);
+    await executor.shutdown();
+    release();
+    await expect(pending).rejects.toThrow("shutting down");
+    expect(canaries).toBe(0);
+    expect(executor.activeJobs).toBe(0);
+    await expect(executor.startWarmContainer()).rejects.toThrow("shutting down");
+    await expect(executor.ensureNamedVolume("fixture", "workerpals-dependencies")).rejects.toThrow(
+      "shutting down",
+    );
+  });
+
+  test("shared readiness checks capabilities under one deadline without candidate dependency hooks", async () => {
+    const executor = createExecutor() as any;
+    let setupLedger: unknown;
+    let canaryTimeout = 0;
+    executor.currentBackend = () => "openai_codex";
+    executor.scheduleIdleShutdown = () => {};
+    executor.ensureWarmRuntimeReady = async (_job: unknown, _log: unknown, ledger: unknown) => {
+      setupLedger = ledger;
+    };
+    executor.createWorktree = async () => {
+      throw new Error("candidate worktree must not be created");
+    };
+    executor.ensureWorktreeDependencyArtifacts = async () => {
+      throw new Error("candidate hooks must not run");
+    };
+    executor.runWarmShell = async (command: string, options: { timeoutMs: number }) => {
+      expect(command).toContain("test -w");
+      expect(command).not.toContain("bun install");
+      canaryTimeout = options.timeoutMs;
+      return { ok: true, stdout: "ready", stderr: "", exitCode: 0 };
+    };
+    await executor.checkSharedRuntimeReadiness(1_000);
+    expect(setupLedger).toBeDefined();
+    expect(canaryTimeout).toBeGreaterThan(0);
+    expect(canaryTimeout).toBeLessThanOrEqual(1_000);
+  });
+
+  test("cleans a container creation that completes after shutdown", async () => {
+    const executor = createExecutor() as any;
+    let release!: (result: unknown) => void;
+    const cleanupReasons: string[] = [];
+    executor.runDockerCommandCapture = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    executor.stopWarmContainer = async (reason: string) => {
+      cleanupReasons.push(reason);
+    };
+    const pending = executor.runDockerPreparationCommand("container_start", ["docker", "run"], {
+      timeoutMs: 1_000,
+    });
+    await executor.shutdown();
+    release({ exitCode: 0, timedOut: false, stdout: "fixture-container", stderr: "" });
+    await expect(pending).rejects.toThrow("shutting down");
+    expect(cleanupReasons).toEqual(["worker shutdown", "cancelled shared preparation"]);
+  });
+
+  test("shutdown fences backend preparation after a pending container check", async () => {
+    const executor = createExecutor() as any;
+    let release!: () => void;
+    let backendProbes = 0;
+    executor.ensureWarmContainer = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    executor.ensureBackendWarmup = async () => {
+      backendProbes += 1;
+    };
+    executor.stopWarmContainer = async () => {};
+    const pending = executor.checkSharedRuntimeReadiness();
+    await executor.shutdown();
+    release();
+    await expect(pending).rejects.toThrow("shutting down");
+    expect(backendProbes).toBe(0);
+  });
+
   test("bounds LLM probes through response-body cancellation", async () => {
     let observedSignal: AbortSignal | null = null;
     let cancellationStarted = false;

@@ -3381,6 +3381,288 @@ function createRepositoryAgentServiceClients(options) {
     }
   });
 }
+// packages/shared/src/runtime_diagnostics.ts
+var LABEL = /^[a-zA-Z0-9_.:-]{1,96}$/;
+var MAX_ACTIVE_OPERATIONS = 8;
+function recordValue(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function finiteMeasurement(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+function activeOperationSummary(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.slice(0, MAX_ACTIVE_OPERATIONS).flatMap((entry) => {
+    const item = recordValue(entry);
+    return item && typeof item.stage === "string" && LABEL.test(item.stage) && finiteMeasurement(item.elapsedMs) ? [{ stage: item.stage, elapsedMs: item.elapsedMs }] : [];
+  });
+}
+function diagnosticContext(value) {
+  const input = recordValue(value);
+  if (!input)
+    return;
+  const context = {};
+  for (const key of ["sampleElapsedMs", "cpuUserMs", "cpuSystemMs", "rssBytes"]) {
+    if (finiteMeasurement(input[key]))
+      context[key] = input[key];
+  }
+  const activeOperations = activeOperationSummary(input.activeOperations);
+  if (activeOperations)
+    context.activeOperations = activeOperations;
+  return Object.keys(context).length ? context : undefined;
+}
+function copyEvent(event) {
+  return { ...event, ...event.context ? { context: diagnosticContext(event.context) } : {} };
+}
+function boundedInteger(value, name, maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new RangeError(`${name} must be a positive safe integer no greater than ${maximum}`);
+  }
+  return value;
+}
+
+class RuntimeDiagnostics {
+  service;
+  now;
+  wallNow;
+  onEvent;
+  sampleIntervalMs;
+  slowThresholdMs;
+  maxSamples;
+  schedule;
+  cpuUsage;
+  rssBytes;
+  running = false;
+  generation = 0;
+  cancelTimer = null;
+  lastEventLoopDelayMs = null;
+  maxEventLoopDelayMs = 0;
+  slowEventLoopSamples = 0;
+  slowOperationSamples = 0;
+  suppressedLogEvents = 0;
+  lastLoggedAt = -Infinity;
+  recentSlowEvents = [];
+  latestEventLoopDelay;
+  latestSlowOperation;
+  activeOperations = new Map;
+  constructor(options) {
+    if (typeof options.service !== "string" || !LABEL.test(options.service)) {
+      throw new TypeError("service must be a fixed identifier of 1 to 96 characters");
+    }
+    this.service = options.service;
+    this.sampleIntervalMs = boundedInteger(options.sampleIntervalMs ?? 1000, "sampleIntervalMs", 60000);
+    this.slowThresholdMs = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86400000);
+    this.maxSamples = Math.min(64, boundedInteger(options.maxSamples ?? 16, "maxSamples", Number.MAX_SAFE_INTEGER));
+    for (const name of ["now", "wallNow", "onEvent", "schedule", "cpuUsage", "rssBytes"]) {
+      if (options[name] !== undefined && typeof options[name] !== "function") {
+        throw new TypeError(`${name} must be a function`);
+      }
+    }
+    this.now = options.now ?? (() => performance.now());
+    this.wallNow = options.wallNow ?? Date.now;
+    this.onEvent = options.onEvent;
+    this.cpuUsage = options.cpuUsage ?? (() => process.cpuUsage());
+    this.rssBytes = options.rssBytes ?? (() => process.memoryUsage.rss());
+    this.schedule = options.schedule ?? ((callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return () => clearTimeout(timer);
+    });
+  }
+  start() {
+    if (this.running)
+      return;
+    this.running = true;
+    this.scheduleNext(++this.generation);
+  }
+  stop() {
+    this.running = false;
+    this.generation += 1;
+    const cancel = this.cancelTimer;
+    this.cancelTimer = null;
+    try {
+      cancel?.();
+    } catch {}
+  }
+  snapshot() {
+    return {
+      service: this.service,
+      running: this.running,
+      measurement: "Timer lateness is measured delay, not proof of root cause or service downtime.",
+      sampleIntervalMs: this.sampleIntervalMs,
+      slowThresholdMs: this.slowThresholdMs,
+      lastEventLoopDelayMs: this.lastEventLoopDelayMs,
+      maxEventLoopDelayMs: this.maxEventLoopDelayMs,
+      slowEventLoopSamples: this.slowEventLoopSamples,
+      slowOperationSamples: this.slowOperationSamples,
+      suppressedLogEvents: this.suppressedLogEvents,
+      latestEventLoopDelay: this.latestEventLoopDelay ? copyEvent(this.latestEventLoopDelay) : undefined,
+      latestSlowOperation: this.latestSlowOperation ? copyEvent(this.latestSlowOperation) : undefined,
+      activeOperations: this.activeOperationSnapshot(),
+      recentSlowEvents: this.recentSlowEvents.map(copyEvent)
+    };
+  }
+  run(stage, fn) {
+    const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
+    try {
+      return fn();
+    } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  async runAsync(stage, fn) {
+    const startedAt = this.readNow();
+    const operation = this.trackOperation(stage, startedAt);
+    try {
+      return await fn();
+    } finally {
+      if (operation)
+        this.activeOperations.delete(operation);
+      this.observeOperation(stage, startedAt);
+    }
+  }
+  scheduleNext(generation) {
+    const startedAt = this.readNow();
+    if (startedAt === null) {
+      this.stop();
+      return;
+    }
+    const expectedAt = startedAt + this.sampleIntervalMs;
+    const cpuBefore = this.readCpuUsage();
+    const callback = () => {
+      if (!this.running || this.generation !== generation)
+        return;
+      this.cancelTimer = null;
+      try {
+        const observed = this.readNow();
+        if (observed === null) {
+          this.stop();
+          return;
+        }
+        const delayMs = Math.max(0, observed - expectedAt);
+        if (Number.isFinite(delayMs)) {
+          this.lastEventLoopDelayMs = delayMs;
+          this.maxEventLoopDelayMs = Math.max(this.maxEventLoopDelayMs, delayMs);
+          if (delayMs >= this.slowThresholdMs) {
+            this.slowEventLoopSamples += 1;
+            this.record({
+              event: "runtime_event_loop_delay",
+              service: this.service,
+              observedAt: new Date(this.wallNow()).toISOString(),
+              delayMs,
+              sampleIntervalMs: this.sampleIntervalMs,
+              context: this.sampleContext(startedAt, observed, cpuBefore)
+            }, observed);
+          }
+        }
+      } catch {}
+      if (this.running && this.generation === generation)
+        this.scheduleNext(generation);
+    };
+    try {
+      this.cancelTimer = this.schedule(callback, this.sampleIntervalMs);
+    } catch {
+      this.stop();
+    }
+  }
+  readNow() {
+    try {
+      const value = this.now();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  trackOperation(stage, startedAt) {
+    if (startedAt === null || this.activeOperations.size >= MAX_ACTIVE_OPERATIONS)
+      return;
+    const key = Symbol();
+    this.activeOperations.set(key, {
+      stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+      startedAt
+    });
+    return key;
+  }
+  activeOperationSnapshot() {
+    const now = this.readNow();
+    if (now === null)
+      return [];
+    return [...this.activeOperations.values()].map(({ stage, startedAt }) => ({
+      stage,
+      elapsedMs: Math.max(0, now - startedAt)
+    }));
+  }
+  readCpuUsage() {
+    try {
+      const usage = this.cpuUsage();
+      return finiteMeasurement(usage.user) && finiteMeasurement(usage.system) ? usage : null;
+    } catch {
+      return null;
+    }
+  }
+  sampleContext(startedAt, observed, before) {
+    const context = {
+      sampleElapsedMs: Math.max(0, observed - startedAt),
+      activeOperations: this.activeOperationSnapshot()
+    };
+    const after = this.readCpuUsage();
+    if (before && after && after.user >= before.user && after.system >= before.system) {
+      context.cpuUserMs = (after.user - before.user) / 1000;
+      context.cpuSystemMs = (after.system - before.system) / 1000;
+    }
+    try {
+      const rss = this.rssBytes();
+      if (finiteMeasurement(rss))
+        context.rssBytes = rss;
+    } catch {}
+    return context;
+  }
+  observeOperation(stage, startedAt) {
+    try {
+      if (startedAt === null)
+        return;
+      const observed = this.readNow();
+      if (observed === null)
+        return;
+      const durationMs = Math.max(0, observed - startedAt);
+      if (!Number.isFinite(durationMs) || durationMs < this.slowThresholdMs)
+        return;
+      this.slowOperationSamples += 1;
+      this.record({
+        event: "runtime_slow_operation",
+        service: this.service,
+        observedAt: new Date(this.wallNow()).toISOString(),
+        stage: typeof stage === "string" && LABEL.test(stage) ? stage : "operation",
+        durationMs
+      }, observed);
+    } catch {}
+  }
+  record(event, observed) {
+    if (event.event === "runtime_event_loop_delay")
+      this.latestEventLoopDelay = event;
+    else
+      this.latestSlowOperation = event;
+    this.recentSlowEvents.push(event);
+    if (this.recentSlowEvents.length > this.maxSamples)
+      this.recentSlowEvents.shift();
+    if (!this.onEvent)
+      return;
+    if (observed - this.lastLoggedAt < 1000) {
+      this.suppressedLogEvents += 1;
+      return;
+    }
+    this.lastLoggedAt = observed;
+    try {
+      Promise.resolve(this.onEvent(copyEvent(event))).catch(() => {
+        return;
+      });
+    } catch {}
+  }
+}
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
   return value.replace(/^(agent|client)(?:[\s:./_-]+)+/i, "");
@@ -8746,6 +9028,8 @@ var WORK_DIVERSITY_ACTIVE_STATUSES = new Set([
 ]);
 var WORK_DIVERSITY_RECENT_COOLDOWN_MS = 6 * 60 * 60000;
 function isRecentWorkDiversityObjective(objective, nowMs = Date.now()) {
+  if (isUnstartedAutonomyInfrastructureOutcome(objective))
+    return false;
   const updatedAt = Date.parse(asString2(objective.updated_at));
   return Number.isFinite(updatedAt) && updatedAt <= nowMs && nowMs - updatedAt <= WORK_DIVERSITY_RECENT_COOLDOWN_MS;
 }
@@ -12409,6 +12693,40 @@ function autonomyIntegrationBaselineDecision(options) {
 }
 var AUTONOMY_CONTROL_HTTP_TIMEOUT_MS = 1e4;
 var AUTONOMY_LLM_ABORT_DRAIN_MS = 1000;
+var AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS = 30 * 60000;
+function isUnstartedAutonomyInfrastructureOutcome(objective) {
+  const failureClass = asString2(objective.failure_class).toLowerCase();
+  return Boolean(asString2(objective.job_id) && ["failed", "dead_letter"].includes(asString2(objective.status)) && objective.execution_started === false && (["infra", "docker_engine", "docker_infrastructure"].includes(failureClass) || failureClass.startsWith("environment.")));
+}
+function isExecutedAutonomyImplementationOutcome(objective) {
+  return Boolean(asString2(objective.job_id) && ["completed", "failed", "dead_letter"].includes(asString2(objective.status)) && !isUnstartedAutonomyInfrastructureOutcome(objective));
+}
+function exhaustedDiscoveryKey(options) {
+  const nowMs = options.nowMs ?? Date.now();
+  const signals = asObject(options.context.runtimeSignals);
+  const exclusions = asObject(options.context.discoveryExclusions);
+  const outcomes = (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : []).map(asObject).filter(isExecutedAutonomyImplementationOutcome).map((objective) => ({
+    job_id: asString2(objective.job_id),
+    status: asString2(objective.status),
+    vision_objective_id: asString2(objective.vision_objective_id),
+    target_paths: asStringArray2(objective.target_paths).sort(),
+    attempt_failure_fingerprint: asString2(objective.attempt_failure_fingerprint)
+  })).sort((a, b) => a.job_id.localeCompare(b.job_id));
+  const available = (limits, used) => Object.entries(limits).map(([key, limit]) => [key, (used[key] ?? 0) < limit]).sort(([a], [b]) => String(a).localeCompare(String(b)));
+  return sha256(JSON.stringify({
+    repository: options.repository,
+    vision: options.context.vision,
+    policy: options.context.deterministicPolicy,
+    exclusions: [...new Set(asStringArray2(exclusions.targetPaths))].sort(),
+    executedOutcomeWatermark: signals.executedOutcomeWatermark ?? null,
+    outcomes,
+    cooldowns: options.snapshot.active_cooldowns.filter((entry) => Date.parse(entry.cooldown_until) > nowMs).map((entry) => entry.pattern_key).sort(),
+    globalEligibility: options.snapshot.dispatch_budget.global_count_last_hour < options.config.maxDispatchPerHour,
+    concurrencyEligibility: options.snapshot.open_objectives.filter((objective) => isActiveWorkDiversityStatus(objective.status)).length < options.config.maxConcurrentObjectives,
+    typeEligibility: available(options.config.maxDispatchPerHourByType ?? {}, options.snapshot.dispatch_budget.by_type_count_last_hour),
+    componentEligibility: available(options.config.maxDispatchPerHourByComponent ?? {}, options.snapshot.dispatch_budget.by_component_count_last_hour ?? {})
+  }));
+}
 
 class RemoteBuddyAutonomousEngine {
   server;
@@ -12452,6 +12770,7 @@ class RemoteBuddyAutonomousEngine {
   lastCompletedAtMs = 0;
   dispatchBackoffUntilMs = 0;
   dispatchBackoffReason = "";
+  exhaustedDiscovery = null;
   lastEnqueueRejectionReason = null;
   suppressedFailureTargets = new Map;
   pendingIdeationTimeoutRecovery = null;
@@ -13308,7 +13627,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           stateTraits: params.snapshot.state_traits.slice(0, 5),
           feedbackPriors: params.snapshot.feedback_priors.slice(0, 4),
           openObjectives: params.snapshot.open_objectives.slice(0, 8),
-          recentObjectives: (params.snapshot.executed_objectives ?? params.snapshot.recent_objectives ?? []).filter((objective) => objective.job_id && ["completed", "failed", "dead_letter"].includes(objective.status)).slice(0, 16),
+          recentObjectives: (params.snapshot.executed_objectives ?? params.snapshot.recent_objectives ?? []).filter(isExecutedAutonomyImplementationOutcome).slice(0, 16),
           activeCooldowns: params.snapshot.active_cooldowns.slice(0, 8)
         }
       };
@@ -13318,6 +13637,23 @@ ${JSON.stringify(input.messages ?? [])}`),
         vision: params.visionContext.sha256,
         repositoryAgentPrompt: "autonomy-priority-v3"
       }));
+      const discoveryKey = exhaustedDiscoveryKey({
+        repository: {
+          identity: repository.identity,
+          revision: repository.revision,
+          tree: repository.tree
+        },
+        context,
+        snapshot: params.snapshot,
+        config: this.cfg
+      });
+      if (this.exhaustedDiscovery?.key === discoveryKey && Date.now() < this.exhaustedDiscovery.recheckAtMs) {
+        return {
+          ...deterministicFallbackPhase("repository_discovery_exhausted_backoff"),
+          deferred: true
+        };
+      }
+      this.exhaustedDiscovery = null;
       const result = await this.repositoryAgent.ask({
         caller: { sessionId: this.sessionId, correlationId: params.runId },
         purpose: "priority",
@@ -13338,6 +13674,12 @@ ${JSON.stringify(input.messages ?? [])}`),
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       const discoveryProgress = Array.isArray(data.candidates) ? autonomyDiscoveryProgress(result.discoveryProgress) : null;
+      if (candidates.length === 0 && result.evidence.length > 0 && discoveryProgress?.boundedCoverageExhausted && !discoveryProgress.nextWindowAvailable) {
+        this.exhaustedDiscovery = {
+          key: discoveryKey,
+          recheckAtMs: Date.now() + AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS
+        };
+      }
       if (discoveryProgress)
         console.log(`[RemoteBuddyAutonomousEngine] repositoryDiscoveryProgress=${JSON.stringify({ runId: params.runId, ...discoveryProgress })}`);
       if (candidates.length === 0) {
@@ -14093,6 +14435,11 @@ ${JSON.stringify(input.messages ?? [])}`),
         outcomeDetail = "snapshot_unavailable";
         return;
       }
+      if (snapshot.execution_capability?.state === "blocked") {
+        this.setPhase("execution_capability_backpressure");
+        outcomeDetail = compactStatusDetail(`execution_capability_blocked:${snapshot.execution_capability.reason || "worker_execution_unavailable"}`);
+        return;
+      }
       const snapshotSafety = asObject(snapshot.safety_state);
       if (asBoolean2(snapshotSafety.kill_switch_enabled, false)) {
         outcomeDetail = "kill_switch_enabled";
@@ -14300,6 +14647,11 @@ ${JSON.stringify(input.messages ?? [])}`),
         visionContext,
         cycleDeadline
       });
+      if (repositoryAgentPhase?.deferred) {
+        this.setPhase("discovery_backoff");
+        outcomeDetail = "repository_discovery_exhausted_backoff";
+        return;
+      }
       if (this.stopped || !this.runtimeEnabled) {
         outcomeDetail = "disabled_during_repository_agent_ideation";
         return;
@@ -16461,7 +16813,7 @@ function filterDiscoveryDelivery(result, excludedPaths) {
 }
 function executedAutonomyOutcomes(request) {
   const signals = isRecord2(request.context?.runtimeSignals) ? request.context.runtimeSignals : {};
-  return (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : []).filter((entry) => isRecord2(entry) && typeof entry.job_id === "string" && compactText2(entry.job_id, 256) && ["completed", "failed", "dead_letter"].includes(String(entry.status))).slice(0, 16).map((entry) => {
+  return (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : []).filter((entry) => isRecord2(entry) && typeof entry.job_id === "string" && compactText2(entry.job_id, 256) && ["completed", "failed", "dead_letter"].includes(String(entry.status)) && !(["failed", "dead_letter"].includes(String(entry.status)) && entry.execution_started === false && (["infra", "docker_engine", "docker_infrastructure"].includes(String(entry.failure_class).toLowerCase()) || String(entry.failure_class).toLowerCase().startsWith("environment.")))).slice(0, 16).map((entry) => {
     const row = entry;
     return {
       job_id: compactText2(row.job_id, 256),
@@ -20415,8 +20767,11 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       return null;
     }
   }
+  workerHasIdleExecutionCapacity(worker) {
+    return worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0 && worker.details?.executionReady !== false;
+  }
   pickIdleWorker(workers) {
-    const idle = workers.filter((worker) => worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0).sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
+    const idle = workers.filter((worker) => this.workerHasIdleExecutionCapacity(worker)).sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
     return idle[0] ?? null;
   }
   pickOnlineWorker(workers, preferredWorkerId) {
@@ -20457,7 +20812,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       if (this.disposed)
         return null;
       if (preferredWorkerId) {
-        const preferred = workers.find((worker) => worker.workerId === preferredWorkerId && worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0);
+        const preferred = workers.find((worker) => worker.workerId === preferredWorkerId && this.workerHasIdleExecutionCapacity(worker));
         if (preferred)
           return preferred;
       }
@@ -20733,7 +21088,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       if (this.disposed)
         return;
       if (spawned) {
-        console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
+        console.log(`[RemoteBuddy] Initial WorkerPal controller registered via ${spawned}; execution readiness is reported separately.`);
         this.ensureAutoscaledWorkerCapacity("startup warm pool");
         return;
       }
@@ -20782,8 +21137,10 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       const spawned = await this.spawnWorker();
       if (this.disposed)
         return null;
-      if (spawned)
-        return spawned;
+      if (spawned) {
+        const idle = await this.waitForIdleWorker(this.waitForWorkerMs, spawned);
+        return idle?.workerId ?? null;
+      }
     }
     const waited = await this.waitForIdleWorker(this.waitForWorkerMs);
     return waited?.workerId ?? null;
