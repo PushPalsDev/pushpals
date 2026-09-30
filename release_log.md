@@ -22,7 +22,8 @@
 - [Initial CLI E2E run 36688499773](https://github.com/PushPalsDev/pushpals/actions/runs/36688499773) passed Linux package/real-Docker worker tests and Windows ownership, shutdown, trusted-validation, and source-only startup contracts. The manual-only Windows Host Docker E2E job was skipped as configured.
 - The exact initial CI commit's generated artifact was inspected and apply-checked; only the two expected worker/SCM bundles changed. The WorkerPal source/sandbox TypeScript mirror hashes match, and the final hosted rebuild produced an empty generated-runtime diff.
 - Final product commit `98b925c09aaef632aef07a8d5d3aef894ebc2fe6` passed [CLI E2E run 36689260426](https://github.com/PushPalsDev/pushpals/actions/runs/36689260426): full hosted preflight, packaged Linux CLI, real-Docker Linux worker execution, and Windows contracts/source-only startup. The manual-only Windows Host Docker E2E job was skipped as configured.
-- Release publication and installed-platform smokes: pending after tagging.
+- [Release CLI run 36690171547](https://github.com/PushPalsDev/pushpals/actions/runs/36690171547) passed all `16` jobs, including the container-backed reliability harness, five-minute Windows runtime test, and published Linux/Windows installation smokes. npm `latest` is `1.2.62`; all `25` GitHub release assets are present. Publication used trusted publishing without reauthentication.
+- The first Windows installed-package attempt stopped before PushPals started: Bun's package index did not yet list the version even though exact-version metadata and the tarball were available. After both full and abbreviated package indexes exposed the version, only that failed smoke was rerun; npm was not republished. The retry cold-started successfully and remained healthy for `150,000ms` after readiness.
 
 ## Install
 
@@ -54,6 +55,7 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.62
 
 ## Known Issues
 
+- Exact-version metadata/tarball visibility can precede the package-index visibility needed by Bun installation. The current availability gate does not check both package-index variants; this release required the targeted Windows smoke retry documented above.
 - The v1.2.60 immediate-restart lock collision had insufficient evidence to identify its exact cause. This release repairs independently reproduced ownership and incomplete-shutdown defects; it does not retrospectively prove which caused that incident.
 - The general standalone CLI TypeScript check still reports 15 pre-existing diagnostics; comparison with the prior committed CLI found no new diagnostics. Scoped worker/SCM typechecks pass. This release does not claim a clean repository-wide CLI typecheck.
 - A completed best-effort process-tree termination call plus launcher exit is not independent proof that every descendant is dead. Reported or pending termination failures prevent automatic cleanup; an exited root with a failed termination remains fail-closed instead of risking a recycled PID.
