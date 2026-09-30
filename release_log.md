@@ -2,43 +2,42 @@
 
 ## Release Metadata
 
-- version: `v1.2.61`
-- start_commit: `d4e82dc8a52bf7f83c7f11ca985b809cad517f27`
-- end_commit: `3ac905dba3259473c211c580ba104dcf7f07c0df`
-- commits_in_range: `2`
+- version: `v1.2.62`
+- start_commit: `9504b12076bf5ec5dd66dcf8907a5b18c64d105a`
+- end_commit: `98b925c09aaef632aef07a8d5d3aef894ebc2fe6`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Avoid unnecessary worker revisions when a normal code change includes conditional guidance such as "update tests if needed." Explicit test targets and mandatory test-edit clauses still require coverage; required validation and critic gates are unchanged.
-- Preserve Repository Agent discovery progress when more active/recent targets are excluded, instead of revisiting candidates that remain ineligible. Persist bounded, fingerprint-bound exclusion paths; removals and legacy or malformed memory retain conservative replay.
-- Do not repeat a full trusted validation suite merely because a test title mentions an infrastructure error. Concrete assertion, compiler, or lint diagnostics veto the retry. Genuine infrastructure failures retain one bounded retry, and progress logs now include safe exit-code, failure-class, and failed-test-count fields.
-- Wait for exact-version npm metadata and the complete hash-verified tarball before published Linux/Windows installation smokes. The availability check has strict request, byte, attempt, and overall deadlines; it never republishes a version or skips smoke validation.
-- Add regression cases, fix independent-review findings, refresh embedded runtime assets, and record the live-run findings in `docs/run-observations-v1.2.60-2026-09-29.md`. All runtime behavior remains repository-generic.
+- Prevent competing SCM instances from both reclaiming a stale lock. A dedicated SQLite connection now holds the process-lifetime OS lock, releases automatically after a crash, and never unlinks a successor's ownership file.
+- Treat ordinary guarantees such as "existing tests pass after the refactor" as validation requirements, not mandatory test-file edits. Explicit test-edit requirements and test targets remain authoritative; required validation and critic gates are unchanged.
+- Preserve actual infrastructure exceptions in failed pytest summaries, including traceback-disabled output, so genuine transient failures retain one bounded retry. Parameterized test names cannot masquerade as diagnostics, and assertion/compiler/lint failures still veto retries.
+- Refuse to report successful shutdown or remove worktrees/containers while service exit or a requested termination is unconfirmed. Bound the stop operation, retain unfinished termination state across retries, and avoid re-signalling an exited launcher's potentially recycled PID.
+- Add 47 focused regression cases plus a hosted Linux release-preflight contract, run native Bun ownership/shutdown checks on Linux and Windows, and regenerate the packaged worker and SCM bundles. All runtime changes remain repository-generic.
 
 ## Validation
 
-- Full root suite: `3,115` passed, `12` platform/opt-in skips, `0` failures, and `17,586` assertions across `198` files (338.20 seconds).
-- Final release-helper/workflow/installed-smoke contracts: `39` passed, `0` failures. Final packaged-runtime/prompt/payload contracts: `25` passed, `0` failures.
-- WorkerPals, RemoteBuddy, and SCM TypeScript checks passed, plus standalone strict typechecking for the registry helper and its tests. A standalone type-narrowing issue was corrected and its targeted suite rerun after the full root suite.
-- Full `cli:bundle`, including monitoring UI export, and package-payload verification passed in an isolated Docker checkout limited to one CPU, 768 MiB memory, and 512 PIDs. The package contains `278` files with no external toolchains. Four generated runtime files were refreshed and the worker source/sandbox mirror hashes match.
-- Independent reviews covered worker-intent classification, exclusion-memory compatibility, and trusted-validation retry authority. Findings involving formatted instructions, separate mandatory clauses, and genuine "Failed to connect" diagnostics were fixed and regression-tested.
-- Product commit `3ac905dba3259473c211c580ba104dcf7f07c0df` passed [CLI E2E run 36545191425](https://github.com/PushPalsDev/pushpals/actions/runs/36545191425): packaged CLI and real-Docker WorkerPal control-plane tests on Linux, plus Windows worktree, recovery, trusted-validation, and source-only startup contracts. The manual-only Windows Host Docker E2E job was skipped as configured.
-- [Release CLI run 36546082378](https://github.com/PushPalsDev/pushpals/actions/runs/36546082378) passed all `16` jobs on its first attempt, including the packaged-container reliability harness, five-minute Windows runtime soak, and published Linux/Windows installation smokes. npm initially returned version-not-found after accepting publication; the new propagation gate waited successfully without republication or reauthentication. npm `latest` is `1.2.61` and all `25` GitHub release assets are present.
+- Final hosted full root suite: `3,163` passed, `12` platform/opt-in skips, `0` failures, and `17,894` assertions across `200` files (189.88 seconds), including the native Bun abrupt-owner-death lock regression. The initial source-change run also passed all `3,163` tests before the generated bundles were committed.
+- Full `cli:bundle`, monitoring UI export, package-payload verification, and WorkerPals/SCM TypeScript checks passed on a GitHub-hosted Linux runner. Local Docker returned an engine API error; no host runtime or live SectorCommand services were started for validation.
+- [Initial CLI E2E run 36688499773](https://github.com/PushPalsDev/pushpals/actions/runs/36688499773) passed Linux package/real-Docker worker tests and Windows ownership, shutdown, trusted-validation, and source-only startup contracts. The manual-only Windows Host Docker E2E job was skipped as configured.
+- The exact initial CI commit's generated artifact was inspected and apply-checked; only the two expected worker/SCM bundles changed. The WorkerPal source/sandbox TypeScript mirror hashes match, and the final hosted rebuild produced an empty generated-runtime diff.
+- Final product commit `98b925c09aaef632aef07a8d5d3aef894ebc2fe6` passed [CLI E2E run 36689260426](https://github.com/PushPalsDev/pushpals/actions/runs/36689260426): full hosted preflight, packaged Linux CLI, real-Docker Linux worker execution, and Windows contracts/source-only startup. The manual-only Windows Host Docker E2E job was skipped as configured.
+- Release publication and installed-platform smokes: pending after tagging.
 
 ## Install
 
 ```bash
-npm install -g @pushpalsdev/cli@1.2.61
+npm install -g @pushpalsdev/cli@1.2.62
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.61
+bun install -g @pushpalsdev/cli@1.2.62
 ```
 
 For environments using a managed certificate store:
 
 ```bash
-bun install -g --use-system-ca @pushpalsdev/cli@1.2.61
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.62
 ```
 
 ## Artifacts
@@ -49,16 +48,15 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.61
 
 ## Compatibility Notes
 
-- No configuration or database migration is required. Older discovery memory without exclusion-path metadata continues conservatively.
-- Required validation order, publication backpressure, exact-candidate checks, and candidate-specific lifecycle hooks remain authoritative. These optimizations do not cache a validation pass for a different candidate.
-- Ambiguous container/database failures still require existing recovery evidence; they are not blindly retried or marked successful. Telemetry fields are observations, not publication authority.
+- No configuration or application-database migration is required. SCM creates a dedicated `merge_queue.lock.sqlite` file in its state directory; do not delete or replace it while a daemon may be running. The existing JSON lock file remains diagnostic/legacy metadata.
+- Live legacy owners are respected, but concurrent old/new binaries retain the old binary's unsafe stale-file protocol. Stop old instances and upgrade all contenders to obtain the new ownership guarantee.
+- Required validation order, publication backpressure, exact-candidate checks, and candidate-specific lifecycle hooks remain authoritative. Failures are not converted into successful jobs or bypassed for speed.
 
 ## Known Issues
 
-- The prior v1.2.60 Windows installed-package smoke observed a SourceControlManager singleton-lock collision during an immediate same-repository restart in [attempt 2](https://github.com/PushPalsDev/pushpals/actions/runs/36518343608/attempts/2). Available logs cannot distinguish incomplete shutdown, stale PID reuse, or another lock-file acquisition error. This patch does not claim to fix that finding; a passing retry is not proof of resolution.
-- The observed v1.2.60 run completed nine of ten jobs, all nine PRs approved on their first PR review, but three needed worker-side revisions. Completed jobs averaged 15.8 minutes; required host validation alone averaged about five minutes. No deployed speedup or 100% success/uptime guarantee is established by these pre-release tests.
-- Discovery still needs grounded evidence for higher-priority product work. Progress preservation does not prove better vision alignment or justify speculative jobs. The observed failed job correctly refused an unsupported gameplay-copy change.
-- The optional local container live-registry check was blocked by managed-CA trust. TLS verification was not bypassed; deterministic tests passed and public metadata was checked through the Windows trust store. Both published CI smokes subsequently passed the live availability gate.
-- Linux preflight and bounded CI smoke tests do not substitute for a long deployed Windows-host Docker soak. Development and inspection did not modify the live installation or external repository.
+- The v1.2.60 immediate-restart lock collision had insufficient evidence to identify its exact cause. This release repairs independently reproduced ownership and incomplete-shutdown defects; it does not retrospectively prove which caused that incident.
+- The general standalone CLI TypeScript check still reports 15 pre-existing diagnostics; comparison with the prior committed CLI found no new diagnostics. Scoped worker/SCM typechecks pass. This release does not claim a clean repository-wide CLI typecheck.
+- A completed best-effort process-tree termination call plus launcher exit is not independent proof that every descendant is dead. Reported or pending termination failures prevent automatic cleanup; an exited root with a failed termination remains fail-closed instead of risking a recycled PID.
+- Hosted tests and bounded smokes do not substitute for a long deployed Windows-host Docker soak or establish a sub-ten-minute job average, improved vision alignment, or 100% success/uptime. Development and validation did not modify the live installation or external repository.
 - The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Docker-backed WorkerPal execution requires Docker to be installed and running.
 - Some Windows environments require `--use-system-ca` for Bun installs or Schannel for Git remote operations.
