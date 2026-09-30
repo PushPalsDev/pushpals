@@ -3091,18 +3091,102 @@ export function buildServiceStopCommand(
   return null;
 }
 
-async function stopRuntimeServicesOnWindows(
+type RuntimeServiceStopOptions = {
+  platform?: NodeJS.Platform;
+  terminateService?: typeof terminateManagedServiceTree;
+};
+
+// Keep uncertain tree termination across retries, even if the launcher exited.
+// Retrying a completed launcher's PID could target an unrelated recycled PID.
+const runtimeServiceTerminations = new WeakMap<
+  RuntimeServiceProcess,
+  { promise: Promise<void>; failed: boolean }
+>();
+
+export class IncompleteRuntimeShutdownError extends Error {
+  constructor(
+    public readonly pendingServices: Array<{ name: string; pid: number | null }>,
+    public readonly terminationErrors: string[],
+  ) {
+    super(
+      `Runtime shutdown incomplete; exit or process-tree termination unconfirmed for ${pendingServices
+        .map(({ name, pid }) => `${name}${pid === null ? "" : ` (pid ${pid})`}`)
+        .join(", ")}. Preserving runtime worktrees and containers.${
+        terminationErrors.length ? ` ${terminationErrors.join("; ")}` : ""
+      }`,
+    );
+    this.name = "IncompleteRuntimeShutdownError";
+  }
+}
+
+async function terminateRuntimeServicesWithin(
   services: RuntimeServiceProcess[],
   timeoutMs: number,
-): Promise<void> {
-  const startedAtMs = Date.now();
-  await Promise.allSettled(
-    services.map((service) => terminateManagedServiceTree(service, "win32")),
+  platform: NodeJS.Platform,
+  terminateService: typeof terminateManagedServiceTree,
+  gracefulSignalAlreadySent = false,
+): Promise<{ errors: string[]; unconfirmed: RuntimeServiceProcess[] }> {
+  if (services.length === 0) return { errors: [], unconfirmed: [] };
+  const errors: string[] = [];
+  const unconfirmed = new Set(services);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const termination = Promise.all(
+    services.map(async (service) => {
+      try {
+        let attempt = runtimeServiceTerminations.get(service);
+        if (attempt?.failed && !service.exited) attempt = undefined;
+        if (!attempt) {
+          const current = { promise: Promise.resolve(), failed: false };
+          runtimeServiceTerminations.set(service, current);
+          current.promise = Promise.resolve()
+            .then(() => terminateService(service, platform, { gracefulSignalAlreadySent }))
+            .then(
+              () => {
+                if (runtimeServiceTerminations.get(service) === current) {
+                  runtimeServiceTerminations.delete(service);
+                }
+              },
+              (error) => {
+                current.failed = true;
+                throw error;
+              },
+            );
+          attempt = current;
+        }
+        await attempt.promise;
+        unconfirmed.delete(service);
+      } catch (error) {
+        errors.push(`${service.name}: ${String(error)}`);
+      }
+    }),
   );
-  const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
-  if (remainingMs > 0) {
-    await waitForRuntimeServicesExit(services, remainingMs);
+  try {
+    await Promise.race([
+      termination,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(
+          () => {
+            errors.push("Process-tree termination deadline exceeded");
+            resolve();
+          },
+          Math.max(0, timeoutMs),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
+  return { errors: [...errors], unconfirmed: [...unconfirmed] };
+}
+
+function assertRuntimeServicesExited(
+  services: RuntimeServiceProcess[],
+  termination: { errors: string[]; unconfirmed: RuntimeServiceProcess[] },
+): void {
+  const pending = [
+    ...new Set([...services.filter((service) => !service.exited), ...termination.unconfirmed]),
+  ].map((service) => ({ name: service.name, pid: service.proc.pid ?? null }));
+  if (pending.length > 0) throw new IncompleteRuntimeShutdownError(pending, termination.errors);
 }
 
 function resolveGracefulShutdownPriority(name: RuntimeServiceName): number {
@@ -3120,31 +3204,46 @@ async function waitForRuntimeServicesExit(
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() < deadline) {
     if (services.every((service) => service.exited)) return true;
-    await Bun.sleep(100);
+    await Bun.sleep(Math.min(100, Math.max(1, deadline - Date.now())));
   }
   return services.every((service) => service.exited);
 }
 
-async function stopRuntimeServicesGracefully(
+export async function stopRuntimeServicesGracefully(
   services: RuntimeServiceProcess[],
   timeoutMs = 10_000,
+  options: RuntimeServiceStopOptions = {},
 ): Promise<void> {
   if (services.length === 0) return;
-  const running = services.filter((service) => !service.exited);
+  const running = services.filter(
+    (service) => !service.exited || runtimeServiceTerminations.has(service),
+  );
   if (running.length === 0) return;
   const ordered = [...running].sort(
     (a, b) =>
       resolveGracefulShutdownPriority(a.name as RuntimeServiceName) -
       resolveGracefulShutdownPriority(b.name as RuntimeServiceName),
   );
-  if (process.platform === "win32") {
-    await stopRuntimeServicesOnWindows(ordered, timeoutMs);
+  const platform = options.platform ?? process.platform;
+  const terminateService = options.terminateService ?? terminateManagedServiceTree;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  const remainingMs = () => Math.max(0, deadline - Date.now());
+  if (platform === "win32") {
+    const errors = await terminateRuntimeServicesWithin(
+      ordered,
+      remainingMs(),
+      platform,
+      terminateService,
+    );
+    await waitForRuntimeServicesExit(ordered, remainingMs());
+    assertRuntimeServicesExited(ordered, errors);
     return;
   }
   const nonServer = ordered.filter((service) => service.name !== "server");
   const server = ordered.filter((service) => service.name === "server");
 
   for (const service of nonServer) {
+    if (service.exited) continue;
     try {
       service.proc.kill("SIGTERM");
     } catch {
@@ -3152,9 +3251,10 @@ async function stopRuntimeServicesGracefully(
     }
   }
 
-  await waitForRuntimeServicesExit(nonServer, Math.max(1_000, timeoutMs - 2_000));
+  await waitForRuntimeServicesExit(nonServer, Math.max(0, remainingMs() - 2_000));
 
   for (const service of server) {
+    if (service.exited) continue;
     try {
       service.proc.kill("SIGTERM");
     } catch {
@@ -3162,18 +3262,20 @@ async function stopRuntimeServicesGracefully(
     }
   }
 
-  await waitForRuntimeServicesExit(server, Math.min(3_000, timeoutMs));
+  await waitForRuntimeServicesExit(server, Math.min(3_000, Math.max(0, remainingMs() - 1_000)));
 
-  const remaining = ordered.filter((service) => !service.exited);
-  if (remaining.length > 0) {
-    await Promise.allSettled(
-      remaining.map((service) =>
-        terminateManagedServiceTree(service, process.platform, {
-          gracefulSignalAlreadySent: true,
-        }),
-      ),
-    );
-  }
+  const remaining = ordered.filter(
+    (service) => !service.exited || runtimeServiceTerminations.has(service),
+  );
+  const errors = await terminateRuntimeServicesWithin(
+    remaining,
+    remainingMs(),
+    platform,
+    terminateService,
+    true,
+  );
+  await waitForRuntimeServicesExit(ordered, remainingMs());
+  assertRuntimeServicesExited(ordered, errors);
 }
 
 type LocalRuntimeShutdownAttempt = {
@@ -3194,6 +3296,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
   ) => Promise<LocalRuntimeShutdownAttempt>;
   shutdownAcceptedDelayMs?: number;
   serviceStopTimeoutMs?: number;
+  serviceStopOptions?: RuntimeServiceStopOptions;
   onLog?: (line: string) => void;
   onWarn?: (line: string) => void;
   cleanupTasks?: Array<() => Promise<void> | void>;
@@ -3206,6 +3309,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
     requestShutdown = requestLocalRuntimeShutdown,
     shutdownAcceptedDelayMs = 1_500,
     serviceStopTimeoutMs = 10_000,
+    serviceStopOptions,
     onLog = (line) => console.log(line),
     onWarn = (line) => console.warn(line),
     cleanupTasks = [],
@@ -3213,7 +3317,12 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
 
   serviceManager.beginShutdown();
   const services = serviceManager.getServices();
-  const shutdown = await requestShutdown(serverUrl, repoRoot, reason);
+  let shutdown: LocalRuntimeShutdownAttempt;
+  try {
+    shutdown = await requestShutdown(serverUrl, repoRoot, reason);
+  } catch (error) {
+    shutdown = { attempted: true, accepted: false, detail: String(error) };
+  }
   if (shutdown.attempted && shutdown.accepted) {
     onLog("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
     await Bun.sleep(Math.max(0, shutdownAcceptedDelayMs));
@@ -3225,7 +3334,12 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
     onWarn(`[pushpals] ${shutdown.detail}`);
   }
 
-  await stopRuntimeServicesGracefully(services, serviceStopTimeoutMs);
+  try {
+    await stopRuntimeServicesGracefully(services, serviceStopTimeoutMs, serviceStopOptions);
+  } catch (error) {
+    onWarn(`[pushpals] ${String(error)}`);
+    throw error;
+  }
   serviceManager.finishShutdownAfterTermination();
   for (const task of cleanupTasks) {
     await task();
@@ -7750,7 +7864,6 @@ async function main(): Promise<void> {
   const stopAutoStartedServicesGracefully = async (reason: string): Promise<void> => {
     if (!autoStartedServiceManager) return;
     const serviceManager = autoStartedServiceManager;
-    autoStartedServiceManager = null;
     await shutdownEmbeddedServiceManagerGracefully({
       serviceManager,
       serverUrl,
@@ -7761,6 +7874,7 @@ async function main(): Promise<void> {
         () => cleanupPushPalsGitWorktreesIfNeeded("cli shutdown"),
       ],
     });
+    if (autoStartedServiceManager === serviceManager) autoStartedServiceManager = null;
   };
 
   if (!serverHealthy && workerpalDockerPrecheck.status === "failed") {
@@ -8039,15 +8153,26 @@ async function main(): Promise<void> {
         console.log("[pushpals] Stopping embedded runtime services...");
       }
       await stopAutoStartedServicesGracefully("pushpals CLI exit");
-    })();
+    })().catch((error) => {
+      // Keep the manager and allow a later request to retry an incomplete stop.
+      stopPromise = null;
+      throw error;
+    });
     return stopPromise;
   };
 
+  const requestStopFromEvent = (): void => {
+    void requestStop().catch((error) => {
+      console.error(`[pushpals] ${String(error)}`);
+      process.exitCode = 1;
+    });
+  };
+
   process.once("SIGINT", () => {
-    void requestStop();
+    requestStopFromEvent();
   });
   process.once("SIGTERM", () => {
-    void requestStop();
+    requestStopFromEvent();
   });
   process.once("exit", () => {
     stopAutoStartedServices();
@@ -8082,7 +8207,7 @@ async function main(): Promise<void> {
       runtimeOnlyInput.on("line", (line) => {
         if (!isCliExitCommand(line)) return;
         exitRequestedFromInput = true;
-        void requestStop();
+        requestStopFromEvent();
         runtimeOnlyInput.close();
         finish();
       });

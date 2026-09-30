@@ -1,104 +1,156 @@
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from "fs";
-import { join } from "path";
+import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+
+const LOCK_BACKEND = "sqlite-v1";
 
 /**
- * File-based exclusive lock for SourceControlManager.
+ * Process-lifetime exclusive lock for SourceControlManager.
  *
- * Ensures only one SourceControlManager instance operates on a repo at a time.
- * The lock file contains the PID and start time of the holder.
- * Acquire on startup, hold for process lifetime, release on exit.
+ * The dedicated SQLite connection holds BEGIN EXCLUSIVE until release/exit.
+ * SQLite's OS locks serialize acquisition and disappear on process death, so
+ * crash recovery never needs a racy read-PID/unlink/recreate sequence. Never
+ * delete or replace the SQLite file: doing so can create two locking domains.
+ *
+ * merge_queue.lock remains diagnostic/legacy metadata, not the ownership
+ * authority. Live legacy holders are respected, and new metadata is published
+ * atomically for old readers. Mixed-version concurrent starts still inherit
+ * the old binary's unsafe stale-file reclamation protocol; all contenders must
+ * use this implementation for the lifetime-lock guarantee.
  */
 export class FileLock {
-  private lockPath: string;
-  private held = false;
+  private readonly lockPath: string;
+  private readonly databasePath: string;
+  private database: Database | null = null;
+  private readonly onExit = (): void => this.release();
 
   constructor(stateDir: string) {
     mkdirSync(stateDir, { recursive: true });
     this.lockPath = join(stateDir, "merge_queue.lock");
+    this.databasePath = join(stateDir, "merge_queue.lock.sqlite");
   }
 
-  /**
-   * Attempt to acquire the lock. Returns true if acquired.
-   * If a stale lock is detected (holder PID no longer running), it is removed.
-   */
+  /** Returns false for a competing owner; other I/O failures remain visible. */
   acquire(): boolean {
-    if (this.held) return true;
+    if (this.database) return true;
 
-    if (existsSync(this.lockPath)) {
-      // Check if holding process is still alive
+    let candidate: Database | null = null;
+    try {
+      candidate = new Database(this.databasePath, { create: true });
+      // Contention must not block SCM's synchronous startup path.
+      candidate.exec("PRAGMA busy_timeout = 0;");
+      candidate.exec("BEGIN EXCLUSIVE;");
+
+      const previous = this.readMetadata();
+      if (
+        previous?.lockBackend !== LOCK_BACKEND &&
+        Number.isSafeInteger(previous?.pid) &&
+        Number(previous?.pid) > 0 &&
+        isProcessAlive(Number(previous?.pid))
+      ) {
+        return false;
+      }
+
+      // Once SQLite is exclusively held, prior modern metadata cannot denote
+      // a live owner, even if its PID has been reused. Do not unlink metadata
+      // on release: an old instance must never remove a successor's record.
+      this.publishMetadata();
+      process.once("exit", this.onExit);
+      this.database = candidate;
+      candidate = null;
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code ?? "";
+      if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return false;
+      throw error;
+    } finally {
+      // Closing rolls back an open transaction and releases its OS lock,
+      // including every failure after BEGIN EXCLUSIVE but before ownership.
+      candidate?.close(true);
+    }
+  }
+
+  release(): void {
+    if (!this.database) return;
+    this.database.close(true);
+    this.database = null;
+    process.removeListener("exit", this.onExit);
+  }
+
+  isHeld(): boolean {
+    return this.database !== null;
+  }
+
+  private readMetadata(): { pid?: unknown; lockBackend?: unknown } | null {
+    let contents: string;
+    try {
+      contents = readFileSync(this.lockPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw error;
+    }
+    try {
+      const parsed: unknown = JSON.parse(contents);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      // A killed legacy writer can leave incomplete JSON. SQLite already
+      // serializes recovery, so corrupt metadata is not an ownership token.
+      return null;
+    }
+  }
+
+  private publishMetadata(): void {
+    const token = randomUUID();
+    const temporaryPath = `${this.lockPath}.${token}.tmp`;
+    // Do not remove a pre-existing staging path if exclusive creation fails.
+    const descriptor = openSync(temporaryPath, "wx");
+    try {
       try {
-        const contents = readFileSync(this.lockPath, "utf-8");
-        const parsed = JSON.parse(contents);
-        const pid = parsed.pid as number;
-
-        if (isProcessAlive(pid)) {
-          return false; // Another live instance holds the lock
-        }
-        // Stale lock — remove it
-        unlinkSync(this.lockPath);
-      } catch {
-        // Corrupt lock file — remove it
-        try {
-          unlinkSync(this.lockPath);
-        } catch {
-          // ignore
-        }
+        writeFileSync(
+          descriptor,
+          JSON.stringify({
+            pid: process.pid,
+            startedAt: new Date().toISOString(),
+            lockBackend: LOCK_BACKEND,
+            token,
+          }),
+        );
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(temporaryPath, this.lockPath);
+    } finally {
+      try {
+        // Only this acquisition's private staging path may be removed.
+        unlinkSync(temporaryPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
       }
     }
-
-    // Write our lock file atomically
-    const lockData = JSON.stringify({
-      pid: process.pid,
-      startedAt: new Date().toISOString(),
-    });
-
-    try {
-      // Use writeFileSync with 'wx' flag for exclusive creation
-      writeFileSync(this.lockPath, lockData, { flag: "wx" });
-      this.held = true;
-      // Register only the 'exit' hook for last-resort cleanup.
-      // Signal handling (SIGINT/SIGTERM) is owned by the daemon entry point
-      // (source_control_manager_main.ts) which calls lock.release() during shutdown.
-      process.on("exit", () => this.release());
-      return true;
-    } catch {
-      // Race condition — another process beat us to it
-      return false;
-    }
-  }
-
-  /**
-   * Release the lock.
-   */
-  release(): void {
-    if (!this.held) return;
-    try {
-      unlinkSync(this.lockPath);
-    } catch {
-      // ignore — file may already be removed
-    }
-    this.held = false;
-  }
-
-  /**
-   * Check if the lock is currently held by this process.
-   */
-  isHeld(): boolean {
-    return this.held;
   }
 }
 
 /**
- * Check if a process with the given PID is still alive.
+ * Only used while migrating an unversioned/unknown-backend legacy record.
  */
 function isProcessAlive(pid: number): boolean {
   try {
-    process.kill(pid, 0); // signal 0 = existence check
+    process.kill(pid, 0);
     return true;
-  } catch (e: any) {
-    // EPERM means the process exists but we lack permission to signal it —
-    // treat as alive to avoid stealing a valid lock.
-    if (e.code === "EPERM") return true;
-    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    // An indeterminate probe must not authorize taking a legacy owner's lock.
+    throw error;
   }
 }

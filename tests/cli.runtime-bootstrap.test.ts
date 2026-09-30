@@ -1378,6 +1378,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     const killSignals: Array<NodeJS.Signals | number | undefined> = [];
     let outputPipeStops = 0;
     let cleanupCalls = 0;
+    let resolveExit!: (code: number) => void;
+    const exit = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
     const supervisor = new ServiceManager({
       pollMs: 10_000,
       maxRestartAttempts: 1,
@@ -1385,9 +1389,13 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         name: spec.name,
         proc: {
           pid: undefined,
-          exited: new Promise<number>(() => {}),
+          exited: exit,
           kill: (signal?: NodeJS.Signals | number) => {
             killSignals.push(signal);
+            if (signal === "SIGKILL") {
+              supervisor.getServices()[0]!.exited = true;
+              resolveExit(0);
+            }
           },
         } as any,
         command: [...spec.command],
@@ -1419,7 +1427,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         reason: "unit test bounded shutdown",
         requestShutdown: async () => ({ attempted: false, accepted: false }),
         shutdownAcceptedDelayMs: 0,
-        serviceStopTimeoutMs: 50,
+        serviceStopTimeoutMs: 500,
+        serviceStopOptions: { platform: "win32" },
         onLog: () => {},
         onWarn: () => {},
         cleanupTasks: [

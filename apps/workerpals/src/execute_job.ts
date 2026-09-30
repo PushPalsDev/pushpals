@@ -6163,7 +6163,9 @@ function hasRequiredTestEditIntent(text: string): boolean {
       /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(
         trimmed,
       ) ||
-      /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/i.test(
+      // A trailing edit noun ("tests pass after the fix") is not a request
+      // to edit tests. Reverse-order wording must require a test edit itself.
+      /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b\s+(?:(?:must|should|shall|will)\s+be|(?:need|needs)\s+to\s+be|(?:is|are)\s+to\s+be)\s+(added|written|created|updated|extended|expanded|hardened|improved|refactored|moved|extracted|fixed)\b/i.test(
         trimmed,
       )
     );

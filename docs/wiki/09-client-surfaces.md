@@ -62,7 +62,12 @@ An unconfirmed requested Docker cleanup (unavailable Docker or a timeout) still
 produces an incomplete summary and exit code `1`, after local cleanup runs. Normal
 clear requires confirmed warm-container cleanup; `--include-caches` additionally
 requires confirmed image cleanup. Intentionally preserved caches are not failures.
-Automatic startup and shutdown cleanup remain warning-only and best-effort.
+Automatic cleanup failures remain warning-only and best-effort, but shutdown
+cleanup starts only after every managed service has a confirmed exit and each
+requested process-tree termination has finished successfully. An incomplete stop
+reports the unresolved services, preserves worktrees/containers, and fails instead
+of claiming success. The manager remains available for a later bounded stop attempt;
+pending restart timers stay disabled throughout shutdown.
 
 The CLI also serves the exported Expo
 monitor UI locally when those assets are available. Planning, execution, and

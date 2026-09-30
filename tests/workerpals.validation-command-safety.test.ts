@@ -2617,6 +2617,50 @@ describe("workerpals validation command safety", () => {
     ).toBe(true);
   });
 
+  test.each([
+    "All existing tests pass after the refactor.",
+    "Existing tests continue to pass after the update.",
+    "Run tests before and after the fix.",
+    "No tests need an update.",
+  ])("does not require test edits for the validation guarantee %s", (criterion) => {
+    const instruction = "Move the narrow lint suppression above the intentional require statement.";
+    const planning = planningFixture({
+      targetPaths: ["src/nativeAdapter.ts"],
+      scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["src/nativeAdapter.ts"] },
+      acceptanceCriteria: [criterion],
+      validationSteps: ["bun run test", "git diff --check"],
+      requiredValidationSteps: ["bun run validate", "bun run lint"],
+    }) as any;
+
+    expect(isTestFocusedTask(instruction, planning)).toBe(false);
+    expect(isTestFocusedTask(`${instruction} ${criterion}`, planning)).toBe(false);
+    const commands = collectQualityGateValidationCommands({
+      instruction,
+      planning,
+      changedTestPaths: [],
+      isTestTask: isTestFocusedTask(instruction, planning),
+    });
+    expect(commands.requiredRunnableSteps).toEqual(["bun run validate", "bun run lint"]);
+    expect(commands.commandsToRun).toContain("bun run test");
+    expect(isTestFocusedTask(instruction, planning, "tests/nativeAdapter.test.ts")).toBe(true);
+  });
+
+  test.each([
+    "Add regression tests for expired tokens.",
+    "Update tests for the affected behavior.",
+    "Regression tests must be updated for expired tokens.",
+    "Coverage needs to be expanded for expired tokens.",
+  ])("keeps explicit test-edit intent authoritative: %s", (criterion) => {
+    const planning = planningFixture({
+      targetPaths: ["src/nativeAdapter.ts"],
+      scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["src/nativeAdapter.ts"] },
+      acceptanceCriteria: [criterion],
+    }) as any;
+
+    expect(isTestFocusedTask("Fix expired-token handling.", planning)).toBe(true);
+    expect(isTestFocusedTask(criterion, { ...planning, acceptanceCriteria: [] })).toBe(true);
+  });
+
   test("does not classify explicit docs-only work as test-focused from inspection language", () => {
     const teardownDocsInstruction =
       "Update `docs/codebase_context.md` to codify the repository's supported Bun test teardown contract. Read `vision.md` and verify relevant unit tests/configuration before documenting anything. Specify the supported teardown API and import/registration pattern, require deterministic cleanup of timers, listeners, servers, sockets, subscriptions, and pending async work, and describe assertions that expose lifecycle leaks instead of masking them. Include concise guidance for diagnosing suite-wide teardown failures and avoiding unsupported Bun APIs. Keep the guidance aligned with current implementation and tests; update other directly relevant documentation only if necessary. Run `bun run validate` and report the result, distinguishing any pre-existing failures from changes introduced by this work.";

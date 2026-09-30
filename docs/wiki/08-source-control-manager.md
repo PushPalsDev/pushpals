@@ -111,7 +111,12 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
 
 A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server mutations are fenced by the pusher and token, while the generation identifies immutable recovery checkpoints. Lease renewals and processed/failed callbacks require an explicit JSON `{ "ok": true }`; a `409` loses the lease, and a malformed success remains unconfirmed rather than being treated as publication authority.
 
-- process lock prevents dual SCM daemons on one state directory,
+- a dedicated `merge_queue.lock.sqlite` connection holds an exclusive SQLite
+  transaction for SCM's lifetime. Contention returns immediately; process death
+  releases the OS lock without deleting stale files. Never unlink/replace this
+  database while SCM may be running. `merge_queue.lock` is legacy/diagnostic
+  metadata only; live legacy owners are respected, but concurrent mixed-version
+  starts retain the old binary's unsafe stale-file protocol until all are upgraded,
 - completion claims use renewable leases and stable pusher ownership; expired,
   legacy, and same-pusher restart claims are reconciled back to FIFO pending work,
 - processed/failed callbacks verify lease ownership so a stale publisher cannot
@@ -166,7 +171,9 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
   trusted-host commands default to an eight-minute ceiling,
 - an immediate trusted-command retry is bounded to one known infrastructure
   failure. Concrete assertion, compiler, or lint diagnostics veto that retry;
-  infrastructure phrases in test titles are not failure evidence. An ambiguous
+  infrastructure phrases in test titles are not failure evidence. Exception
+  suffixes in failed pytest summaries remain diagnostics, even without tracebacks;
+  assertion suffixes still veto a retry. An ambiguous
   container exit alone does not qualify. Completion/retry progress events include
   the exit code, failure class, and failed-test count without copying child output
   or test names into the streaming log,

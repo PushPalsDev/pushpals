@@ -703,6 +703,7 @@ jobs:
           bun test
           tests/workerpals.executor-timeout-recovery.test.ts
           tests/source-control-manager.trusted-validation.test.ts
+          tests/source-control-manager.lock.test.ts
           tests/source-control-manager.dependency-artifact-cache.test.ts
           tests/source-control-manager.validation-substeps.test.ts
           tests/shared.validation-substeps.test.ts
@@ -723,6 +724,7 @@ jobs:
           tests/cli.http-deadline.test.ts
           tests/cli.worker-startup-readiness.test.ts
           tests/cli.runtime-bootstrap.test.ts
+          tests/cli.shutdown-confirmation.test.ts
           tests/cli.clear-progress.test.ts
           tests/cli.sse-buffer.test.ts
           tests/client.http-deadline.test.ts

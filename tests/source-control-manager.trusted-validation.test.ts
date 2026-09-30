@@ -565,6 +565,47 @@ describe("SourceControlManager trusted validation", () => {
       output:
         "Error: Hook timed out in 10000ms.\nsrc/value.ts:3:1 - error TS2322: incompatible types",
     },
+    {
+      name: "a pytest summary with an infrastructure-only test title",
+      output: "FAILED tests/test_health.py::test_handles_connection_refused",
+    },
+    {
+      name: "a pytest parameterized title with an apparent diagnostic separator",
+      output: "FAILED tests/test_health.py::test_handles_error[transport - connection refused]",
+    },
+    {
+      name: "a pytest parameterized title with an exception-like parameter value",
+      output:
+        "FAILED tests/test_health.py::test_handles_error[transport - ConnectionError: ECONNRESET]",
+    },
+    {
+      name: "a pytest parameterized title with a nested node separator and exception label",
+      output:
+        "FAILED tests/test_health.py::test_handles_error[transport::reset - ConnectionError: ECONNRESET]",
+    },
+    {
+      name: "a pytest assertion with brackets and an exception-like message suffix",
+      output:
+        "FAILED tests/test_health.py::test_health[local service] - AssertionError: [fixture] - ConnectionError: ECONNRESET",
+    },
+    {
+      name: "a pytest assertion suffix mentioning infrastructure",
+      output:
+        "FAILED tests/test_health.py::test_health - AssertionError: connection refused was not logged",
+    },
+    {
+      name: "a network failure mixed with a pytest assertion summary",
+      output:
+        "Error: connect ECONNRESET\nFAILED tests/test_health.py::test_health - AssertionError: expected 2 to be 3",
+    },
+    {
+      name: "a prefixed wrapper assertion mentioning infrastructure",
+      output: "FAILED: AssertionError: connection refused was not logged",
+    },
+    {
+      name: "a unittest title mentioning infrastructure",
+      output: "FAIL: test_handles_connection_refused (test_health.HealthTests)",
+    },
   ])("does not retry $name as transient infrastructure", async ({ output }) => {
     let calls = 0;
     const results = await runTrustedValidationCommands({
@@ -590,6 +631,11 @@ describe("SourceControlManager trusted validation", () => {
     "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
     "Failed to connect to the Docker daemon at unix:///var/run/docker.sock",
     "Error: Hook timed out in 10000ms.",
+    "FAILED tests/test_health.py::test_health - ConnectionRefusedError: [Errno 111] Connection refused",
+    "FAILED tests/test_health.py::test_health - requests.exceptions.ConnectionError: ECONNRESET",
+    "FAILED tests/test_health.py::test_health[local service] - ConnectionRefusedError: connection refused",
+    "FAILED tests/test_health.py::test_health[param - ConnectionError: fixture] - ConnectionError: ECONNRESET",
+    "FAILED: Could not resolve host registry.npmjs.org",
   ])("retains one bounded retry for known infrastructure diagnostic %s", async (output) => {
     let calls = 0;
     const events: TrustedValidationProgressEvent[] = [];
@@ -608,6 +654,55 @@ describe("SourceControlManager trusted validation", () => {
     expect(results[1]).toMatchObject({ ok: false, attempt: 2 });
     expect(events.filter((event) => event.boundary === "retry")).toHaveLength(1);
     expect(resolveTrustedValidationOutcome(results).terminalFailure).toBe(results[1]);
+  });
+
+  test("does not retry a process timeout with a deterministic pytest summary", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["python -m pytest --tb=no tests/test_health.py"]),
+      runner: async () => {
+        calls += 1;
+        return {
+          ok: false,
+          output:
+            "Error: connect ECONNRESET\nFAILED tests/test_health.py::test_health - AssertionError: expected 2 to be 3",
+          exitCode: 124,
+        };
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBe(results[0]);
+  });
+
+  test("accepts the recovered outcome after retrying a pytest infrastructure summary", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["python -m pytest --tb=no tests/test_health.py"]),
+      runner: async () => {
+        calls += 1;
+        return calls === 1
+          ? {
+              ok: false,
+              output:
+                "FAILED tests/test_health.py::test_health - ConnectionRefusedError: [Errno 111] Connection refused",
+              exitCode: 1,
+            }
+          : { ok: true, output: "1 passed", exitCode: 0 };
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(results[0]).toMatchObject({
+      ok: false,
+      attempt: 1,
+      failureClass: "test_failure",
+      retryReason: "transient_infrastructure",
+    });
+    expect(results[1]).toMatchObject({ ok: true, attempt: 2 });
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBeNull();
   });
 
   test("keeps failed retry telemetry but blocks on the terminal attempt when retry also fails", () => {

@@ -13,6 +13,19 @@ function workflowText(): string {
 }
 
 describe("release workflow action runtimes", () => {
+  test("runs the full release preflight on Linux before tagging and captures only runtime changes", () => {
+    const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
+    const preflight = ci.split("  release_preflight_linux:")[1]?.split(/\n  [a-z_]+:/)[0] ?? "";
+    expect(preflight).toContain("runs-on: ubuntu-latest");
+    expect(preflight).toContain("timeout-minutes: 45");
+    expect(preflight).toContain("bun run cli:bundle");
+    expect(preflight).toContain("bun run cli:verify-package-payload");
+    expect(preflight).toContain("bun run test:root");
+    expect(preflight).toContain("git diff --binary -- packages/cli/runtime");
+    expect(preflight).toContain("runtime-assets-${{ github.sha }}");
+    expect(preflight).not.toContain("continue-on-error");
+  });
+
   test("published platform smokes wait for exact npm propagation without repeating publication", () => {
     const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");
     for (const platform of ["linux", "windows"]) {
@@ -38,18 +51,22 @@ describe("release workflow action runtimes", () => {
     const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
     const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");
     const healthSteps = ci.split("- name: Verify health recovery reporting").slice(1);
+    expect(ci.match(/- "tests\/cli\.shutdown-confirmation\.test\.ts"/g)).toHaveLength(2);
+    expect(ci.match(/- "tests\/source-control-manager\.lock\.test\.ts"/g)).toHaveLength(2);
     expect(healthSteps).toHaveLength(2);
     for (const entry of healthSteps) {
       const step = entry.split("- name:")[0];
       expect(step).toContain("bun test");
       expect(step).toContain("tests/start.runtime-services.test.ts");
       expect(step).toContain("tests/cli.runtime-bootstrap.test.ts");
+      expect(step).toContain("tests/cli.shutdown-confirmation.test.ts");
     }
     const windowsDeadlineStep = release
       .split("- name: Verify Windows deadline and process-tree contracts")[1]
       ?.split("- name:")[0];
     expect(windowsDeadlineStep).toContain("tests/start.runtime-services.test.ts");
     expect(windowsDeadlineStep).toContain("tests/cli.runtime-bootstrap.test.ts");
+    expect(windowsDeadlineStep).toContain("tests/cli.shutdown-confirmation.test.ts");
   });
 
   test("gates worker readiness in Linux/Windows CI and Windows release validation", () => {
@@ -75,6 +92,7 @@ describe("release workflow action runtimes", () => {
       expect(step).toContain("bun test");
       expect(step).toContain("tests/workerpals.executor-timeout-recovery.test.ts");
       expect(step).toContain("tests/source-control-manager.trusted-validation.test.ts");
+      expect(step).toContain("tests/source-control-manager.lock.test.ts");
       expect(step).toContain("tests/source-control-manager.http.test.ts");
       expect(step).toContain("tests/source-control-manager.runtime-helpers.test.ts");
       expect(step).toContain("tests/source-control-manager.review-agent.test.ts");

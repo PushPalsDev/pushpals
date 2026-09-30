@@ -896,25 +896,64 @@ export function isTransientTrustedValidationFailure(
   result: Pick<TrustedValidationCommandResult, "failureClass" | "output" | "exitCode">,
 ): boolean {
   const plain = String(result.output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const diagnostics = plain.split(/\r?\n/).flatMap((line) => {
+    // With pytest --tb=no the failed-summary suffix can be the only error
+    // diagnostic. Test parameters may themselves contain exception labels,
+    // "::" or " - ", so only a separator outside parameter brackets counts.
+    const pytestDiagnostic = extractPytestSummaryDiagnostic(line);
+    if (pytestDiagnostic) return [pytestDiagnostic];
+    // A wrapper's "FAILED: <diagnostic>" is not a runner's "FAIL: <test>".
+    const wrapperDiagnostic = /^\s*FAILED:\s*(.+)$/i.exec(line);
+    if (wrapperDiagnostic) return [wrapperDiagnostic[1]];
+    // Test titles are not infrastructure diagnostics, regardless of verdict.
+    return /^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(
+      line,
+    )
+      ? []
+      : [line];
+  });
   // Classify the full command output, before the report's bounded truncation.
   // An expected negative-path fixture can mention ECONNRESET while a later
   // assertion, compiler or lint failure requires a code change. Retrying that
   // mixed aggregate spends minutes without repairing the candidate.
-  if (hasDeterministicValidationDiagnostic(plain)) return false;
+  if (hasDeterministicValidationDiagnostic(diagnostics.join("\n"))) return false;
   if (result.failureClass === "timeout" || result.exitCode === 124) return true;
   if (isExplicitTestRunnerTimeoutFailure(plain)) return true;
-  const diagnostics = plain.split(/\r?\n/).filter(
-    // Test titles are not infrastructure diagnostics, regardless of verdict.
-    (line) =>
-      !/^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(
-        line,
-      ),
-  );
   return diagnostics.some((line) =>
     /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(
       line,
     ),
   );
+}
+
+function extractPytestSummaryDiagnostic(line: string): string | null {
+  const summary = /^\s*FAILED\s+(.+)$/i.exec(line)?.[1];
+  if (!summary) return null;
+  let bracketDepth = 0;
+  let sawNodeSeparator = false;
+  for (let index = 0; index < summary.length; index += 1) {
+    const character = summary[index];
+    if (character === "[") {
+      bracketDepth += 1;
+    } else if (character === "]") {
+      if (bracketDepth === 0) return null;
+      bracketDepth -= 1;
+    } else if (bracketDepth === 0) {
+      if (summary.startsWith("::", index)) sawNodeSeparator = true;
+      if (
+        sawNodeSeparator &&
+        character === "-" &&
+        /\s/.test(summary[index - 1] ?? "") &&
+        /\s/.test(summary[index + 1] ?? "")
+      ) {
+        const diagnostic = summary.slice(index + 1).trimStart();
+        // Inspect the first external separator only: an assertion's message
+        // may contain brackets and a later exception-like suffix of its own.
+        return /^(?:[\w.]*?(?:Error|Exception)|Failed):\s*/i.test(diagnostic) ? diagnostic : null;
+      }
+    }
+  }
+  return null;
 }
 
 function hasDeterministicValidationDiagnostic(output: string): boolean {

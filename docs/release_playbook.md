@@ -73,6 +73,14 @@ If `bun run cli:bundle` changes `packages/cli/runtime` or monitor UI assets,
 commit those generated updates before tagging. The published package uses those
 packaged assets.
 
+When local container validation is unavailable, `CLI E2E` includes a hosted Linux
+release-preflight job that runs the complete bundle, payload check, worker/SCM
+typechecks, and full root suite. It uploads a commit-bound `runtime-assets-<SHA>`
+artifact containing only the tracked `packages/cli/runtime` build diff. Inspect
+the patch paths/content before applying it locally; commit any generated updates
+and require a successful `CLI E2E` run for that final product commit before tagging.
+Hosted checks do not justify claiming a local or long-running Windows soak passed.
+
 The npm package must not vendor external toolchains. Run
 `bun run cli:verify-package-payload` to inspect the actual `npm pack --dry-run`
 file list and fail if the package would include real `node_modules`
@@ -216,7 +224,9 @@ pushpals --clear
   Docker cleanup cannot be confirmed. No-worker installed-CLI smokes explicitly
   disable Docker configuration and must still require a successful clear;
   worker-enabled smokes retain Docker cleanup requirements. Automatic startup
-  and shutdown cleanup remain warning-only and best-effort.
+  cleanup remains warning-only and best-effort. Shutdown cleanup is skipped when
+  managed-service exit or a requested termination remains unconfirmed; the CLI
+  reports an incomplete stop instead of deleting resources still potentially in use.
 - User-local `runtime/configs/local.toml` overrides new defaults during manual
   smoke testing.
 - Git cannot fetch or push on Windows due to certificate backend mismatch; retry
