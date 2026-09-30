@@ -5,7 +5,7 @@ var __require = import.meta.require;
 import { parseArgs } from "util";
 import { isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve14 } from "path";
 import { mkdirSync as mkdirSync5 } from "fs";
-import { createHash as createHash8, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash8, randomUUID as randomUUID4 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -3780,67 +3780,119 @@ class MergeQueueDB {
 }
 
 // apps/source_control_manager/src/lock.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, readFileSync as readFileSync3 } from "fs";
+import { Database as Database2 } from "bun:sqlite";
+import { randomUUID as randomUUID2 } from "crypto";
+import {
+  closeSync,
+  mkdirSync as mkdirSync2,
+  openSync,
+  readFileSync as readFileSync3,
+  renameSync,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync2
+} from "fs";
 import { join as join3 } from "path";
+var LOCK_BACKEND = "sqlite-v1";
 
 class FileLock {
   lockPath;
-  held = false;
+  databasePath;
+  database = null;
+  onExit = () => this.release();
   constructor(stateDir) {
     mkdirSync2(stateDir, { recursive: true });
     this.lockPath = join3(stateDir, "merge_queue.lock");
+    this.databasePath = join3(stateDir, "merge_queue.lock.sqlite");
   }
   acquire() {
-    if (this.held)
+    if (this.database)
       return true;
-    if (existsSync2(this.lockPath)) {
-      try {
-        const contents = readFileSync3(this.lockPath, "utf-8");
-        const parsed = JSON.parse(contents);
-        const pid = parsed.pid;
-        if (isProcessAlive(pid)) {
-          return false;
-        }
-        unlinkSync2(this.lockPath);
-      } catch {
-        try {
-          unlinkSync2(this.lockPath);
-        } catch {}
-      }
-    }
-    const lockData = JSON.stringify({
-      pid: process.pid,
-      startedAt: new Date().toISOString()
-    });
+    let candidate = null;
     try {
-      writeFileSync2(this.lockPath, lockData, { flag: "wx" });
-      this.held = true;
-      process.on("exit", () => this.release());
+      candidate = new Database2(this.databasePath, { create: true });
+      candidate.exec("PRAGMA busy_timeout = 0;");
+      candidate.exec("BEGIN EXCLUSIVE;");
+      const previous = this.readMetadata();
+      if (previous?.lockBackend !== LOCK_BACKEND && Number.isSafeInteger(previous?.pid) && Number(previous?.pid) > 0 && isProcessAlive(Number(previous?.pid))) {
+        return false;
+      }
+      this.publishMetadata();
+      process.once("exit", this.onExit);
+      this.database = candidate;
+      candidate = null;
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      const code = error?.code ?? "";
+      if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED")
+        return false;
+      throw error;
+    } finally {
+      candidate?.close(true);
     }
   }
   release() {
-    if (!this.held)
+    if (!this.database)
       return;
-    try {
-      unlinkSync2(this.lockPath);
-    } catch {}
-    this.held = false;
+    this.database.close(true);
+    this.database = null;
+    process.removeListener("exit", this.onExit);
   }
   isHeld() {
-    return this.held;
+    return this.database !== null;
+  }
+  readMetadata() {
+    let contents;
+    try {
+      contents = readFileSync3(this.lockPath, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT")
+        return null;
+      throw error;
+    }
+    try {
+      const parsed = JSON.parse(contents);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  publishMetadata() {
+    const token = randomUUID2();
+    const temporaryPath = `${this.lockPath}.${token}.tmp`;
+    const descriptor = openSync(temporaryPath, "wx");
+    try {
+      try {
+        writeFileSync2(descriptor, JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          lockBackend: LOCK_BACKEND,
+          token
+        }));
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(temporaryPath, this.lockPath);
+    } finally {
+      try {
+        unlinkSync2(temporaryPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT")
+          throw error;
+      }
+    }
   }
 }
 function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (e) {
-    if (e.code === "EPERM")
+  } catch (error) {
+    const code = error?.code;
+    if (code === "ESRCH")
+      return false;
+    if (code === "EPERM")
       return true;
-    return false;
+    throw error;
   }
 }
 
@@ -3848,7 +3900,7 @@ function isProcessAlive(pid) {
 import { resolve as resolve8, win32 as pathWin32 } from "path";
 
 // packages/shared/src/repo.ts
-import { existsSync as existsSync3, readFileSync as readFileSync4, statSync as statSync2 } from "fs";
+import { existsSync as existsSync2, readFileSync as readFileSync4, statSync as statSync2 } from "fs";
 import { resolve as resolve3 } from "path";
 function resolveDotGitEntry(repoRoot) {
   return resolve3(repoRoot, ".git");
@@ -3874,7 +3926,7 @@ function findGitRepoRoot(startDir) {
 }
 function resolveGitMetadataDir(repoRoot) {
   const dotGitPath = resolveDotGitEntry(repoRoot);
-  if (!existsSync3(dotGitPath))
+  if (!existsSync2(dotGitPath))
     return null;
   try {
     const stat = statSync2(dotGitPath);
@@ -3893,7 +3945,7 @@ function resolveGitMetadataDir(repoRoot) {
     if (!match)
       return null;
     const gitDir = resolve3(repoRoot, match[1].trim());
-    return existsSync3(gitDir) ? gitDir : null;
+    return existsSync2(gitDir) ? gitDir : null;
   } catch {
     return null;
   }
@@ -4363,7 +4415,7 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
   "-F"
 ]);
 // packages/shared/src/repo_validation.ts
-import { closeSync, existsSync as existsSync5, openSync, readSync, readdirSync } from "fs";
+import { closeSync as closeSync2, existsSync as existsSync4, openSync as openSync2, readSync, readdirSync } from "fs";
 import { basename as basename2, dirname as dirname2, extname, relative as relative3, resolve as resolve7 } from "path";
 
 // packages/shared/src/trusted_validation.ts
@@ -4787,7 +4839,7 @@ function normalizeTrustedValidationCommands(value) {
 }
 
 // packages/shared/src/repo_test_runner.ts
-import { existsSync as existsSync4, readFileSync as readFileSync6, realpathSync, statSync as statSync3 } from "fs";
+import { existsSync as existsSync3, readFileSync as readFileSync6, realpathSync, statSync as statSync3 } from "fs";
 import { basename, dirname, relative as relative2, resolve as resolve6 } from "path";
 var MAX_EVIDENCE_BYTES = 256000;
 function within(root, path) {
@@ -4830,7 +4882,7 @@ function packageManager(root, directory) {
       ["yarn", "yarn.lock"],
       ["npm", "package-lock.json"]
     ]) {
-      if (existsSync4(resolve6(cursor, lock)))
+      if (existsSync3(resolve6(cursor, lock)))
         return manager;
     }
     if (cursor === root)
@@ -5156,7 +5208,7 @@ function commandsForTest(root, path) {
   for (let directory = dirname(path);within(root, directory); directory = dirname(directory)) {
     const manifest = readManifest(root, directory);
     if (!manifest) {
-      if (existsSync4(resolve6(directory, "package.json")))
+      if (existsSync3(resolve6(directory, "package.json")))
         return [];
       if (directory === root)
         break;
@@ -5180,7 +5232,7 @@ function commandsForTest(root, path) {
         continue;
       const configIndex = argv.findIndex((arg) => arg === "--config" || arg === "-c");
       const configArg = configIndex >= 0 ? argv[configIndex + 1] : configOptions[0]?.slice(configOptions[0].indexOf("=") + 1);
-      const configFiles = (base) => ["ts", "mts", "js", "mjs", "cjs", "cts", "json"].map((ext) => `${base}.config.${ext}`).filter((file) => existsSync4(resolve6(directory, file)));
+      const configFiles = (base) => ["ts", "mts", "js", "mjs", "cjs", "cts", "json"].map((ext) => `${base}.config.${ext}`).filter((file) => existsSync3(resolve6(directory, file)));
       let defaultConfigs = configFiles(runner.runner);
       if (runner.runner === "vitest" && defaultConfigs.length === 0)
         defaultConfigs = configFiles("vite");
@@ -5193,7 +5245,7 @@ function commandsForTest(root, path) {
       const config = configPath ? readEvidence(root, resolve6(directory, configPath)) : null;
       if (configPath && config === null)
         continue;
-      if (runner.runner === "vitest" && ["ts", "mts", "js", "mjs", "json"].some((extension) => existsSync4(resolve6(directory, `vitest.workspace.${extension}`))))
+      if (runner.runner === "vitest" && ["ts", "mts", "js", "mjs", "json"].some((extension) => existsSync3(resolve6(directory, `vitest.workspace.${extension}`))))
         continue;
       const selection = config !== null ? configSelection(config, configPath, runner.runner) : { root: undefined, includes: undefined, excludes: undefined };
       if (!selection)
@@ -5324,7 +5376,7 @@ function dedupeCompletePlans(plans, maxItems) {
 function readTextBounded(path, maxBytes = MAX_PROJECT_EVIDENCE_BYTES) {
   let fd = null;
   try {
-    fd = openSync(path, "r");
+    fd = openSync2(path, "r");
     const buffer = Buffer.allocUnsafe(maxBytes + 1);
     let bytesRead = 0;
     while (bytesRead < buffer.length) {
@@ -5342,7 +5394,7 @@ function readTextBounded(path, maxBytes = MAX_PROJECT_EVIDENCE_BYTES) {
   } finally {
     if (fd !== null) {
       try {
-        closeSync(fd);
+        closeSync2(fd);
       } catch {}
     }
   }
@@ -5511,14 +5563,14 @@ function packageManagerAt(directory) {
   if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
     return declared;
   }
-  if (existsSync5(resolve7(directory, "bun.lock")) || existsSync5(resolve7(directory, "bun.lockb"))) {
+  if (existsSync4(resolve7(directory, "bun.lock")) || existsSync4(resolve7(directory, "bun.lockb"))) {
     return "bun";
   }
-  if (existsSync5(resolve7(directory, "pnpm-lock.yaml")))
+  if (existsSync4(resolve7(directory, "pnpm-lock.yaml")))
     return "pnpm";
-  if (existsSync5(resolve7(directory, "yarn.lock")))
+  if (existsSync4(resolve7(directory, "yarn.lock")))
     return "yarn";
-  if (existsSync5(resolve7(directory, "package-lock.json")))
+  if (existsSync4(resolve7(directory, "package-lock.json")))
     return "npm";
   return null;
 }
@@ -5596,7 +5648,7 @@ function pythonValidationSteps(repoRoot, directory, paths) {
     "tox.ini",
     "requirements.txt"
   ];
-  const hasManifest = manifestNames.some((name) => existsSync5(resolve7(root, name)));
+  const hasManifest = manifestNames.some((name) => existsSync4(resolve7(root, name)));
   const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
   if (!hasManifest)
     return null;
@@ -5611,7 +5663,7 @@ ${read.text}`;
   if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
     return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
   }
-  if (existsSync5(resolve7(root, "manage.py"))) {
+  if (existsSync4(resolve7(root, "manage.py"))) {
     const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
     return managePath ? [`python ${managePath} test`] : null;
   }
@@ -5619,13 +5671,13 @@ ${read.text}`;
   return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
 }
 function goValidationSteps(repoRoot, directory) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "go.mod")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "go.mod")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
 }
 function rustValidationSteps(repoRoot, directory) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "Cargo.toml")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "Cargo.toml")))
     return null;
   if (!directory)
     return ["cargo test"];
@@ -5635,11 +5687,11 @@ function rustValidationSteps(repoRoot, directory) {
 function jvmValidationSteps(repoRoot, directory) {
   const root = resolve7(repoRoot, directory || ".");
   const directoryArg = directory ? commandPathArg(directory) : "";
-  if (existsSync5(resolve7(root, "pom.xml"))) {
+  if (existsSync4(resolve7(root, "pom.xml"))) {
     const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
     return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
   }
-  if (existsSync5(resolve7(root, "build.gradle")) || existsSync5(resolve7(root, "build.gradle.kts"))) {
+  if (existsSync4(resolve7(root, "build.gradle")) || existsSync4(resolve7(root, "build.gradle.kts"))) {
     return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
   }
   return null;
@@ -5662,15 +5714,15 @@ function dotnetValidationSteps(repoRoot, directory, paths) {
 function rubyValidationSteps(repoRoot, directory, paths) {
   const root = resolve7(repoRoot, directory || ".");
   const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
-  const hasRubyProjectEvidence = existsSync5(resolve7(root, "Gemfile")) || existsSync5(resolve7(root, "Rakefile")) || existsSync5(resolve7(root, ".rspec"));
+  const hasRubyProjectEvidence = existsSync4(resolve7(root, "Gemfile")) || existsSync4(resolve7(root, "Rakefile")) || existsSync4(resolve7(root, ".rspec"));
   if (directory && !hasRubyProjectEvidence)
     return null;
-  if (!directory && existsSync5(resolve7(root, "Gemfile"))) {
+  if (!directory && existsSync4(resolve7(root, "Gemfile"))) {
     const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
-    if (tests.length > 0 || existsSync5(resolve7(root, "spec")) || existsSync5(resolve7(root, ".rspec"))) {
+    if (tests.length > 0 || existsSync4(resolve7(root, "spec")) || existsSync4(resolve7(root, ".rspec"))) {
       return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
     }
-    if (existsSync5(resolve7(root, "Rakefile")))
+    if (existsSync4(resolve7(root, "Rakefile")))
       return ["bundle exec rake test"];
   }
   const target = commandPathArg(rubyPaths[0] ?? "");
@@ -5700,7 +5752,7 @@ function changedManifestAt(paths, directory, names) {
 }
 function makeValidationSteps(repoRoot, directory) {
   const root = resolve7(repoRoot, directory || ".");
-  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync5(resolve7(root, name)));
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve7(root, name)));
   if (!makefile)
     return null;
   const evidence = readTextBounded(resolve7(root, makefile));
@@ -5713,7 +5765,7 @@ function makeValidationSteps(repoRoot, directory) {
   return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
 }
 function cmakeValidationSteps(repoRoot, directory) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "CMakeLists.txt")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "CMakeLists.txt")))
     return null;
   const sourceArg = directory ? commandPathArg(directory) : ".";
   const buildPath = directory ? `${directory}/build` : "build";
@@ -5727,13 +5779,13 @@ function cmakeValidationSteps(repoRoot, directory) {
   ];
 }
 function hasBazelWorkspaceAt(repoRoot) {
-  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync5(resolve7(repoRoot, name)));
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve7(repoRoot, name)));
 }
 function bazelValidationSteps(repoRoot, directory) {
   if (!hasBazelWorkspaceAt(repoRoot))
     return null;
   const root = resolve7(repoRoot, directory || ".");
-  const hasPackage = existsSync5(resolve7(root, "BUILD")) || existsSync5(resolve7(root, "BUILD.bazel"));
+  const hasPackage = existsSync4(resolve7(root, "BUILD")) || existsSync4(resolve7(root, "BUILD.bazel"));
   if (directory && !hasPackage)
     return null;
   const target = directory ? `//${directory}/...` : "//...";
@@ -5759,14 +5811,14 @@ function nativeValidationSteps(repoRoot, directory, paths) {
 }
 function protobufValidationSteps(repoRoot, directory) {
   const root = resolve7(repoRoot, directory || ".");
-  if (!existsSync5(resolve7(root, "buf.yaml")) && !existsSync5(resolve7(root, "buf.work.yaml"))) {
+  if (!existsSync4(resolve7(root, "buf.yaml")) && !existsSync4(resolve7(root, "buf.work.yaml"))) {
     return null;
   }
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
 }
 function swiftValidationSteps(repoRoot, directory) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "Package.swift")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "Package.swift")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
@@ -5800,12 +5852,12 @@ function dartValidationSteps(repoRoot, directory, paths) {
     return [`${executable} test ${focusedTests.join(" ")}`];
   if (!directory)
     return [`${executable} test`];
-  const relativeTests = existsSync5(resolve7(root, "test")) ? `${directory}/test` : existsSync5(resolve7(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const relativeTests = existsSync4(resolve7(root, "test")) ? `${directory}/test` : existsSync4(resolve7(root, "integration_test")) ? `${directory}/integration_test` : "";
   const target = commandPathArg(relativeTests);
   return target ? [`${executable} test ${target}`] : null;
 }
 function elixirValidationSteps(repoRoot, directory, paths) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "mix.exs")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "mix.exs")))
     return null;
   if (directory) {
     const directoryArg = commandPathArg(directory);
@@ -5815,7 +5867,7 @@ function elixirValidationSteps(repoRoot, directory, paths) {
   return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
 }
 function hasCabalManifest(directory) {
-  if (existsSync5(resolve7(directory, "cabal.project")))
+  if (existsSync4(resolve7(directory, "cabal.project")))
     return true;
   try {
     return readdirSync(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
@@ -5825,7 +5877,7 @@ function hasCabalManifest(directory) {
 }
 function haskellValidationSteps(repoRoot, directory) {
   const root = resolve7(repoRoot, directory || ".");
-  if (existsSync5(resolve7(root, "stack.yaml"))) {
+  if (existsSync4(resolve7(root, "stack.yaml"))) {
     if (!directory)
       return ["stack test"];
     const yamlArg = commandPathArg(`${directory}/stack.yaml`);
@@ -5895,12 +5947,12 @@ function clojureValidationSteps(repoRoot, directory) {
     if (/:main-opts\b/.test(testAlias))
       return ["clojure -M:test"];
   }
-  if (existsSync5(resolve7(repoRoot, "project.clj")))
+  if (existsSync4(resolve7(repoRoot, "project.clj")))
     return ["lein test"];
   return null;
 }
 function zigValidationSteps(repoRoot, directory) {
-  if (!existsSync5(resolve7(repoRoot, directory || ".", "build.zig")))
+  if (!existsSync4(resolve7(repoRoot, directory || ".", "build.zig")))
     return null;
   if (!directory)
     return ["zig build test"];
@@ -7539,7 +7591,7 @@ async function maintainIntegrationBeforeCompletionClaim(options) {
 }
 
 // apps/source_control_manager/src/review_agent.ts
-import { existsSync as existsSync6, readFileSync as readFileSync7 } from "fs";
+import { existsSync as existsSync5, readFileSync as readFileSync7 } from "fs";
 import { createHash as createHash3 } from "crypto";
 import { tmpdir } from "os";
 import { basename as basename3, delimiter, isAbsolute as isAbsolute3, join as join6, resolve as resolve9 } from "path";
@@ -7631,10 +7683,10 @@ function resolveReviewValidationRepoRoot() {
   try {
     const config = loadPushPalsConfig();
     const scmRepo = String(config.sourceControlManager.repoPath ?? "").trim();
-    if (scmRepo && existsSync6(scmRepo))
+    if (scmRepo && existsSync5(scmRepo))
       return resolve9(scmRepo);
     const projectRoot = String(config.projectRoot ?? "").trim();
-    if (projectRoot && existsSync6(projectRoot))
+    if (projectRoot && existsSync5(projectRoot))
       return resolve9(projectRoot);
   } catch {}
   return resolve9(process.cwd());
@@ -7748,7 +7800,7 @@ function currentBunExecPath() {
       continue;
     for (const candidate of candidates) {
       const fullPath = join6(dir, candidate);
-      if (existsSync6(fullPath))
+      if (existsSync5(fullPath))
         return fullPath;
     }
   }
@@ -7851,7 +7903,7 @@ function resolveReviewerMdPath(reviewerMdPath, options) {
     cursor = parent;
   }
   for (const candidate of candidates) {
-    if (existsSync6(candidate))
+    if (existsSync5(candidate))
       return candidate;
   }
   return resolve9(workspaceRoot, raw);
@@ -11375,12 +11427,12 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 import { createHash as createHash5 } from "crypto";
 import {
   accessSync,
-  closeSync as closeSync2,
+  closeSync as closeSync3,
   constants,
   fstatSync,
   lstatSync,
   mkdirSync as mkdirSync3,
-  openSync as openSync2,
+  openSync as openSync3,
   readSync as readSync2,
   statSync as statSync4
 } from "fs";
@@ -11398,7 +11450,7 @@ function readInstallConfig(path) {
     return "unsafe";
   let fd;
   try {
-    fd = openSync2(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+    fd = openSync3(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
     const opened = fstatSync(fd);
     if (!opened.isFile() || opened.size > MAX_INSTALL_CONFIG_BYTES || opened.dev !== before.dev || opened.ino !== before.ino)
       return "unsafe";
@@ -11418,7 +11470,7 @@ function readInstallConfig(path) {
   } finally {
     if (fd !== undefined) {
       try {
-        closeSync2(fd);
+        closeSync3(fd);
       } catch {}
     }
   }
@@ -11567,16 +11619,16 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash as createHash6, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
 import {
-  closeSync as closeSync3,
-  existsSync as existsSync7,
+  closeSync as closeSync4,
+  existsSync as existsSync6,
   fsyncSync,
   mkdirSync as mkdirSync4,
-  openSync as openSync3,
+  openSync as openSync4,
   readFileSync as readFileSync8,
   readdirSync as readdirSync2,
-  renameSync,
+  renameSync as renameSync2,
   unlinkSync as unlinkSync3,
   writeFileSync as writeFileSync3
 } from "fs";
@@ -11714,31 +11766,31 @@ class CompletionGcJournal {
   enqueue(input) {
     const record = normalizeRecord(input);
     const destination = this.pathFor(record);
-    if (existsSync7(destination)) {
+    if (existsSync6(destination)) {
       const existing = normalizeRecord(JSON.parse(readFileSync8(destination, "utf8")));
       if (!sameRecord(existing, record)) {
         throw new Error(`Completion GC record ${record.completionId}/${record.claimGeneration} conflicts with an existing durable record.`);
       }
       return existing;
     }
-    const temporary = `${destination}.tmp-${process.pid}-${randomUUID2()}`;
+    const temporary = `${destination}.tmp-${process.pid}-${randomUUID3()}`;
     let fd = null;
     try {
-      fd = openSync3(temporary, "wx", 384);
+      fd = openSync4(temporary, "wx", 384);
       writeFileSync3(fd, `${JSON.stringify(record)}
 `, "utf8");
       fsyncSync(fd);
-      closeSync3(fd);
+      closeSync4(fd);
       fd = null;
-      renameSync(temporary, destination);
+      renameSync2(temporary, destination);
       return record;
     } catch (error) {
       if (fd !== null)
-        closeSync3(fd);
+        closeSync4(fd);
       try {
         unlinkSync3(temporary);
       } catch {}
-      if (existsSync7(destination)) {
+      if (existsSync6(destination)) {
         const existing = normalizeRecord(JSON.parse(readFileSync8(destination, "utf8")));
         if (sameRecord(existing, record))
           return existing;
@@ -12097,7 +12149,7 @@ async function isValidationCheckpointPublished(options) {
 
 // apps/source_control_manager/src/trusted_validation.ts
 import { createHash as createHash7 } from "crypto";
-import { existsSync as existsSync8, readFileSync as readFileSync9, rmSync, writeFileSync as writeFileSync4 } from "fs";
+import { existsSync as existsSync7, readFileSync as readFileSync9, rmSync, writeFileSync as writeFileSync4 } from "fs";
 import { basename as basename5, resolve as resolve12 } from "path";
 
 // packages/shared/src/validation_substeps.ts
@@ -12428,7 +12480,7 @@ function resolveTrustedValidationArgv(argv, bunExecutable) {
   return [...argv];
 }
 function resolveTrustedValidationPreparationArgv(options) {
-  const hasBunProject = existsSync8(`${options.repoPath}/package.json`) && (existsSync8(`${options.repoPath}/bun.lock`) || existsSync8(`${options.repoPath}/bun.lockb`));
+  const hasBunProject = existsSync7(`${options.repoPath}/package.json`) && (existsSync7(`${options.repoPath}/bun.lock`) || existsSync7(`${options.repoPath}/bun.lockb`));
   const needsDependencies = options.commandArgv.some((argv) => BUN_DEPENDENCY_COMMANDS.has(String(argv[0] ?? "").trim().toLowerCase()));
   if (!hasBunProject || !needsDependencies)
     return null;
@@ -12449,8 +12501,8 @@ function trustedValidationInstallFingerprint(options) {
   const lockPath = [
     resolve12(options.repoPath, "bun.lock"),
     resolve12(options.repoPath, "bun.lockb")
-  ].find((path) => existsSync8(path));
-  if (!existsSync8(packagePath) || !lockPath)
+  ].find((path) => existsSync7(path));
+  if (!existsSync7(packagePath) || !lockPath)
     return null;
   const hash = createHash7("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
@@ -12480,7 +12532,7 @@ function trustedInstallMarkerPath(repoPath) {
 function invalidateTrustedInstallMarker(repoPath) {
   const markerPath = trustedInstallMarkerPath(repoPath);
   rmSync(markerPath, { force: true });
-  if (existsSync8(markerPath)) {
+  if (existsSync7(markerPath)) {
     throw new Error("Could not invalidate the prior trusted dependency install marker.");
   }
 }
@@ -12830,14 +12882,48 @@ async function runTrustedValidationCommands(options) {
 }
 function isTransientTrustedValidationFailure(result) {
   const plain = String(result.output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
-  if (hasDeterministicValidationDiagnostic(plain))
+  const diagnostics = plain.split(/\r?\n/).flatMap((line) => {
+    const pytestDiagnostic = extractPytestSummaryDiagnostic(line);
+    if (pytestDiagnostic)
+      return [pytestDiagnostic];
+    const wrapperDiagnostic = /^\s*FAILED:\s*(.+)$/i.exec(line);
+    if (wrapperDiagnostic)
+      return [wrapperDiagnostic[1]];
+    return /^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(line) ? [] : [line];
+  });
+  if (hasDeterministicValidationDiagnostic(diagnostics.join(`
+`)))
     return false;
   if (result.failureClass === "timeout" || result.exitCode === 124)
     return true;
   if (isExplicitTestRunnerTimeoutFailure(plain))
     return true;
-  const diagnostics = plain.split(/\r?\n/).filter((line) => !/^\s*(?:\((?:pass|skip|fail)\)|PASS\b|FAIL(?:ED)?\b(?!\s+to\b)|---\s+FAIL:|[\u2713\u2714\u2715\u2717\u25cf]\s|test\s+.+\s+\.\.\.\s+(?:ok|FAILED)\b)/i.test(line));
   return diagnostics.some((line) => /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(line));
+}
+function extractPytestSummaryDiagnostic(line) {
+  const summary = /^\s*FAILED\s+(.+)$/i.exec(line)?.[1];
+  if (!summary)
+    return null;
+  let bracketDepth = 0;
+  let sawNodeSeparator = false;
+  for (let index = 0;index < summary.length; index += 1) {
+    const character = summary[index];
+    if (character === "[") {
+      bracketDepth += 1;
+    } else if (character === "]") {
+      if (bracketDepth === 0)
+        return null;
+      bracketDepth -= 1;
+    } else if (bracketDepth === 0) {
+      if (summary.startsWith("::", index))
+        sawNodeSeparator = true;
+      if (sawNodeSeparator && character === "-" && /\s/.test(summary[index - 1] ?? "") && /\s/.test(summary[index + 1] ?? "")) {
+        const diagnostic = summary.slice(index + 1).trimStart();
+        return /^(?:[\w.]*?(?:Error|Exception)|Failed):\s*/i.test(diagnostic) ? diagnostic : null;
+      }
+    }
+  }
+  return null;
 }
 function hasDeterministicValidationDiagnostic(output) {
   return output.split(/\r?\n/).some((rawLine) => {
@@ -13149,7 +13235,7 @@ var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
 var sourceControlManagerPusherId = `source_control_manager-${createHash8("sha256").update(`${config.repoPath}
 ${config.mainBranch}
-${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID3().slice(0, 8)}`;
+${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID4().slice(0, 8)}`;
 var repositoryServices = createRepositoryAgentServiceClients({
   serverUrl: config.serverUrl,
   callerService: "source_control_manager",

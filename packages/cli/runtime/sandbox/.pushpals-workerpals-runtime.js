@@ -13048,7 +13048,7 @@ function hasRequiredTestEditIntent(text) {
     if (/^(?:also\s+)?(?:update|adjust|extend|add)\s+(?:(?:relevant|affected|existing|corresponding)\s+)*tests?\b/i.test(trimmed) && (/\b(?:if|when|where|as)\s+(?:needed|necessary|warranted|appropriate|applicable)\b/i.test(trimmed) || /\btests?\s+or\s+documentation\b[^;\n]*\bif\b/i.test(trimmed))) {
       return false;
     }
-    return /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(trimmed) || /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/i.test(trimmed);
+    return /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(trimmed) || /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b\s+(?:(?:must|should|shall|will)\s+be|(?:need|needs)\s+to\s+be|(?:is|are)\s+to\s+be)\s+(added|written|created|updated|extended|expanded|hardened|improved|refactored|moved|extracted|fixed)\b/i.test(trimmed);
   });
 }
 function isTestFocusedTask(instruction, planning, targetPath) {
