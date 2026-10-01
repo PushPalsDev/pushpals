@@ -2,43 +2,44 @@
 
 ## Release Metadata
 
-- version: `v1.2.62`
-- start_commit: `9504b12076bf5ec5dd66dcf8907a5b18c64d105a`
-- end_commit: `98b925c09aaef632aef07a8d5d3aef894ebc2fe6`
-- commits_in_range: `3`
+- version: `v1.2.63`
+- start_commit: `5b87b0c69b2b0802a6451f09a827149375e8aa9f`
+- end_commit: `7cf5434750bb496ffe376dd2f98dd74c4eaca623`
+- commits_in_range: `2` (one product fix and the prior release's verification record)
 
 ## Highlights
 
-- Prevent competing SCM instances from both reclaiming a stale lock. A dedicated SQLite connection now holds the process-lifetime OS lock, releases automatically after a crash, and never unlinks a successor's ownership file.
-- Treat ordinary guarantees such as "existing tests pass after the refactor" as validation requirements, not mandatory test-file edits. Explicit test-edit requirements and test targets remain authoritative; required validation and critic gates are unchanged.
-- Preserve actual infrastructure exceptions in failed pytest summaries, including traceback-disabled output, so genuine transient failures retain one bounded retry. Parameterized test names cannot masquerade as diagnostics, and assertion/compiler/lint failures still veto retries.
-- Refuse to report successful shutdown or remove worktrees/containers while service exit or a requested termination is unconfirmed. Bound the stop operation, retain unfinished termination state across retries, and avoid re-signalling an exited launcher's potentially recycled PID.
-- Add 47 focused regression cases plus a hosted Linux release-preflight contract, run native Bun ownership/shutdown checks on Linux and Windows, and regenerate the packaged worker and SCM bundles. All runtime changes remain repository-generic.
+- Check shared Docker execution capability before claiming jobs. Known infrastructure outages leave queued attempts untouched, keep controller heartbeats alive, and use bounded recovery probes rather than repeated failed coding jobs or worker respawn loops.
+- Distinguish setup-only infrastructure failures from implementation outcomes. Healthy workers can take work targeted to a blocked worker, existing claims remain replayable, and shutdown fences prevent late readiness probes from recreating resources.
+- Pause expensive autonomous discovery while workers explicitly report blocked execution. Confirmed, unchanged bounded-discovery exhaustion pauses repeated analysis for at most 30 minutes; fresh repository evidence or changed eligibility reopens discovery without inventing work.
+- Report review quality from actual observed review outcomes. Jobs that never reached review cannot produce a perfect first-pass rate; successful publication is not itself a revision, and retained revisions cannot age into first-pass success.
+- Preserve bounded structured stall diagnostics separately from truncated health previews, including recent lag, slow operations, CPU-window deltas, RSS, and fixed-label active operations. These measurements support correlation without claiming a proven stall cause.
+- Expand regression and Windows CI coverage, require the new readiness helper in the published package, and refresh bundled runtimes. All changes remain repository-generic and preserve candidate-specific hooks, final validation, review, and publication gates.
 
 ## Validation
 
-- Final hosted full root suite: `3,163` passed, `12` platform/opt-in skips, `0` failures, and `17,894` assertions across `200` files (189.88 seconds), including the native Bun abrupt-owner-death lock regression. The initial source-change run also passed all `3,163` tests before the generated bundles were committed.
-- Full `cli:bundle`, monitoring UI export, package-payload verification, and WorkerPals/SCM TypeScript checks passed on a GitHub-hosted Linux runner. Local Docker returned an engine API error; no host runtime or live SectorCommand services were started for validation.
-- [Initial CLI E2E run 36688499773](https://github.com/PushPalsDev/pushpals/actions/runs/36688499773) passed Linux package/real-Docker worker tests and Windows ownership, shutdown, trusted-validation, and source-only startup contracts. The manual-only Windows Host Docker E2E job was skipped as configured.
-- The exact initial CI commit's generated artifact was inspected and apply-checked; only the two expected worker/SCM bundles changed. The WorkerPal source/sandbox TypeScript mirror hashes match, and the final hosted rebuild produced an empty generated-runtime diff.
-- Final product commit `98b925c09aaef632aef07a8d5d3aef894ebc2fe6` passed [CLI E2E run 36689260426](https://github.com/PushPalsDev/pushpals/actions/runs/36689260426): full hosted preflight, packaged Linux CLI, real-Docker Linux worker execution, and Windows contracts/source-only startup. The manual-only Windows Host Docker E2E job was skipped as configured.
-- [Release CLI run 36690171547](https://github.com/PushPalsDev/pushpals/actions/runs/36690171547) passed all `16` jobs, including the container-backed reliability harness, five-minute Windows runtime test, and published Linux/Windows installation smokes. npm `latest` is `1.2.62`; all `25` GitHub release assets are present. Publication used trusted publishing without reauthentication.
-- The first Windows installed-package attempt stopped before PushPals started: Bun's package index did not yet list the version even though exact-version metadata and the tarball were available. After both full and abbreviated package indexes exposed the version, only that failed smoke was rerun; npm was not republished. The retry cold-started successfully and remained healthy for `150,000ms` after readiness.
+- Isolated Linux container regression run: `3,231` passed, `12` platform/opt-in skips, `0` failures, and `18,289` assertions across `202` files (331.33 seconds). One unrelated Metro test was excluded because the offline image lacked Expo; this is not a claim that the full local root suite passed.
+- Final packaging, Windows-workflow contract, and runtime-mirror tests: `33` passed, `0` failures. CLI entrypoint and all service bundles built; actual npm package payload verification passed with `279` files and no vendored external toolchains.
+- Server, WorkerPals, RemoteBuddy, shared, and SourceControlManager TypeScript checks passed. Formatting and diff checks passed; changed raw runtime mirrors match source hashes.
+- Hosted release preflight passed the full CLI bundle and monitoring UI export, actual package-payload verification, WorkerPals/SCM typechecks, and the complete root suite: `3,235` passed, `12` platform/opt-in skips, `0` failures across `203` files (183.47 seconds). This includes the Metro test unavailable in the offline container and the final packaging regression.
+- Final product commit `7cf5434750bb496ffe376dd2f98dd74c4eaca623` passed [CLI E2E run 36780559155](https://github.com/PushPalsDev/pushpals/actions/runs/36780559155): full Linux preflight, packaged CLI, real-Docker worker execution, and Windows contracts/source-only runtime startup. The manual-only Windows Host Docker E2E job was skipped as configured.
+- The exact commit's generated-runtime artifact was downloaded and inspected: `runtime-assets.patch` is empty, confirming the committed runtime bundles match the hosted build.
+- Local execution stayed inside a disposable container capped at one CPU and 2 GiB RAM, with no network or Docker socket. The container was removed afterward; no live SectorCommand installation or services were changed.
 
 ## Install
 
 ```bash
-npm install -g @pushpalsdev/cli@1.2.62
+npm install -g @pushpalsdev/cli@1.2.63
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.62
+bun install -g @pushpalsdev/cli@1.2.63
 ```
 
 For environments using a managed certificate store:
 
 ```bash
-bun install -g --use-system-ca @pushpalsdev/cli@1.2.62
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.63
 ```
 
 ## Artifacts
@@ -49,16 +50,15 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.62
 
 ## Compatibility Notes
 
-- No configuration or application-database migration is required. SCM creates a dedicated `merge_queue.lock.sqlite` file in its state directory; do not delete or replace it while a daemon may be running. The existing JSON lock file remains diagnostic/legacy metadata.
-- Live legacy owners are respected, but concurrent old/new binaries retain the old binary's unsafe stale-file protocol. Stop old instances and upgrade all contenders to obtain the new ownership guarantee.
+- No configuration or application-database migration is required. Legacy workers without an explicit execution-readiness signal remain compatible and are treated as unknown, not permanently blocked; upgrade all workers for the full admission guarantee.
+- Docker readiness recovery uses a 30-second positive cache, a bounded shared probe, and failure backoff capped at five minutes. Candidate-specific dependency installation and lifecycle hooks still run per job.
 - Required validation order, publication backpressure, exact-candidate checks, and candidate-specific lifecycle hooks remain authoritative. Failures are not converted into successful jobs or bypassed for speed.
 
 ## Known Issues
 
-- Exact-version metadata/tarball visibility can precede the package-index visibility needed by Bun installation. The current availability gate does not check both package-index variants; this release required the targeted Windows smoke retry documented above.
-- The v1.2.60 immediate-restart lock collision had insufficient evidence to identify its exact cause. This release repairs independently reproduced ownership and incomplete-shutdown defects; it does not retrospectively prove which caused that incident.
-- The general standalone CLI TypeScript check still reports 15 pre-existing diagnostics; comparison with the prior committed CLI found no new diagnostics. Scoped worker/SCM typechecks pass. This release does not claim a clean repository-wide CLI typecheck.
-- A completed best-effort process-tree termination call plus launcher exit is not independent proof that every descendant is dead. Reported or pending termination failures prevent automatic cleanup; an exited root with a failed termination remains fail-closed instead of risking a recycled PID.
+- Exact-version metadata/tarball visibility can precede the package-index visibility needed by Bun installation. The current availability gate does not check both package-index variants; retry only a failed installed-package smoke after confirming propagation, never npm publication.
+- Readiness admission cannot repair Docker itself or guarantee that infrastructure stays healthy after a successful probe. A job can still fail if Docker becomes unavailable after admission; that failure is retained and subsequent claims are blocked until recovery.
+- This release does not claim a clean repository-wide standalone CLI TypeScript check; the scoped service/package checks listed above passed.
 - Hosted tests and bounded smokes do not substitute for a long deployed Windows-host Docker soak or establish a sub-ten-minute job average, improved vision alignment, or 100% success/uptime. Development and validation did not modify the live installation or external repository.
 - The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Docker-backed WorkerPal execution requires Docker to be installed and running.
 - Some Windows environments require `--use-system-ca` for Bun installs or Schannel for Git remote operations.
