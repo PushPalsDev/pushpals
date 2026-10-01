@@ -7944,6 +7944,27 @@ describe("server AutonomyStore policy gates", () => {
                   },
                 },
               },
+              {
+                command: "bun run aggregate",
+                passed: false,
+                exitCode: 125,
+                metadata: {
+                  executionState: "not_started",
+                  deferredByCommand: "bun test tests/router-shell.test.ts",
+                },
+              },
+              {
+                command: "bun run host",
+                passed: false,
+                exitCode: 1,
+                metadata: { executionState: "deferred", capability: "trusted_host" },
+              },
+              {
+                command: "bun run legacy-host",
+                passed: false,
+                exitCode: 1,
+                metadata: { capability: "trusted_host" },
+              },
             ],
           },
         }).ok,
@@ -7951,6 +7972,9 @@ describe("server AutonomyStore policy gates", () => {
 
       expect(store.getReliabilityMetrics()).toMatchObject({
         validationFailureRuns: 1,
+        validationExecutedRuns: 1,
+        validationDeferredRuns: 2,
+        validationNotStartedRuns: 1,
         validationEvidenceCoverageRate: 1,
         validationFingerprintCollisionCount: 0,
       });

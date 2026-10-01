@@ -20,6 +20,10 @@ import {
   type ReviewAgentConfig,
 } from "../apps/source_control_manager/src/review_agent";
 import { deleteBranchRef, type GitHubPR } from "../apps/source_control_manager/src/github_pr";
+import type {
+  ReviewJournal,
+  ReviewJournalEntry,
+} from "../apps/source_control_manager/src/review_journal";
 import {
   SCM_REPAIR_AUTHORITY_HEADER,
   SCM_REPAIR_AUTHORITY_SECRET_ENV,
@@ -553,6 +557,107 @@ describe("ReviewAgent", () => {
       8.5,
     );
     expect(prompt).toContain("ReviewAgent approves iff score >= 8.5/10.");
+    expect(prompt).toContain('"complete":true');
+  });
+
+  test("complete review prompt never clips ASCII or multibyte evidence", () => {
+    const prefix = "diff --git a/file b/file\n+";
+    const exact = prefix + "a".repeat(150_000 - Buffer.byteLength(prefix));
+    expect(buildReviewPrompt("Criteria", makePr(), exact, 8.5)).toContain(exact);
+    for (const tooLarge of [exact + "a", prefix + "🙂".repeat(40_000)]) {
+      expect(() => buildReviewPrompt("Criteria", makePr(), tooLarge, 8.5)).toThrow(
+        "Review evidence incomplete",
+      );
+    }
+  });
+
+  test("incomplete patches are durable observable holds, never approval or coding repair", async () => {
+    for (const diff of [
+      "diff --git a/file b/file\n+" + "a".repeat(180_000),
+      "diff --git a/file b/file\n+" + "🙂".repeat(40_000),
+      "diff --git a/file b/file\nGIT binary patch\nliteral 5\nabc\n",
+      "diff --git a/file b/file\n+line\n...(diff truncated)\n",
+    ]) {
+      const pr = makePr();
+      const records = new Map<string, ReviewJournalEntry>();
+      const journal: ReviewJournal = {
+        getReviewDecision: (_repo, _number, revision) => records.get(revision) ?? null,
+        saveReviewDecision: (_repo, _number, revision, entry) => {
+          records.set(revision, entry);
+        },
+        getReviewRepairEnqueueCount: () => 0,
+      };
+      let modelCalls = 0;
+      let mutations = 0;
+      const warnings: string[] = [];
+      const makeAgent = () =>
+        new ReviewAgent(
+          baseConfig,
+          "http://server",
+          "token",
+          "https://github.com/org/repo.git",
+          "main",
+          undefined,
+          {
+            ...silentLogs,
+            reviewJournal: journal,
+            listOpenPullRequests: async () => [pr],
+            getPullRequestDiff: async () => diff,
+            invokeCodexReview: async () => {
+              modelCalls++;
+              return JSON.stringify({
+                score: 10,
+                summary: "Approved",
+                issues: [],
+                fix_instruction: "",
+              });
+            },
+            mergePullRequest: async () => {
+              mutations++;
+              return { merged: true, sha: "abc", message: "merged" };
+            },
+            addPullRequestComment: async () => {
+              mutations++;
+            },
+            fetchImpl: async () => {
+              mutations++;
+              return Response.json({ ok: true });
+            },
+            logWarn: (message) => warnings.push(message),
+          },
+        );
+      await makeAgent().poll();
+      await makeAgent().poll(); // Simulated service restart reads persisted hold.
+      expect(modelCalls).toBe(0);
+      expect(mutations).toBe(0);
+      expect(records.size).toBe(1);
+      const entry = [...records.values()][0]!;
+      expect(entry.finalized).toBe(true);
+      expect(JSON.parse(entry.verdictJson!)).toMatchObject({
+        event: "review_evidence_hold",
+        manifest: { complete: false },
+      });
+      expect(warnings.some((message) => message.includes("No approval or coding retry"))).toBe(
+        true,
+      );
+    }
+  });
+
+  test("parameterized suite refactor reaches semantic reviewer with full coverage evidence", () => {
+    const diff = [
+      "diff --git a/tests/layout.test.ts b/tests/layout.test.ts",
+      "-describe('layout', () => {",
+      "-test('top', () => {})",
+      "-test('bottom', () => {})",
+      "+describe.each(['top', 'bottom'])('%s', () => {",
+      "+test('fits', () => {})",
+      "+test('controls', () => {})",
+    ].join("\n");
+    expect(collectReviewHygieneIssuesFromDiff(diff)).toEqual([]);
+    const prompt = buildReviewPrompt("Criteria", makePr(), diff, 8.5);
+    expect(prompt).toContain(diff);
+    expect(prompt).toContain("compare actual assertions");
+    expect(prompt).toContain('"parameterized":1');
   });
 
   test("derives scoped write globs from PR diff paths", () => {
@@ -649,20 +754,20 @@ describe("ReviewAgent", () => {
 
   test("detects removed test declarations across common language families", () => {
     const declarations = [
-      "test('works', () => {})",
-      "def test_works():",
-      "func TestWorks(t *testing.T) {",
-      "#[test]",
-      "@Test",
-      "[Fact]",
-      "it('works') { true }",
-      "public function testWorks() {",
-      "func testWorks() throws {",
+      ["ts", "test('works', () => {})"],
+      ["py", "def test_works():"],
+      ["go", "func TestWorks(t *testing.T) {"],
+      ["rs", "#[test]"],
+      ["java", "@Test"],
+      ["cs", "[Fact]"],
+      ["rb", "it('works') { true }"],
+      ["php", "public function testWorks() {"],
+      ["swift", "func testWorks() throws {"],
     ];
-    for (const declaration of declarations) {
+    for (const [extension, declaration] of declarations) {
       const removed = collectReviewHygieneIssuesFromDiff(
         [
-          "diff --git a/tests/example.txt b/tests/example.txt",
+          `diff --git a/tests/example.${extension} b/tests/example.${extension}`,
           `-${declaration}`,
           `-${declaration}`,
           `-${declaration}`,
@@ -672,7 +777,7 @@ describe("ReviewAgent", () => {
 
       const intentionalRemoval = collectReviewHygieneIssuesFromDiff(
         [
-          "diff --git a/tests/example.txt b/tests/example.txt",
+          `diff --git a/tests/example.${extension} b/tests/example.${extension}`,
           `-${declaration}`,
           `-${declaration}`,
           `-${declaration}`,
@@ -685,7 +790,7 @@ describe("ReviewAgent", () => {
 
       const replaced = collectReviewHygieneIssuesFromDiff(
         [
-          "diff --git a/tests/example.txt b/tests/example.txt",
+          `diff --git a/tests/example.${extension} b/tests/example.${extension}`,
           `-${declaration}`,
           `-${declaration}`,
           `-${declaration}`,

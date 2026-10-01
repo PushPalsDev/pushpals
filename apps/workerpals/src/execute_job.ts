@@ -12,6 +12,7 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -59,6 +60,21 @@ import type {
   JobValidationRunDiagnostics,
 } from "./common/types.js";
 import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
+import type { ValidationExecutionState } from "../../../packages/shared/src/validation_observation.js";
+import { codexUsageAttempt } from "./codex_usage.js";
+import { durableCodexCommandTimings } from "./command_timing_diagnostics.js";
+import {
+  buildCompleteReviewEvidence,
+  assertCompleteReviewEvidence,
+} from "../../../packages/shared/src/review_evidence.js";
+import {
+  analyzeTestHygieneDiff,
+  testRemovalExplicitlyRequested,
+} from "../../../packages/shared/src/test_hygiene.js";
+import {
+  createValidationSubstepCollector,
+  type ValidationSubstepReport,
+} from "../../../packages/shared/src/validation_substep_collector.js";
 import {
   CapabilityRevisionCircuit,
   withCapabilityBlockedResult,
@@ -125,6 +141,9 @@ export interface ValidationExecutionResult {
   stdout: string;
   stderr: string;
   elapsedMs: number;
+  executionState?: ValidationExecutionState;
+  deferralReason?: string;
+  substepTimings?: ValidationSubstepReport;
   /** Informational browser/e2e marker observed in output; never a terminal-status source. */
   browserSignal?: "failure" | "success" | "failure_and_success";
   terminalStatusSource?: "process_exit" | "deadline";
@@ -1290,20 +1309,25 @@ export function validationEvidenceId(
   return `validation:${createHash("sha256").update(provenance).digest("hex").slice(0, 12)}`;
 }
 
-function buildValidationRunDiagnostics(
+export function buildValidationRunDiagnostics(
   runs: ValidationExecutionResult[],
   attempt: number,
 ): JobValidationRunDiagnostics[] {
   return runs.slice(0, 20).map((run) => ({
     attempt,
     command: run.command,
-    exitCode: run.exitCode,
+    exitCode: run.executionState && run.executionState !== "executed" ? null : run.exitCode,
     durationMs: run.elapsedMs,
     passed: run.ok,
-    failureClass: classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run),
+    failureClass:
+      run.executionState && run.executionState !== "executed"
+        ? null
+        : (classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run)),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...(run.browserSignal ||
+    ...(run.executionState ||
+    run.substepTimings ||
+    run.browserSignal ||
     run.inheritedFailureClass ||
     run.deferredByCommand ||
     run.evidenceId ||
@@ -1311,6 +1335,9 @@ function buildValidationRunDiagnostics(
     run.capability
       ? {
           metadata: {
+            executionState: run.executionState ?? "executed",
+            ...(run.substepTimings ? { substepTimings: run.substepTimings } : {}),
+            ...(run.deferralReason ? { deferralReason: run.deferralReason } : {}),
             evidenceId: run.evidenceId ?? validationEvidenceId(run),
             ...(run.plannedEvidenceId ? { plannedEvidenceId: run.plannedEvidenceId } : {}),
             ...(run.capability ? { capability: run.capability } : {}),
@@ -1983,6 +2010,8 @@ function captureValidationStream(
   let browserFailureSignalDetected = false;
   let browserSuccessSignalDetected = false;
   let done = false;
+  let complete = false;
+  let cancelled = false;
   const reader = stream?.getReader();
   const decoder = new TextDecoder();
   const append = (chunk: string) => {
@@ -2033,6 +2062,7 @@ function captureValidationStream(
             append(decoder.decode(result.value, { stream: true }));
           }
           append(decoder.decode());
+          complete = !cancelled;
         } catch {
           // Stream cancellation after process exit is expected when descendants
           // inherit pipes from failed browser/dev-server launchers.
@@ -2047,10 +2077,12 @@ function captureValidationStream(
       })()
     : Promise.resolve().then(() => {
         done = true;
+        complete = true;
       });
 
   return {
     cancel: async () => {
+      if (!done) cancelled = true;
       try {
         await Promise.race([reader?.cancel() ?? Promise.resolve(), Bun.sleep(250)]);
       } catch {
@@ -2058,6 +2090,7 @@ function captureValidationStream(
       }
     },
     isDone: () => done,
+    isComplete: () => complete,
     promise,
     text: retainedText,
     hasBrowserFailureSignal: () => browserFailureSignalDetected,
@@ -2141,11 +2174,34 @@ export async function runValidationArgv(
       elapsedMs: Math.max(1, Date.now() - startedAt),
     };
   }
+  const substeps = createValidationSubstepCollector();
+  const substepBuffers = { stdout: "", stderr: "" };
+  const substepDropping = { stdout: false, stderr: false };
+  const substepChunk = (stream: "stdout" | "stderr") => (chunk: string) => {
+    for (const [index, part] of chunk.split("\n").entries()) {
+      if (index > 0) {
+        if (!substepDropping[stream]) {
+          (stream === "stdout" ? substeps.onStdoutLine : substeps.onStderrLine)(
+            substepBuffers[stream],
+          );
+        }
+        substepBuffers[stream] = "";
+        substepDropping[stream] = false;
+      }
+      if (substepDropping[stream]) continue;
+      if (substepBuffers[stream].length + part.length > 4096) {
+        substepBuffers[stream] = "";
+        substepDropping[stream] = true;
+      } else substepBuffers[stream] += part;
+    }
+  };
   const stdoutCapture = captureValidationStream(
     (proc.stdout ?? null) as ReadableStream<Uint8Array> | null,
+    substepChunk("stdout"),
   );
   const stderrCapture = captureValidationStream(
     (proc.stderr ?? null) as ReadableStream<Uint8Array> | null,
+    substepChunk("stderr"),
   );
   // `timeoutMs` may already be capped to the final milliseconds remaining in
   // the absolute job ledger. Never round that cap back up and mint time.
@@ -2196,6 +2252,10 @@ export async function runValidationArgv(
       ? "success"
       : undefined;
 
+  if (stdoutCapture.isComplete() && !substepDropping.stdout && substepBuffers.stdout)
+    substeps.onStdoutLine(substepBuffers.stdout);
+  if (stderrCapture.isComplete() && !substepDropping.stderr && substepBuffers.stderr)
+    substeps.onStderrLine(substepBuffers.stderr);
   return {
     step: command,
     command,
@@ -2213,6 +2273,14 @@ export async function runValidationArgv(
     elapsedMs: Math.max(1, Date.now() - startedAt),
     ...(browserSignal ? { browserSignal } : {}),
     terminalStatusSource: timedOut ? "deadline" : "process_exit",
+    executionState: "executed",
+    substepTimings: substeps.finish(
+      timedOut
+        ? "timed_out"
+        : !stdoutCapture.isComplete() || !stderrCapture.isComplete()
+          ? "output_incomplete"
+          : "command_finished",
+    ),
   };
 }
 
@@ -3937,9 +4005,19 @@ export function isolatePureEnvironmentValidationDeferral(quality: DeterministicQ
       actionableRuns.filter((run) => !run.ok).map((run) => run.command),
       actionableRuns,
     );
+    const environmentFailureTexts = new Set(
+      collectRequiredValidationFailures([...environmentCommands], environmentRuns),
+    );
     const requiredValidationFailures = quality.requiredValidationFailures.filter(
       (failure) =>
-        ![...environmentCommands].some((command) => failure.startsWith(`${command} exited `)),
+        !environmentFailureTexts.has(failure) &&
+        !environmentRuns.some((run) =>
+          // Legacy diagnostics may omit or compact the failure excerpt. Match
+          // only known outcome separators after an exact owned command.
+          [" exited ", " deferred ", " not_started "].some((separator) =>
+            failure.startsWith(`${run.command}${separator}`),
+          ),
+        ),
     );
     const validationIssues = [
       ...quality.validationIssues.filter(
@@ -5516,13 +5594,22 @@ export function buildBrowserValidationRepairPacket(
 
 export function collectRequiredValidationFailures(
   requiredCommands: string[],
-  validationRuns: Array<{ command: string; ok: boolean; exitCode?: number }>,
+  validationRuns: Array<{
+    command: string;
+    ok: boolean;
+    exitCode?: number;
+    executionState?: ValidationExecutionState;
+    deferredByCommand?: string;
+  }>,
 ): string[] {
   const requiredKeys = new Set(requiredCommands.map(validationCommandKey).filter(Boolean));
   if (requiredKeys.size === 0) return [];
   return validationRuns
     .filter((run) => requiredKeys.has(validationCommandKey(run.command)) && !run.ok)
     .map((run) => {
+      if (run.executionState && run.executionState !== "executed") {
+        return `${run.command} ${run.executionState}${run.deferredByCommand ? ` after ${run.deferredByCommand}` : ""} (still required)`;
+      }
       const exitCode = Number.isFinite(Number(run.exitCode)) ? Number(run.exitCode) : "unknown";
       const digest = extractValidationFailureDigest(run);
       return `${run.command} exited ${exitCode}${digest ? ` (${digest})` : ""}`;
@@ -6435,6 +6522,19 @@ async function runDeterministicQualityGate(
     for (const issue of collectWriteScopeIssuesFromChangedPaths(changedPaths, planning)) {
       addScopeIssue(issue);
     }
+    if (changedTestPaths.length > 0) {
+      try {
+        const hygiene = analyzeTestHygieneDiff(
+          await buildCriticDiffText(repo, changedTestPaths, deadlineLedger),
+          { allowTestRemoval: testRemovalExplicitlyRequested(instruction) },
+        );
+        for (const issue of hygiene.blockingIssues) addScopeIssue(issue);
+      } catch (error) {
+        addScopeIssue(
+          `Could not capture complete test hygiene evidence: ${toSingleLine(error, 240)}`,
+        );
+      }
+    }
     if (
       isTestTask &&
       changedTestPaths.length === 0 &&
@@ -6545,6 +6645,8 @@ async function runDeterministicQualityGate(
     stderr:
       "Validation did not start because the absolute WorkerPal job deadline was exhausted; this is not a passing validation result.",
     elapsedMs: 0,
+    executionState: "not_started",
+    deferralReason: "job_deadline",
     terminalStatusSource: "deadline",
     failureClass: "deadline",
   });
@@ -6651,11 +6753,13 @@ async function runDeterministicQualityGate(
               exitCode: 125,
               stdout: "",
               stderr,
-              elapsedMs: 1,
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferredByCommand: higherTierDeferral.blockerCommand,
+              deferralReason: higherTierDeferral.reason,
               ...(higherTierDeferral.inheritedFailureClass
                 ? {
                     inheritedFailureClass: higherTierDeferral.inheritedFailureClass,
-                    deferredByCommand: higherTierDeferral.blockerCommand,
                   }
                 : {}),
             });
@@ -6706,7 +6810,9 @@ async function runDeterministicQualityGate(
                       exitCode: 127,
                       stdout: "",
                       stderr,
-                      elapsedMs: 1,
+                      elapsedMs: 0,
+                      executionState: "not_started",
+                      deferralReason: "missing_toolchain",
                     } satisfies ValidationExecutionResult,
                     stream: "stderr" as const,
                     summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
@@ -6777,7 +6883,9 @@ async function runDeterministicQualityGate(
               exitCode: 127,
               stdout: "",
               stderr,
-              elapsedMs: 1,
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferralReason: "missing_toolchain",
             });
             onLog?.(
               "stderr",
@@ -6801,7 +6909,10 @@ async function runDeterministicQualityGate(
               exitCode: 125,
               stdout: "",
               stderr,
-              elapsedMs: 1,
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferralReason: deferredReason,
+              deferredByCommand: validationRuns.find(isDeterministicFastValidationFailure)?.command,
             });
             onLog?.(
               "stderr",
@@ -6822,6 +6933,8 @@ async function runDeterministicQualityGate(
               stdout: "",
               stderr: trustedEnvironmentDeferral,
               elapsedMs: 0,
+              executionState: "deferred",
+              deferralReason: "trusted_host_required",
             });
             onLog?.(
               "stderr",
@@ -7148,9 +7261,10 @@ function resolveQualityCriticMaxDiffChars(
   compact = false,
 ): number {
   const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
-  const max = Number.isFinite(value) ? value : 16_000;
+  const max = Number.isFinite(value) ? value : 65_536;
   const bounded = Math.max(256, Math.min(524_288, Math.floor(max)));
-  return compact ? Math.min(bounded, 6_000) : bounded;
+  // The retry may shorten validation logs, never remove patch evidence.
+  return bounded;
 }
 
 function resolveQualityCriticMaxValidationOutputChars(
@@ -7178,7 +7292,9 @@ export function buildCriticValidationSummary(
       return [
         `Evidence ID: ${evidenceId}`,
         `Command: ${run.command}`,
-        `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
+        run.executionState && run.executionState !== "executed"
+          ? `Result: ${run.executionState} (not executed; still required)${run.deferredByCommand ? ` after ${run.deferredByCommand}` : ""}`
+          : `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
         output ? `Output:\n${output}` : "",
       ]
         .filter(Boolean)
@@ -7455,11 +7571,12 @@ async function runTaskCriticReview(
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const buildAttemptPayload = async (compact: boolean) => {
-    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
-    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
-      0,
-      resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
+    const diffText = await buildCompleteWorkerReviewDiff(
+      repo,
+      criticChangedPaths,
+      resolveQualityCriticMaxDiffChars(runtimeConfig),
+      deadlineLedger,
+      instruction,
     );
     const validationSummary = buildCriticValidationSummary(
       quality,
@@ -7661,7 +7778,7 @@ async function runTaskCriticReview(
   } catch (err) {
     onLog?.(
       "stderr",
-      `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
+      `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (candidate requires review before publication).`,
     );
     return {
       kind: "unavailable",
@@ -7943,7 +8060,9 @@ export function buildQualityRevisionHint(
       )}`,
     );
   }
-  const failedValidationRuns = validationRuns.filter((run) => !run.ok);
+  const failedValidationRuns = validationRuns.filter(
+    (run) => !run.ok && (!run.executionState || run.executionState === "executed"),
+  );
   if (failedValidationRuns.length > 0) {
     lines.push(
       "Validation repair continuity rule: existing content changes from earlier repair attempts are prepared candidate fixes. Preserve them unless the latest failing command proves a specific change is wrong; do not revert them merely to restore the original narrow file count, target paths, or write globs.",
@@ -8258,7 +8377,13 @@ export async function git(
   args: string[],
   deadlineLedger?: JobDeadlineLedger,
   deadlinePhase: "work" | "total" = "total",
-): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null }> {
+): Promise<{
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  captureComplete?: boolean;
+}> {
   try {
     const configuredTimeoutMs = resolveWorkerGitCommandTimeoutMs(args);
     const activeDeadlineLedger = deadlineLedger ?? workerGitDeadlineContext.getStore();
@@ -8286,9 +8411,15 @@ export async function git(
     // Preserve leading spaces in stdout for porcelain parsers.
     return {
       ok: !result.timedOut && !result.drainTimedOut && result.exitCode === 0,
-      stdout: result.stdout.trimEnd(),
+      // Blank context lines in unified patches consist of a single space.
+      stdout: args[0] === "diff" ? result.stdout : result.stdout.trimEnd(),
       stderr: result.stderr.trim(),
       exitCode: result.exitCode,
+      captureComplete:
+        !result.stdoutTruncated &&
+        !result.stdoutReadError &&
+        !result.stdoutDecodeError &&
+        !result.drainTimedOut,
     };
   } catch (err) {
     return { ok: false, stdout: "", stderr: String(err), exitCode: null };
@@ -8329,13 +8460,22 @@ export async function buildCriticDiffText(
     ["diff", "HEAD", "--", ...paths],
     deadlineLedger,
   );
-  if (trackedDiff.stdout) {
+  if (trackedDiff.captureComplete === false)
+    throw new Error("Review evidence incomplete: tracked diff capture failed or was truncated");
+  if (trackedDiff.ok && trackedDiff.stdout) {
     chunks.push(trackedDiff.stdout);
   } else if (!trackedDiff.ok) {
     const [unstagedDiff, stagedDiff] = await Promise.all([
       gitDuringJobWork(repo, ["diff", "--", ...paths], deadlineLedger),
       gitDuringJobWork(repo, ["diff", "--cached", "--", ...paths], deadlineLedger),
     ]);
+    if (
+      !unstagedDiff.ok ||
+      !stagedDiff.ok ||
+      unstagedDiff.captureComplete === false ||
+      stagedDiff.captureComplete === false
+    )
+      throw new Error("Review evidence incomplete: could not read tracked changes");
     if (unstagedDiff.stdout) chunks.push(unstagedDiff.stdout);
     if (stagedDiff.stdout) chunks.push(stagedDiff.stdout);
   }
@@ -8345,6 +8485,8 @@ export async function buildCriticDiffText(
     ["ls-files", "-z", "--others", "--exclude-standard", "--", ...paths],
     deadlineLedger,
   );
+  if (!untrackedResult.ok || untrackedResult.captureComplete === false)
+    throw new Error("Review evidence incomplete: could not enumerate untracked files");
   if (untrackedResult.ok) {
     const untrackedPaths = untrackedResult.stdout
       .split("\u0000")
@@ -8356,11 +8498,38 @@ export async function buildCriticDiffText(
         ["diff", "--no-index", "--", "/dev/null", path],
         deadlineLedger,
       );
+      if (
+        (newFileDiff.exitCode !== 0 && newFileDiff.exitCode !== 1) ||
+        newFileDiff.captureComplete === false
+      )
+        throw new Error(`Review evidence incomplete: could not capture new file ${path}`);
       if (newFileDiff.stdout) chunks.push(newFileDiff.stdout);
     }
   }
 
   return chunks.join("\n");
+}
+
+export async function buildCompleteWorkerReviewDiff(
+  repo: string,
+  paths: string[],
+  maxBytes: number,
+  ledger?: JobDeadlineLedger,
+  taskIntent = "",
+): Promise<string> {
+  const base = await gitDuringJobWork(repo, ["rev-parse", "HEAD"], ledger);
+  const evidence = buildCompleteReviewEvidence({
+    diff: await buildCriticDiffText(repo, paths, ledger),
+    maxBytes,
+    expectedPaths: publishableChangedPaths(paths),
+    captureComplete: true,
+    ...(base.ok ? { baseSha: base.stdout.trim() } : {}),
+  });
+  assertCompleteReviewEvidence(evidence);
+  const hygiene = analyzeTestHygieneDiff(evidence.diff, {
+    allowTestRemoval: testRemovalExplicitlyRequested(taskIntent),
+  });
+  return `Patch manifest: ${JSON.stringify(evidence.manifest)}\n${[...hygiene.blockingIssues, ...hygiene.semanticReviewNotes].join("\n")}\n\n${evidence.diff}`;
 }
 
 async function trackedPathHasGitContentDelta(
@@ -9139,7 +9308,7 @@ function inferCommitArea(
   if (pick("apps/source_control_manager/")) return "source_control_manager";
   if (pick("apps/client/")) return "client";
   if (pick("apps/server/")) return "server";
-  if (pick("README.md") || pick("docs/")) return "docs";
+  if (targets.length > 0 && targets.every(isDocPath)) return "docs";
   return inferRepoNativeCommitArea(targets) ?? "repo";
 }
 
@@ -10538,6 +10707,59 @@ function buildCommitMessageGeneratorPrompt(
   return { systemPrompt, userMessage };
 }
 
+export function resolveIsolatedCodexCommandPrefix(repo: string, prefix: string[]): string[] {
+  return prefix.map((arg, index) => {
+    if (arg.startsWith("-") || isAbsolute(arg) || /^[A-Za-z]:[\\/]/.test(arg)) return arg;
+    const explicitRelative = /^(?:\.{1,2}[\\/])/.test(arg);
+    const pathLike = /[\\/]/.test(arg) && !arg.includes("://");
+    // Preserve package specs (bun x @scope/package) and ordinary flags. A
+    // script/executable already found relative to the repo must keep that
+    // identity after the caller moves into a neutral working directory.
+    if (explicitRelative || (pathLike && (index === 0 || existsSync(resolve(repo, arg)))))
+      return resolve(repo, arg);
+    return arg;
+  });
+}
+
+export function buildCommitMessageCodexCommand(
+  prefix: string[],
+  model: string,
+  outputPath: string,
+): string[] {
+  return [
+    ...prefix,
+    "-c",
+    'model_reasoning_effort="low"',
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "project_doc_fallback_filenames=[]",
+    "-c",
+    'web_search="disabled"',
+    "--strict-config",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "apps",
+    "-a",
+    "never",
+    "-s",
+    "read-only",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--json",
+    "--color",
+    "never",
+    "--output-last-message",
+    outputPath,
+    ...(model ? ["-m", model] : []),
+    "-",
+  ];
+}
+
 async function generateCommitMessageFromDiffViaCodex(
   prompt: CommitMessagePrompt,
   opts: { type: string; area: string },
@@ -10558,39 +10780,23 @@ async function generateCommitMessageFromDiffViaCodex(
     ? finalizationLedger.capTotalTimeout(configuredTimeoutMs)
     : configuredTimeoutMs;
   if (timeoutMs <= 0) return null;
-  const reasoningEffort = normalizeCodexReasoningEffort(
-    runtimeConfig.workerpals.llm.reasoningEffort,
+  // Supplied evidence only: no project instructions, tools or session history.
+  const neutralWorkspace = mkdtempSync(resolve(tmpdir(), "pushpals-commit-neutral-"));
+  const tmpOutputPath = resolve(neutralWorkspace, "last-message.txt");
+  const cmd = buildCommitMessageCodexCommand(
+    resolveIsolatedCodexCommandPrefix(repo, codexPrefix),
     model,
-  );
-  const tmpOutputPath = resolve(
-    Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp",
-    `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
-  );
-  const cmd = [
-    ...codexPrefix,
-    "-c",
-    `model_reasoning_effort="${reasoningEffort}"`,
-    "-a",
-    "never",
-    "-s",
-    "read-only",
-    "exec",
-    "--color",
-    "never",
-    "--output-last-message",
     tmpOutputPath,
-  ];
-  if (model) cmd.push("-m", model);
-  cmd.push("-");
+  );
 
   const env = buildWorkerSandboxWritableEnv(repo);
-  const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
   const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
   let callStarted = false;
+  const callStartedAt = performance.now();
   try {
     callStarted = true;
     const processResult = await runBoundedWorkerProcess(cmd, {
-      cwd: repo,
+      cwd: neutralWorkspace,
       env,
       stdin: new Blob([stdinText]),
       timeoutMs,
@@ -10603,16 +10809,34 @@ async function generateCommitMessageFromDiffViaCodex(
     } catch {
       content = "";
     }
-    if (!content) {
-      content = processResult.stdout.trim();
-    }
-    const usageAttempt = estimatedCommitMessageUsageAttempt({
+    const usageAttempt = codexUsageAttempt({
+      jsonl: processResult.stdout,
       promptChars: stdinText.length,
-      completionChars: content.length + processResult.stderr.length,
-      backend: "commit_message_codex",
+      finalMessage: content,
+      stage: "finalization",
+      source: "commit_message_codex",
+      attempt: 1,
       modelId: model,
       timedOut: processResult.timedOut || processResult.drainTimedOut,
     });
+    console.info(
+      `[WorkerPals] commitMessageOutcome=${JSON.stringify({
+        status: processResult.timedOut
+          ? "timeout"
+          : processResult.drainTimedOut
+            ? "drain_timeout"
+            : processResult.exitCode !== 0
+              ? "process_error"
+              : content
+                ? "response_received"
+                : "empty_response",
+        configuredTimeoutMs,
+        timeoutMs,
+        exitCode: processResult.exitCode,
+        elapsedMs: Math.round(performance.now() - callStartedAt),
+        usageSource: usageAttempt.estimated ? "text_estimate" : "provider",
+      })}`,
+    );
     if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
       return { message: null, usageAttempts: [usageAttempt] };
     }
@@ -10633,9 +10857,8 @@ async function generateCommitMessageFromDiffViaCodex(
         }
       : null;
   } finally {
-    restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
-      unlinkSync(tmpOutputPath);
+      rmSync(neutralWorkspace, { recursive: true, force: true });
     } catch {
       // ignore
     }
@@ -11350,11 +11573,12 @@ async function runCodexCriticReview(
   const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
 
   const buildCriticInstruction = async (compact: boolean) => {
-    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
-    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
-      0,
-      resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
+    const diffText = await buildCompleteWorkerReviewDiff(
+      repo,
+      criticChangedPaths,
+      resolveQualityCriticMaxDiffChars(runtimeConfig),
+      deadlineLedger,
+      instruction,
     );
     const validationSummary = buildCriticValidationSummary(
       quality,
@@ -11399,6 +11623,7 @@ async function runCodexCriticReview(
       "-a",
       "never",
       "exec",
+      "--json",
       "-s",
       "read-only",
       "--color",
@@ -11448,12 +11673,20 @@ async function runCodexCriticReview(
       retainOutputTail: true,
     });
 
+    let finalMessageForUsage = "";
+    try {
+      finalMessageForUsage = (await Bun.file(tmpOutputPath).text()).trim();
+    } catch {
+      /* unavailable */
+    }
     usageAttempts.push(
-      estimatedCriticUsageAttempt({
+      codexUsageAttempt({
+        jsonl: processResult.stdout,
         promptChars: payload.promptChars,
-        completionChars: processResult.stdout.length + processResult.stderr.length,
-        backend: "quality_critic_codex",
-        modelId: criticModel || undefined,
+        finalMessage: finalMessageForUsage,
+        stage: "critic",
+        source: "quality_critic_codex",
+        modelId: criticModel,
         attempt,
         timedOut: processResult.timedOut || processResult.drainTimedOut,
       }),
@@ -11893,6 +12126,7 @@ export async function executeJob(
       ...terminalResult,
       diagnostics: {
         ...(terminalResult.diagnostics ?? {}),
+        attempts: [...diagnosticExecutorAttempts, ...(terminalResult.diagnostics?.attempts ?? [])],
         validationRuns: [
           ...new Set([
             ...diagnosticValidationRuns,
@@ -11917,6 +12151,7 @@ export async function executeJob(
   const passingValidationCache = new Map<string, ValidationExecutionResult>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns: JobValidationRunDiagnostics[] = [];
+  const diagnosticExecutorAttempts: NonNullable<JobDiagnostics["attempts"]> = [];
   const diagnosticPatchSnapshots: JobPatchSnapshotDiagnostics[] = [];
   const diagnosticQualityReviews: Record<string, unknown>[] = [];
   let nextQualityRevisionExecuteBudgets: {
@@ -12000,6 +12235,8 @@ export async function executeJob(
           exitCode: 124,
         });
       }
+      const executorCallStartedAt = Date.now();
+      const executorCallStartedMonotonic = performance.now();
       const currentResult = await runExecutor(
         kind,
         attemptParams,
@@ -12008,6 +12245,20 @@ export async function executeJob(
         onLog,
         currentExecuteBudgets,
       );
+      const commandTimings = durableCodexCommandTimings(
+        currentResult.diagnostics?.metadata?.codexCommandTimings,
+      );
+      if (commandTimings)
+        diagnosticExecutorAttempts.push({
+          attempt: revisionAttempt,
+          backend: executor,
+          startedAt: new Date(executorCallStartedAt).toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationMs: Math.round(performance.now() - executorCallStartedMonotonic),
+          exitCode: currentResult.exitCode,
+          terminalReason: currentResult.ok ? "executor_completed" : "executor_failed",
+          metadata: { mergeConflictPass, codexCommandTimings: commandTimings },
+        });
       if ((currentResult.usageAttempts?.length ?? 0) > 0) {
         usageAccumulator.addAttempts(currentResult.usageAttempts);
       } else {

@@ -520,7 +520,8 @@ function sanitizeToolRunMetadata(value: unknown, depth = 0): unknown {
 
 const MAX_JOB_DIAGNOSTIC_ATTEMPTS = 8;
 const MAX_JOB_DIAGNOSTIC_PHASE_SPANS = 32;
-const MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS = 20;
+const MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS = 200;
+const MAX_FINAL_VALIDATION_RUNS = 32;
 const MAX_JOB_DIAGNOSTIC_PATCH_SNAPSHOTS = 20;
 const MAX_JOB_DIAGNOSTIC_PATH_SAMPLE = 50;
 
@@ -4321,7 +4322,7 @@ export class JobQueue {
           ? Number.isSafeInteger(finalCount) && finalCount === finalRuns.length
           : finalRevision === undefined && finalCount === undefined;
         const completeCommands =
-          rawRuns.length <= MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS &&
+          finalRuns.length <= MAX_FINAL_VALIDATION_RUNS &&
           completeFinalRevision &&
           finalRuns.every((run) => {
             const record = recordFromUnknown(run);
@@ -6658,6 +6659,8 @@ export class JobQueue {
       `COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
         json_extract(${alias}.metadataJson, '$.validationTarget') END, 'candidate') != 'baseline'`;
     const executedObservation = (alias: string) => `${candidateObservation(alias)}
+      AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.executionState') END, 'executed') NOT IN ('deferred', 'not_started')
       AND NOT (COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
         json_extract(${alias}.metadataJson, '$.source') END, '') = 'worker'
         AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN

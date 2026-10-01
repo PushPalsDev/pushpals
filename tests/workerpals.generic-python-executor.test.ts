@@ -7,6 +7,7 @@ import { loadPushPalsConfig } from "shared";
 import { createPythonPayloadTransport } from "../apps/workerpals/src/common/python_payload_transport";
 import {
   createGenericPythonExecutor,
+  coerceCodexCommandTimings,
   normalizeGenericPythonExecutorParsedResultForTimeout,
   resolveGenericPythonExecutorScriptPath,
   resolveGenericPythonExecutorChildTimeoutEnv,
@@ -17,6 +18,40 @@ import {
 import { inferWorkerTerminalFailureClass } from "../apps/workerpals/src/workerpals_main";
 
 describe("python payload transport", () => {
+  test("command timing metadata is allowlisted, bounded and honest about missing durations", () => {
+    const command = {
+      commandId: "command-1",
+      category: "validation",
+      digest: "a".repeat(64),
+      durationMs: 12,
+      observedDurationMs: 12,
+      incomplete: false,
+      exitCode: 0,
+      command: "secret-token",
+      providerId: "private-provider-id",
+    };
+    const timing = coerceCodexCommandTimings({
+      schemaVersion: 1,
+      attempts: Array.from({ length: 8 }, (_, index) => ({
+        attempt: index + 1,
+        commands: Array(100).fill(command),
+      })),
+    })!;
+    const encoded = JSON.stringify(timing);
+    expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(12_000);
+    expect(encoded).not.toContain("secret-token");
+    expect(encoded).not.toContain("private-provider-id");
+    expect(timing.attempts as unknown[]).toHaveLength(4);
+    expect(timing.omittedAttempts).toBe(4);
+    const unknown = coerceCodexCommandTimings({
+      schemaVersion: 1,
+      attempts: [{ attempt: 1, commands: [{ ...command, durationMs: null }] }],
+    }) as any;
+    expect(unknown.attempts[0].commands[0].durationMs).toBeNull();
+    expect(unknown.attempts[0].commands[0].incomplete).toBe(true);
+    expect(coerceCodexCommandTimings({ schemaVersion: 2, attempts: [] })).toBeUndefined();
+  });
+
   test("keeps large executor payloads out of process argv", () => {
     const payloadBase64 = "x".repeat(256 * 1024);
     const transport = createPythonPayloadTransport(payloadBase64);
@@ -36,6 +71,40 @@ describe("python payload transport", () => {
 });
 
 describe("generic python executor timeout resolution", () => {
+  test.each([false, true])(
+    "retains sanitized command timings across parsed result transport (timedOut=%s)",
+    async (timedOut) => {
+      const resultPrefix = "__PUSHPALS_TIMING_RESULT__ ";
+      const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+      const execute = createGenericPythonExecutor({
+        backendName: "test",
+        scriptPath: process.execPath,
+        pythonConfigKey: "testPython",
+        timeoutConfigKey: "testTimeoutMs",
+        processRunner: (async () => ({
+          stdout: `${resultPrefix}${JSON.stringify({ ok: true, summary: "completed", exitCode: 0, diagnostics: { metadata: { codexCommandTimings: { schemaVersion: 1, attempts: [{ attempt: 1, commands: [{ commandId: "command-1", category: "validation", durationMs: 40, observedDurationMs: 40, incomplete: false, exitCode: 0, secret: "do-not-store" }] }] } } } })}\n`,
+          stderr: "",
+          exitCode: 0,
+          timedOut,
+        })) as never,
+      });
+      const runtimeConfig = {
+        ...baseConfig,
+        workerpals: {
+          ...baseConfig.workerpals,
+          testPython: process.execPath,
+          testTimeoutMs: 10_000,
+          executorResultPrefix: resultPrefix,
+        },
+      } as never;
+      const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+      expect(result.ok).toBe(!timedOut);
+      const timings = result.diagnostics?.metadata?.codexCommandTimings as any;
+      expect(timings.attempts[0].commands[0].durationMs).toBe(40);
+      expect(JSON.stringify(timings)).not.toContain("do-not-store");
+    },
+  );
+
   test("keeps a quiet executor alive across progress ticks and clears the timer", async () => {
     const root = join(tmpdir(), `pushpals-generic-executor-${randomUUID()}`);
     const scriptPath = join(root, "quiet-wrapper.ts");

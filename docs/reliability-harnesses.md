@@ -104,6 +104,15 @@ generic runtime-upgrade/restart instruction; probe deadlines and termination
 thresholds remain unchanged. Probe telemetry separates client-observed
 `probeDurationMs` and configured `probeTimeoutMs` from `outageAgeMs`, which is
 zero for the first failure and is not request latency.
+Server liveness runs before request logging and uses only in-memory diagnostics.
+Selected heartbeat, claim, RepositoryAgent, and autonomy operations expose fixed
+stage labels, separating request-body waits from synchronous store work. No
+request identifiers, bodies, paths, or raw errors are added to those spans.
+CLI health/recovery envelopes include bounded supervisor log-sink write timing
+and failure counters. The sink observer is memory-only and never recursively
+logs a slow or failed write. These observations help distinguish plausible stall
+boundaries; they do not prove the cause of a pause or change health deadlines,
+restart policy, or continuous-uptime claims.
 These regressions run in Linux/Windows CLI CI and
 Windows release validation as well as the reliability harness.
 
@@ -270,6 +279,38 @@ cannot label their own validation as trusted-host evidence or replace SCM's
 persisted results. The separate cross-job circuit threshold is unchanged.
 
 ### Metrics
+
+Validation observations distinguish `executed`, `deferred`, and `not_started`.
+A deferred or skipped gate remains mandatory but is not a failed process; its
+durable exit code is null. Reliability metrics expose these counts separately
+and compute failure-evidence coverage only over executed failures. Legacy
+worker-to-host deferrals are recognized by source/capability, never by guessing
+from an exit code such as 125.
+
+Codex critic and commit-message calls use JSON terminal usage when available.
+Fallback estimates count supplied/final text only, not stderr, tool output, or
+echoed prompts. Terminal diagnostics separate provider-reported and estimated
+tokens, retain the latest 50 call details, and disclose omitted detail counts.
+These records describe the job's aggregate usage event, not extra usage to add
+to the hourly budget. Cached input/reasoning counters are subsets, not additive.
+
+Executor attempts retain bounded command-category timings, generated IDs and
+digests without raw commands. Worker validation and trusted-host validation
+share bounded aggregate substep observations. Incomplete timing observations
+never prove pass/fail or extend a deadline. Periodic worker status messages do
+not reset the measured age of actual child output.
+
+Workers and final PR review require complete patch evidence. The legacy
+`quality_critic_max_diff_chars` key now sets a UTF-8 byte budget (default 65,536);
+compact retries shorten logs, not the patch. Oversized, truncated or binary
+patch evidence is held rather than silently reviewed as a prefix. Test-suite
+parameterization and case renames require semantic review rather than a
+mechanical assertion that runnable coverage disappeared.
+
+Existing local overrides are preserved. If an older local configuration pins
+`quality_critic_max_diff_chars = 16000`, set it to `65536` to adopt the new
+default budget, or retain a deliberate smaller budget and split larger jobs.
+An evidence hold identifies the actual UTF-8 size and configured limit.
 
 Worker phase intervals inferred from logs use `transitioned` when a later phase
 was observed. This describes an interval boundary, not a successful test result;

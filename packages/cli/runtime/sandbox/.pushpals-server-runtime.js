@@ -10164,6 +10164,16 @@ function sanitizeDiscoveryProgress(value) {
   return {
     page,
     pageCount,
+    ...value.window === undefined ? {} : { window: integer("window", 1, 6667) },
+    ...value.windowCount === undefined ? {} : { windowCount: integer("windowCount", 1, 6667) },
+    ...value.globalPage === undefined ? {} : { globalPage: integer("globalPage", 1, 6667) },
+    ...typeof value.outcome === "string" && [
+      "candidates_found",
+      "no_actionable_candidate",
+      "insufficient_evidence",
+      "delivery_deferred"
+    ].includes(value.outcome) ? { outcome: value.outcome } : {},
+    ...typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt)) ? { retryAt: value.retryAt } : {},
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
     retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
@@ -11465,7 +11475,7 @@ var DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
-var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 65536;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 var DEFAULT_WORKERPALS_EXECUTION_PLATFORM = "auto";
@@ -12588,7 +12598,7 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
   "-F"
 ]);
 // packages/shared/src/trusted_validation.ts
-var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
+var MAX_TRUSTED_VALIDATION_COMMANDS = 32;
 var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
   "bazel",
@@ -13227,7 +13237,8 @@ function sanitizeToolRunMetadata(value, depth = 0) {
 }
 var MAX_JOB_DIAGNOSTIC_ATTEMPTS = 8;
 var MAX_JOB_DIAGNOSTIC_PHASE_SPANS = 32;
-var MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS = 20;
+var MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS = 200;
+var MAX_FINAL_VALIDATION_RUNS = 32;
 var MAX_JOB_DIAGNOSTIC_PATCH_SNAPSHOTS = 20;
 var MAX_JOB_DIAGNOSTIC_PATH_SAMPLE = 50;
 function recordFromUnknown(value) {
@@ -15841,7 +15852,7 @@ class JobQueue {
         const hasFinalRevision = Number.isSafeInteger(finalRevision) && Number(finalRevision) >= 0;
         const finalRuns = hasFinalRevision ? rawRuns.filter((run) => recordFromUnknown(run)?.attempt === finalRevision) : rawRuns;
         const completeFinalRevision = hasFinalRevision ? Number.isSafeInteger(finalCount) && finalCount === finalRuns.length : finalRevision === undefined && finalCount === undefined;
-        const completeCommands = rawRuns.length <= MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS && completeFinalRevision && finalRuns.every((run) => {
+        const completeCommands = finalRuns.length <= MAX_FINAL_VALIDATION_RUNS && completeFinalRevision && finalRuns.every((run) => {
           const record = recordFromUnknown(run);
           return typeof record?.command === "string" && record.command.length <= 1000;
         }) ? finalRuns.map((run) => run.command) : null;
@@ -17264,6 +17275,8 @@ class JobQueue {
     const candidateObservation = (alias) => `COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
         json_extract(${alias}.metadataJson, '$.validationTarget') END, 'candidate') != 'baseline'`;
     const executedObservation = (alias) => `${candidateObservation(alias)}
+      AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.executionState') END, 'executed') NOT IN ('deferred', 'not_started')
       AND NOT (COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
         json_extract(${alias}.metadataJson, '$.source') END, '') = 'worker'
         AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
@@ -19211,6 +19224,30 @@ function buildReviewPublicationValidationPlan(options) {
 }
 
 // apps/server/src/completions.ts
+function exactOrdinaryPublicationValidationHold(value, completion, jobParams) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const input = value;
+  try {
+    const review = JSON.parse(jobParams)?.reviewAgent;
+    if (["review_fix", "merge_conflict"].includes(String(review?.resolutionType)))
+      return null;
+  } catch {
+    return null;
+  }
+  if (completion.branch?.startsWith("refs/pushpals/review/"))
+    return null;
+  if (input.version !== 1 || input.code !== "publication_validation_unavailable" || input.scope !== "ordinary_completion" || input.workerCandidateSha !== completion.commitSha || typeof input.workerCandidateSha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(input.workerCandidateSha) || typeof input.retainedCandidateSha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(input.retainedCandidateSha) || typeof input.retainedCandidateRef !== "string")
+    return null;
+  return {
+    version: 1,
+    code: "publication_validation_unavailable",
+    scope: "ordinary_completion",
+    workerCandidateSha: input.workerCandidateSha,
+    retainedCandidateSha: input.retainedCandidateSha,
+    retainedCandidateRef: input.retainedCandidateRef
+  };
+}
 function exactPublicationOutcome(value, jobParams) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
@@ -19371,12 +19408,21 @@ function normalizeTrustedValidationReport(value) {
   const candidateSha = trustedValidationText(input.candidateSha, 128) || null;
   const candidateRef = trustedValidationText(input.candidateRef, 512) || null;
   const hasExactCandidateProvenance = Boolean(candidateSha && candidateRef);
+  const binding = input.treeBinding && typeof input.treeBinding === "object" ? input.treeBinding : null;
+  const treeSha = (value2) => typeof value2 === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value2) ? value2.toLowerCase() : null;
   return {
     version: 1,
     baselineSha: trustedValidationText(input.baselineSha, 128) || null,
     candidateSha: hasExactCandidateProvenance ? candidateSha : null,
     candidateRef: hasExactCandidateProvenance ? candidateRef : null,
-    results
+    results,
+    ...binding && (binding.planSource === "identical_worker_tree" || binding.planSource === "full_worker_plan") ? {
+      treeBinding: {
+        workerTreeSha: treeSha(binding.workerTreeSha),
+        candidateTreeSha: treeSha(binding.candidateTreeSha),
+        planSource: binding.planSource
+      }
+    } : {}
   };
 }
 function trustedValidationFailureFingerprint(result) {
@@ -20006,7 +20052,7 @@ class CompletionQueue {
            WHERE id = ? AND status = 'pending'`).run(pusherId, claimToken, now, leaseExpiresAt, now, now, row.id);
       const claimed = this.getCompletion(row.id);
       if (claimed) {
-        const plan = this.snapshotReviewValidationPlan(claimed, now);
+        const plan = this.snapshotPublicationValidationPlan(claimed, now);
         if (plan)
           claimed.reviewValidationPlan = plan;
       }
@@ -20236,7 +20282,8 @@ class CompletionQueue {
         };
       }
       const publicationOutcome = publicationOutcomeInput === undefined ? null : exactPublicationOutcome(publicationOutcomeInput, job.params);
-      if (publicationOutcomeInput !== undefined && !publicationOutcome) {
+      const ordinaryHold = exactOrdinaryPublicationValidationHold(publicationOutcomeInput, completion, job.params);
+      if (publicationOutcomeInput !== undefined && !publicationOutcome && !ordinaryHold) {
         return { ok: false, message: "Invalid exact publication outcome evidence" };
       }
       const superseded = publicationOutcome?.code === "publication_superseded";
@@ -20248,19 +20295,21 @@ class CompletionQueue {
         if (!lifecycle)
           return { ok: false, message: "Publication no longer owns its exact repair lifecycle" };
       }
-      if (conflict) {
+      const retainedHold = conflict ?? ordinaryHold;
+      if (retainedHold) {
         const namespace = `refs/pushpals/validation/${createHash6("sha256").update(completion.id).digest("hex").slice(0, 32)}/`;
-        const suffix = conflict.retainedCandidateRef.startsWith(namespace) ? conflict.retainedCandidateRef.slice(namespace.length) : "";
+        const suffix = retainedHold.retainedCandidateRef.startsWith(namespace) ? retainedHold.retainedCandidateRef.slice(namespace.length) : "";
         const match = suffix.match(/^([1-9][0-9]*)\/candidate$/);
         const generation = Number(match?.[1]);
-        if (!match || !Number.isSafeInteger(generation) || generation > completion.claimGeneration || trustedReport?.candidateSha !== conflict.retainedCandidateSha || trustedReport?.candidateRef !== conflict.retainedCandidateRef) {
+        if (!match || !Number.isSafeInteger(generation) || generation > completion.claimGeneration || trustedReport?.candidateSha !== retainedHold.retainedCandidateSha || trustedReport?.candidateRef !== retainedHold.retainedCandidateRef) {
           return {
             ok: false,
             message: "Publication hold requires this completion's exact retained checkpoint evidence"
           };
         }
       }
-      const retainedFailure = publicationOutcome ? JSON.stringify({ message: failure, publicationOutcome }) : failure;
+      const retainedOutcome = publicationOutcome ?? ordinaryHold;
+      const retainedFailure = retainedOutcome ? JSON.stringify({ message: failure, publicationOutcome: retainedOutcome }) : failure;
       const completionUpdated = this.db.prepare(`UPDATE completions
            SET status = 'failed',
                trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
@@ -20293,13 +20342,13 @@ class CompletionQueue {
         message: superseded ? "Candidate publication superseded" : "Candidate publication failed",
         detail: failure,
         completionId,
-        ...publicationOutcome ? { publicationOutcome } : {}
+        ...retainedOutcome ? { publicationOutcome: retainedOutcome } : {}
       }), superseded ? null : now, superseded ? now : null, now, now, completion.jobId);
       if (transitioned.changes > 0) {
         this.upsertPublicationTerminalDiagnostics({
           jobId: completion.jobId,
           status: superseded ? "abandoned" : "publish_blocked",
-          ...superseded ? { failureClass: "publication_superseded", terminalStage: "publication" } : conflict ? { failureClass: conflict.code, terminalStage: "publication" } : this.publicationFailureDiagnostics(completion),
+          ...superseded ? { failureClass: "publication_superseded", terminalStage: "publication" } : retainedHold ? { failureClass: retainedHold.code, terminalStage: "publication" } : this.publicationFailureDiagnostics(completion),
           summary: failure,
           now
         });
@@ -20319,12 +20368,12 @@ class CompletionQueue {
         durationMs: saved?.durationMs ?? undefined,
         publishBlockedAt: saved?.publishBlockedAt ?? undefined,
         ...superseded ? { publicationSuperseded: true } : {},
-        ...conflict ? { publicationHeld: true } : {}
+        ...retainedHold ? { publicationHeld: true } : {}
       };
     });
     return tx();
   }
-  snapshotReviewValidationPlan(completion, now) {
+  snapshotPublicationValidationPlan(completion, now) {
     if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").get())
       return null;
     const job = this.db.query("SELECT params, claimGeneration FROM jobs WHERE id = ?").get(completion.jobId);
@@ -20336,9 +20385,14 @@ class CompletionQueue {
     } catch {
       return null;
     }
-    const review = params?.reviewAgent;
-    if (!review || !["review_fix", "merge_conflict"].includes(String(review.resolutionType)))
-      return null;
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      return {
+        version: 1,
+        status: "invalid",
+        commands: [],
+        reason: "The job has malformed validation planning authority."
+      };
+    }
     const frozen = this.db.query(`SELECT jobId, workerClaimGeneration, candidateSha, commandsJson
       FROM completion_validation_plans WHERE completionId = ?`).get(completion.id);
     if (frozen) {
@@ -20368,7 +20422,7 @@ class CompletionQueue {
       return fields.flatMap((value) => value);
     };
     const plan = buildReviewPublicationValidationPlan({
-      complete: Boolean(snapshot && snapshot.claimGeneration === job.claimGeneration),
+      complete: Boolean(snapshot && snapshot.claimGeneration === job.claimGeneration && snapshot.commandsJson !== "null"),
       requiredValidationSteps: joinedSteps("requiredValidationSteps"),
       validationSteps: joinedSteps("validationSteps"),
       workerCommands: snapshot?.commandsJson,
@@ -20399,7 +20453,8 @@ class CompletionQueue {
       const retained = JSON.parse(completion.error ?? "null")?.publicationOutcome;
       if (retained) {
         const job = this.db.query("SELECT params FROM jobs WHERE id = ?").get(completion.jobId);
-        const outcome = job && exactPublicationOutcome(retained, job.params);
+        const fullCompletion = this.getCompletion(completion.id);
+        const outcome = job && (exactPublicationOutcome(retained, job.params) ?? (fullCompletion && exactOrdinaryPublicationValidationHold(retained, fullCompletion, job.params)));
         if (outcome)
           return { failureClass: outcome.code, terminalStage: "publication" };
       }
@@ -20472,6 +20527,7 @@ class CompletionQueue {
         baselineSha: report.baselineSha,
         candidateSha: report.candidateSha,
         candidateRef: report.candidateRef,
+        treeBinding: report.treeBinding,
         failureFingerprint: failureFingerprint2,
         failureFingerprintVersion: 3,
         failedTests,
@@ -20659,6 +20715,20 @@ class CompletionQueue {
 
 // apps/server/src/autonomy.ts
 import { Database as Database5 } from "bun:sqlite";
+
+// packages/shared/src/validation_observation.ts
+function validationObservationState(metadata) {
+  const record2 = metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : {};
+  if (record2.executionState === "deferred" || record2.executionState === "not_started")
+    return record2.executionState;
+  if (record2.executionState === "executed")
+    return "executed";
+  if (record2.source === "worker" && record2.capability === "trusted_host")
+    return "deferred";
+  return "executed";
+}
+
+// apps/server/src/autonomy.ts
 import { createHash as createHash7, randomUUID as randomUUID6 } from "crypto";
 var REPOSITORY_AGENT_MEMORY_ROLES = new Set(["analysis_cache", "evidence_fact", "recalled_fact"]);
 var REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS = 5 * 60000;
@@ -23055,11 +23125,12 @@ class AutonomyStore {
          ORDER BY v.createdAt DESC
          LIMIT 1000`).all(nowIso);
     }
-    const validationFailureRows = validationRows.filter((row) => Number(row.passed) !== 1);
+    const executedValidationRows = validationRows.filter((row) => validationObservationState(parseJsonObject(row.metadataJson)) === "executed");
+    const validationFailureRows = executedValidationRows.filter((row) => Number(row.passed) !== 1);
     let validationEvidenceCovered = 0;
     const transientRetryKeys = new Set;
     const signaturesByFingerprint = new Map;
-    for (const row of validationRows) {
+    for (const row of executedValidationRows) {
       const metadata = normalizeValidationEvidenceMetadata(parseJsonObject(row.metadataJson));
       const canonical = canonicalValidationFailureEvidence({
         command: asString3(row.command),
@@ -23132,6 +23203,9 @@ ${attempt}`);
         p95: percentileValue(durations, 95)
       },
       validationFailureRuns: validationFailureRows.length,
+      validationExecutedRuns: executedValidationRows.length,
+      validationDeferredRuns: validationRows.filter((row) => validationObservationState(parseJsonObject(row.metadataJson)) === "deferred").length,
+      validationNotStartedRuns: validationRows.filter((row) => validationObservationState(parseJsonObject(row.metadataJson)) === "not_started").length,
       validationEvidenceCoverageRate: validationFailureRows.length > 0 ? validationEvidenceCovered / validationFailureRows.length : null,
       validationFingerprintCollisionCount,
       transientValidationRetries: transientRetryKeys.size,
@@ -30113,6 +30187,13 @@ function createRequestHandler() {
         status,
         headers: { ...jsonHeaders, ...extraHeaders }
       });
+      if (pathname === "/healthz" && method === "GET") {
+        return makeJson({
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          diagnostics: runtimeDiagnostics.snapshot()
+        });
+      }
       const parseLimit = (raw, fallback = 200) => {
         const parsed = raw ? parseInt(raw, 10) : NaN;
         if (!Number.isFinite(parsed))
@@ -30647,13 +30728,6 @@ function createRequestHandler() {
         }
         return null;
       };
-      if (pathname === "/healthz" && method === "GET") {
-        return makeJson({
-          ok: true,
-          protocolVersion: PROTOCOL_VERSION,
-          diagnostics: runtimeDiagnostics.snapshot()
-        });
-      }
       if (pathname === "/admin/shutdown" && method === "POST") {
         const denied = requireAuth();
         if (denied)
@@ -30791,17 +30865,17 @@ function createRequestHandler() {
           return denied;
         let body;
         try {
-          body = await readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request");
+          body = await runtimeDiagnostics.runAsync("repository_agent.submit.body", () => readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request"));
         } catch (error) {
           const bounded = error;
           return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent request body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         try {
           const request = sanitizeRepositoryAgentRequest(body);
-          const resolved = await resolveRepositoryAgentContext({
+          const resolved = await runtimeDiagnostics.runAsync("repository_agent.context", () => resolveRepositoryAgentContext({
             canonicalRepoRoot: repositoryAgentRepoRoot,
             requested: request.repository
-          });
+          }));
           const normalizedRequest = {
             ...request,
             repository: resolved.repository,
@@ -30810,7 +30884,7 @@ function createRequestHandler() {
               ...resolved.requestedRootMapped ? { callerRootMappedToHost: true } : {}
             }
           };
-          const enqueued = repositoryAgentQueue.enqueue({
+          const enqueued = runtimeDiagnostics.run("repository_agent.enqueue.store", () => repositoryAgentQueue.enqueue({
             sessionId: request.caller.sessionId ?? "dev",
             callerService: request.caller.service,
             purpose: request.purpose,
@@ -30823,7 +30897,7 @@ function createRequestHandler() {
             deadlineAt: request.deadlineAt,
             idempotencyKey: request.idempotencyKey,
             request: normalizedRequest
-          });
+          }));
           if (!enqueued.ok || !enqueued.requestId) {
             return makeJson({
               ok: false,
@@ -30855,17 +30929,17 @@ function createRequestHandler() {
           return denied;
         let body;
         try {
-          body = await readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim");
+          body = await runtimeDiagnostics.runAsync("repository_agent.claim.body", () => readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim"));
         } catch (error) {
           const bounded = error;
           return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         const agentId = compactText4(body.agentId, 256);
         const identities = Array.isArray(body.repositoryIdentities) ? body.repositoryIdentities.map((value) => compactText4(value, 1024)).filter(Boolean) : [];
-        const claim = repositoryAgentQueue.claim(agentId, {
+        const claim = runtimeDiagnostics.run("repository_agent.claim.store", () => repositoryAgentQueue.claim(agentId, {
           leaseMs: Number(body.leaseMs),
           repositoryIdentities: identities
-        });
+        }));
         if (!claim.ok || !claim.request) {
           return makeJson({ ok: true, claim: null, pollAfterMs: 750 }, 200);
         }
@@ -30898,7 +30972,7 @@ function createRequestHandler() {
         }
         let body;
         try {
-          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`);
+          body = await runtimeDiagnostics.runAsync("repository_agent.result.body", () => readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`));
         } catch (error) {
           const bounded = error;
           return makeJson({ ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
@@ -30926,12 +31000,12 @@ function createRequestHandler() {
             if (result.analyzedRepository.identity !== requestedRepository.identity || result.analyzedRepository.revision !== requestedRepository.revision || result.analyzedRepository.tree !== requestedRepository.tree) {
               return makeJson({ ok: false, requestId, message: "RepositoryAgent result baseline mismatch" }, 409);
             }
-            const completed = repositoryAgentQueue.complete(requestId, {
+            const completed = runtimeDiagnostics.run("repository_agent.complete.store", () => repositoryAgentQueue.complete(requestId, {
               agentId,
               claimToken,
               claimGeneration,
               result
-            });
+            }));
             return completed.ok ? makeJson({ ok: true, requestId, status: "completed" }, 200) : makeJson({ ok: false, requestId, message: completed.message }, 409);
           } catch (error) {
             return makeJson({
@@ -30946,12 +31020,12 @@ function createRequestHandler() {
           message: "RepositoryAgent request failed",
           retryable: false
         };
-        const failed = repositoryAgentQueue.fail(requestId, {
+        const failed = runtimeDiagnostics.run("repository_agent.fail.store", () => repositoryAgentQueue.fail(requestId, {
           agentId,
           claimToken,
           claimGeneration,
           message: JSON.stringify(remoteError)
-        });
+        }));
         return failed.ok ? makeJson({
           ok: true,
           requestId,
@@ -31262,7 +31336,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         maybeRecoverStaleClaims();
-        const body = await req.json().catch(() => ({}));
+        const body = await runtimeDiagnostics.runAsync("job_claim.body", () => req.json().catch(() => ({})));
         const workerId = normalizeJobWorkerId(body.workerId);
         if (!workerId) {
           return makeJson({
@@ -31282,7 +31356,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         let skippedCount = 0;
         let runtimeCanaryJobId = null;
         let cachedFailureCircuit;
-        const claimNextJob = () => jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION });
+        const claimNextJob = () => runtimeDiagnostics.run("job_claim.store", () => jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION }));
         let result = claimNextJob();
         while (result.ok && result.job?.id) {
           const claimAuthority = {
@@ -31422,7 +31496,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const denied = requireAuth();
         if (denied)
           return denied;
-        const body = await req.json().catch(() => ({}));
+        const body = await runtimeDiagnostics.runAsync("worker_heartbeat.body", () => req.json().catch(() => ({})));
         const heartbeatRuntimeGeneration = compactText4(body.runtimeGeneration, 200);
         if (heartbeatRuntimeGeneration && heartbeatRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
           return makeJson({
@@ -31432,7 +31506,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             runtimeGeneration: WORKER_RUNTIME_GENERATION
           }, 409);
         }
-        const result = jobQueue.heartbeat(body);
+        const result = runtimeDiagnostics.run("worker_heartbeat.store", () => jobQueue.heartbeat(body));
         if (result.ok) {
           for (const recovered of result.recoveredJobs ?? []) {
             projectAuthoritativeClaimRecovery(recovered);
@@ -31707,7 +31781,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (!sessionId) {
           return makeJson({ ok: false, message: "sessionId is required" }, 400);
         }
-        const snapshot = autonomyStore.createSnapshot({
+        const snapshot = runtimeDiagnostics.run("autonomy_snapshot.store", () => autonomyStore.createSnapshot({
           sessionId,
           runId,
           executionCapability: summarizeWorkerExecutionCapability(jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS)),
@@ -31717,7 +31791,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             is_worktree_dirty: parseBool(url.searchParams.get("isWorktreeDirty"), false),
             is_merge_in_progress: parseBool(url.searchParams.get("isMergeInProgress"), false)
           }
-        });
+        }));
         return makeJson({ ok: true, snapshot }, 200);
       }
       if (pathname === "/autonomy/insights" && method === "GET") {
@@ -32859,13 +32933,13 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const denied = requireAuth();
         if (denied)
           return denied;
-        const body = await req.json().catch(() => ({}));
+        const body = await runtimeDiagnostics.runAsync("completion_claim.body", () => req.json().catch(() => ({})));
         const pusherId = compactText4(body.pusherId, 128);
         if (!pusherId)
           return makeJson({ ok: false, message: "pusherId is required" }, 400);
-        const result = completionQueue.claim(pusherId, {
+        const result = runtimeDiagnostics.run("completion_claim.store", () => completionQueue.claim(pusherId, {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined
-        });
+        }));
         if (result.completion) {
           const parent = jobQueue.getJob(result.completion.jobId);
           const params = parseJsonRecord2(parent?.params ?? "");

@@ -382,7 +382,7 @@ describe("server JobQueue diagnostics", () => {
             outcome: "completed",
           },
         ],
-        validationRuns: Array.from({ length: 22 }, (_, index) => ({
+        validationRuns: Array.from({ length: 202 }, (_, index) => ({
           attempt: 1,
           command: `bun test ${index}`,
           exitCode: 0,
@@ -420,7 +420,7 @@ describe("server JobQueue diagnostics", () => {
     expect(diagnostics.phaseSpans).toEqual([
       expect.objectContaining({ phase: "focused validation", durationMs: 1000 }),
     ]);
-    expect(diagnostics.validationRuns).toHaveLength(20);
+    expect(diagnostics.validationRuns).toHaveLength(200);
     expect(diagnostics.validationRuns[0]?.command).toBe("bun test 0");
     expect((diagnostics.validationRuns[0]?.stdoutTail ?? "").length).toBeLessThanOrEqual(8000);
     expect(diagnostics.patchSnapshots).toEqual([

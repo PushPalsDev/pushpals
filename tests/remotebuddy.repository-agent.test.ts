@@ -108,6 +108,7 @@ function modelResponse(overrides: Record<string, unknown> = {}): Record<string, 
     answer: "Advance the repository's documented reliability priority.",
     summary: "The vision prioritizes reliable repository-native improvements.",
     data: {
+      outcome: "candidates_found",
       candidates: [
         {
           id: "reliability-candidate",
@@ -226,7 +227,7 @@ async function seedLastCoveragePage(
 }
 
 function emptyAutonomyResponse(): Record<string, unknown> {
-  return modelResponse({ data: { candidates: [] } });
+  return modelResponse({ data: { candidates: [], outcome: "no_actionable_candidate" } });
 }
 
 function memoryWithHooks(
@@ -389,6 +390,309 @@ afterEach(() => {
 });
 
 describe("RemoteBuddy-hosted Repository Agent", () => {
+  test("supplies bounded same-revision caller evidence in one optional second call", async () => {
+    const repo = createRepository();
+    writeFileSync(
+      join(repo, "src", "caller.ts"),
+      "import { value } from './index';\nexport const publishedValue = value;\n",
+    );
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "caller",
+    ]);
+    const request = await coverageRequest(repo);
+    let calls = 0;
+    const llm = new FakeLlm(() =>
+      ++calls === 1
+        ? modelResponse({
+            data: {
+              outcome: "insufficient_evidence",
+              candidates: [],
+              evidenceRequest: {
+                windows: [{ path: "src/caller.ts", startLine: 1, endLine: 2 }],
+                literalQueries: ["publishedValue"],
+              },
+            },
+          })
+        : modelResponse({ evidence: [{ path: "src/caller.ts", startLine: 1, endLine: 2 }] }),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    const result = await worker.analyze("followup-caller", request);
+    expect(llm.calls).toHaveLength(2);
+    expect(
+      llm.calls.every((call) => call.executionContext?.repositoryMode === "isolated-evidence"),
+    ).toBe(true);
+    const extra = JSON.parse(llm.calls[1]!.messages.at(-1)!.content).hostEvidenceFollowup;
+    expect(extra.revision).toBe(request.repository.revision);
+    expect(extra.files[0].content).toContain("publishedValue");
+    expect(Buffer.byteLength(JSON.stringify(extra), "utf8")).toBeLessThanOrEqual(16_384);
+    expect(extra.repositoryExhaustivenessEstablished).toBe(false);
+    expect(result.evidence.some((entry) => entry.path === "src/caller.ts" && entry.blobHash)).toBe(
+      true,
+    );
+    expect((result.data as any).outcome).toBe("candidates_found");
+  });
+
+  test("schema repair and follow-up share a two-call ceiling", async () => {
+    const repo = createRepository();
+    const request = await coverageRequest(repo);
+    let calls = 0;
+    const llm = new FakeLlm(() =>
+      ++calls === 1
+        ? modelResponse({ data: { candidates: [], outcome: "bad" } })
+        : modelResponse({
+            data: {
+              candidates: [],
+              outcome: "insufficient_evidence",
+              evidenceRequest: {
+                windows: [{ path: "src/index.ts", startLine: 1, endLine: 1 }],
+                literalQueries: [],
+              },
+            },
+          }),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    const result = await worker.analyze("shared-call-limit", request);
+    expect(llm.calls).toHaveLength(2);
+    expect((result.data as any).outcome).toBe("insufficient_evidence");
+    expect(result.cache.key).toBeNull();
+  });
+
+  test("a followed-up negative is invalidated when an uncited search dependency changes", async () => {
+    const repo = createCoverageRepository(8);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() =>
+      ++calls % 2 === 1
+        ? modelResponse({
+            data: {
+              candidates: [],
+              outcome: "insufficient_evidence",
+              evidenceRequest: {
+                windows: [{ path: "src/index.ts", startLine: 1, endLine: 1 }],
+                literalQueries: ["futureCaller"],
+              },
+            },
+          })
+        : emptyAutonomyResponse(),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const first = await worker.analyze("dependency-first", request);
+    expect(first.discoveryProgress?.page).toBe(1);
+    expect(first.cache.key).toBeNull();
+    const [record] = await coverageRecords(memory, request);
+    expect(Object.values((record!.value as any).dependencyPathsByPage)).toContainEqual(["*"]);
+    writeFileSync(join(repo, "src", "coverage-007.ts"), "export const futureCaller = 1;\n");
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "new caller",
+    ]);
+    const next = await worker.analyze("dependency-changed", await coverageRequest(repo));
+    expect(next.discoveryProgress?.page).toBe(1);
+    expect(llm.calls).toHaveLength(4);
+  });
+
+  test("host follow-up rejects secret and untracked paths even if proposal validation is bypassed", async () => {
+    const repo = createRepository();
+    writeFileSync(join(repo, ".env"), "SECRET_MUST_NOT_LEAVE_HOST=private\n");
+    git(repo, ["add", ".env"]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "secret fixture",
+    ]);
+    const request = await coverageRequest(repo);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm: new FakeLlm(),
+      logger: quietLogger,
+    });
+    const paths = git(repo, ["ls-files", "-z"]).split("\0").filter(Boolean);
+    const result = await (worker as any).retrieveFollowupEvidence(
+      repo,
+      request,
+      { paths, pathByComparable: new Map(paths.map((path) => [path, path])) },
+      { trackedPaths: paths },
+      {
+        windows: [
+          { path: ".env", startLine: 1, endLine: 1 },
+          { path: "src/untracked.ts", startLine: 1, endLine: 1 },
+        ],
+        literalQueries: ["SECRET_MUST_NOT_LEAVE_HOST"],
+      },
+      new AbortController().signal,
+      Date.now() + 60_000,
+    );
+    expect(result.files).toEqual([]);
+    expect(result.searchScope).not.toContain(".env");
+  });
+
+  test("a changed search dependency replays only its followed-up page, not ordinary negative pages", async () => {
+    const repo = createCoverageRepository(13);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let calls = 0;
+    const llm = new FakeLlm(() =>
+      ++calls === 2
+        ? modelResponse({
+            data: {
+              candidates: [],
+              outcome: "insufficient_evidence",
+              evidenceRequest: {
+                windows: [{ path: "src/index.ts", startLine: 1, endLine: 1 }],
+                literalQueries: ["futureCaller"],
+              },
+            },
+          })
+        : emptyAutonomyResponse(),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    expect((await worker.analyze("mixed-ordinary", request)).discoveryProgress?.page).toBe(1);
+    expect((await worker.analyze("mixed-followed-up", request)).discoveryProgress?.page).toBe(2);
+    expect(llm.calls).toHaveLength(3);
+    writeFileSync(join(repo, "src", "coverage-012.ts"), "export const futureCaller = 1;\n");
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "unrelated caller",
+    ]);
+    const next = await worker.analyze("mixed-replay", await coverageRequest(repo));
+    expect(next.discoveryProgress?.page).toBe(2);
+    expect(llm.calls).toHaveLength(4);
+  });
+
+  test.each([
+    { value: null },
+    { value: [] },
+    { value: ["../outside.ts"] },
+    { value: "missing-provenance" },
+  ])(
+    "corrupt dependency metadata cannot retain a reviewed page as dependency-free proof (%j)",
+    async ({ value: corruptPaths }) => {
+      const repo = createCoverageRepository(13);
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm: new FakeLlm(emptyAutonomyResponse),
+        logger: quietLogger,
+      });
+      const first = await worker.analyze("dependency-corrupt-first", request);
+      expect(first.discoveryProgress?.page).toBe(1);
+      const [record] = await coverageRecords(memory, request);
+      const previous = record!.value as Record<string, any>;
+      const fingerprint = previous.reviewedPageFingerprints[0];
+      await memory.put(
+        {
+          ...record!,
+          value: { ...previous, dependencyPathsByPage: { [fingerprint]: corruptPaths } },
+        },
+        { expectedRevision: record!.revision },
+      );
+      const replayed = await worker.analyze("dependency-corrupt-replay", request);
+      expect(replayed.discoveryProgress?.page).toBe(1);
+      expect(replayed.discoveryProgress?.advanced).toBe(true);
+      const [repaired] = await coverageRecords(memory, request);
+      expect((repaired!.value as any).dependencyPathsByPage[fingerprint]).toBeUndefined();
+    },
+  );
+
+  test("insufficient evidence advances temporarily without durable negative caching or hot-loop calls", async () => {
+    const repo = createRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(() =>
+      modelResponse({ data: { candidates: [], outcome: "insufficient_evidence" } }),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const first = await worker.analyze("insufficient-first", request);
+    expect(first.discoveryProgress?.outcome).toBe("insufficient_evidence");
+    expect(first.discoveryProgress?.window).toBe(1);
+    expect(first.discoveryProgress?.globalPage).toBe(1);
+    expect(Date.parse(first.discoveryProgress!.retryAt!) - Date.now()).toBeGreaterThan(250_000);
+    const records = await coverageRecords(memory, request);
+    expect((records[0]!.value as any).reviewedPageFingerprints).toEqual([]);
+    expect((records[0]!.value as any).evidenceDeferrals).toHaveLength(1);
+    await worker.analyze("insufficient-second", request);
+    expect(llm.calls).toHaveLength(1);
+    expect(first.cache.key).toBeNull();
+  });
+
+  test("does not start optional retrieval without the synthesis reserve", async () => {
+    const repo = createRepository();
+    const request = await coverageRequest(repo);
+    request.deadlineAt = new Date(Date.now() + 20_000).toISOString();
+    const llm = new FakeLlm(() =>
+      modelResponse({
+        data: {
+          candidates: [],
+          outcome: "insufficient_evidence",
+          evidenceRequest: {
+            windows: [{ path: "src/index.ts", startLine: 1, endLine: 1 }],
+            literalQueries: [],
+          },
+        },
+      }),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("short-reserve", request);
+    expect(llm.calls).toHaveLength(1);
+  });
+
   test("fails closed when Git exits successfully but bounded output draining times out", () => {
     expect(() =>
       assertRepositoryGitInspectionResult(["ls-files"], {

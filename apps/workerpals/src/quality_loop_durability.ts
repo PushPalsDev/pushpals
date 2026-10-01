@@ -161,6 +161,22 @@ function normalizeUsage(usage: JobTokenUsage): JobTokenUsage {
     completionTokens,
     totalTokens: promptTokens + completionTokens,
     estimated: usage.estimated === true,
+    ...(typeof usage.cachedInputTokens === "number"
+      ? {
+          cachedInputTokens: Math.min(
+            promptTokens,
+            Math.max(0, Math.floor(usage.cachedInputTokens)),
+          ),
+        }
+      : {}),
+    ...(typeof usage.reasoningOutputTokens === "number"
+      ? {
+          reasoningOutputTokens: Math.min(
+            completionTokens,
+            Math.max(0, Math.floor(usage.reasoningOutputTokens)),
+          ),
+        }
+      : {}),
     ...(usage.backend ? { backend: usage.backend } : {}),
     ...(usage.modelId ? { modelId: usage.modelId } : {}),
   };
@@ -229,6 +245,27 @@ export class UsageAccumulator {
       usageAttempts: this.attempts(),
       diagnostics: {
         ...(result.diagnostics ?? {}),
+        terminal: {
+          ...(result.diagnostics?.terminal ?? {}),
+          metadata: {
+            ...(result.diagnostics?.terminal?.metadata ?? {}),
+            usageAttempts: this.attempts().slice(-50),
+            usageAttemptCount: this.records.length,
+            usageAttemptsTruncated: this.records.length > 50,
+            usageAttemptsDropped: Math.max(0, this.records.length - 50),
+            usageAccounting: {
+              providerReportedTokens: this.records
+                .filter((r) => !r.estimated)
+                .reduce((n, r) => n + r.promptTokens + r.completionTokens, 0),
+              estimatedTextTokens: this.records
+                .filter((r) => r.estimated)
+                .reduce((n, r) => n + r.promptTokens + r.completionTokens, 0),
+              // These are detail records for the aggregate usage event, not
+              // additional usage events to add into budgets a second time.
+              aggregation: "detail_of_job_total",
+            },
+          },
+        },
         metadata: {
           ...(result.diagnostics?.metadata ?? {}),
           usageAttemptCount: this.records.length,

@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   RuntimeDiagnostics,
+  RuntimeLogSinkDiagnostics,
   summarizeRuntimeDiagnostics,
   type RuntimeDiagnosticEvent,
   type RuntimeDiagnosticsOptions,
@@ -52,6 +53,130 @@ function fixture(
 }
 
 describe("bounded runtime diagnostics", () => {
+  test("body waits and synchronous store work remain distinct and always release active spans", async () => {
+    const f = fixture();
+    let release!: () => void;
+    const body = f.diagnostics.runAsync(
+      "worker_heartbeat.body",
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    f.advance(1500);
+    expect(f.diagnostics.snapshot().activeOperations).toEqual([
+      { stage: "worker_heartbeat.body", elapsedMs: 1500 },
+    ]);
+    release();
+    await body;
+    const sentinel = new Error("private body contents and request id");
+    expect(() =>
+      f.diagnostics.run("worker_heartbeat.store", () => {
+        expect(f.diagnostics.snapshot().activeOperations).toEqual([
+          { stage: "worker_heartbeat.store", elapsedMs: 0 },
+        ]);
+        f.advance(2000);
+        throw sentinel;
+      }),
+    ).toThrow(sentinel);
+    expect(f.diagnostics.snapshot().activeOperations).toEqual([]);
+    expect(
+      f.diagnostics
+        .snapshot()
+        .recentSlowEvents.map((event) => event.event === "runtime_slow_operation" && event.stage),
+    ).toEqual(["worker_heartbeat.body", "worker_heartbeat.store"]);
+    expect(JSON.stringify(f.diagnostics.snapshot())).not.toContain("private");
+    expect(f.pending.size).toBe(0);
+  });
+
+  test("log sink observations remain fixed-size, memory-only, and do not recursively log failures", () => {
+    let now = 0;
+    const sink = new RuntimeLogSinkDiagnostics({ now: () => now });
+    const log = spyOn(console, "log").mockImplementation(() => {
+      throw new Error("logging forbidden");
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {
+      throw new Error("logging forbidden");
+    });
+    const error = spyOn(console, "error").mockImplementation(() => {
+      throw new Error("logging forbidden");
+    });
+    try {
+      expect(
+        sink.write(() => {
+          expect(sink.snapshot().activeWrites).toBe(1);
+          now += 1500;
+        }),
+      ).toBe(true);
+      expect(
+        sink.write(() => {
+          now += 2500;
+          throw new Error("private file path and secret");
+        }),
+      ).toBe(false);
+      for (let i = 0; i < 1000; i++)
+        expect(
+          sink.write(() => {
+            now += 1;
+          }),
+        ).toBe(true);
+      const snapshot = sink.snapshot();
+      expect(snapshot).toEqual({
+        attempts: 1002,
+        failures: 1,
+        slowWrites: 2,
+        activeWrites: 0,
+        lastWriteDurationMs: 1,
+        maxWriteDurationMs: 2500,
+        lastSlowWriteAgoMs: 1000,
+        lastFailureAgoMs: 1000,
+      });
+      snapshot.failures = 999;
+      expect(sink.snapshot().failures).toBe(1);
+      expect(JSON.stringify(snapshot).length).toBeLessThan(400);
+      expect(JSON.stringify(snapshot)).not.toContain("private");
+      expect(log).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  test("failed sink clocks cannot alter the write outcome or retain active operations", () => {
+    for (const now of [
+      () => NaN,
+      () => Infinity,
+      () => {
+        throw new Error("clock failed");
+      },
+    ]) {
+      const sink = new RuntimeLogSinkDiagnostics({ now });
+      let calls = 0;
+      expect(
+        sink.write(() => {
+          calls += 1;
+        }),
+      ).toBe(true);
+      expect(
+        sink.write(() => {
+          calls += 1;
+          throw new Error("write failed");
+        }),
+      ).toBe(false);
+      expect(calls).toBe(2);
+      expect(sink.snapshot()).toMatchObject({
+        attempts: 2,
+        failures: 1,
+        activeWrites: 0,
+        lastWriteDurationMs: null,
+        maxWriteDurationMs: 0,
+        lastFailureAgoMs: null,
+      });
+    }
+  });
   test("production timers are unref'd and cancelled on stop", () => {
     let unrefs = 0;
     const timer = {

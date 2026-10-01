@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -25,6 +26,67 @@ spec.loader.exec_module(module)
 
 
 class OpenAICodexExecutorStreamingTests(unittest.TestCase):
+    def test_command_category_uses_executable_not_search_terms_or_filenames(self):
+        self.assertEqual(module._command_timing_category("rg test src"), "discovery")
+        self.assertEqual(module._command_timing_category("cat foo.test.ts"), "discovery")
+        self.assertEqual(module._command_timing_category("bun run test"), "validation")
+        self.assertEqual(module._command_timing_category("bash -lc 'bun test'"), "other")
+        self.assertEqual(module._command_timing_category("rg symbol src && bun test"), "other")
+
+    def record_command(self, trace, event, item_id, command, now, **extra):
+        module._record_command_timing({"item": {"type": "command_execution", "id": item_id, "command": command, **extra}}, event, trace, now)
+
+    def test_command_timings_pair_parallel_commands_and_ignore_duplicates(self):
+        trace = module._empty_codex_trace()
+        self.record_command(trace, "item.started", "a", "bun test", 10)
+        self.record_command(trace, "item.started", "b", "rg symbol src", 11)
+        self.record_command(trace, "item.started", "a", "bun test", 12)
+        self.record_command(trace, "item.completed", "b", "rg symbol src", 13, exit_code=0)
+        self.record_command(trace, "item.completed", "a", "bun test", 15, exit_code=1)
+        self.record_command(trace, "item.completed", "a", "bun test", 30, exit_code=0)
+        result = module._finalize_command_timings(trace, 40)
+        self.assertEqual([row["durationMs"] for row in result["commands"]], [5000, 2000])
+        self.assertEqual([row["exitCode"] for row in result["commands"]], [1, 0])
+        self.assertEqual(result["duplicateEvents"], 2)
+        self.assertIsNone(trace["last_command_activity_at"])
+        self.assertIsNone(trace["last_meaningful_progress_at"])
+
+    def test_command_timings_report_missing_start_and_interrupted_commands(self):
+        trace = module._empty_codex_trace()
+        self.record_command(trace, "item.completed", "missing", "bun test", 12, exit_code=0)
+        self.record_command(trace, "item.started", "interrupted", "npm install", 14)
+        records = module._finalize_command_timings(trace, 20)["commands"]
+        self.assertTrue(all(row["incomplete"] for row in records))
+        self.assertIsNone(records[0]["durationMs"])
+        self.assertIsNone(records[1]["durationMs"])
+        self.assertEqual(records[1]["observedDurationMs"], 6000)
+
+    def test_command_timings_are_bounded_and_do_not_persist_secrets_or_external_ids(self):
+        trace = module._empty_codex_trace()
+        secret = "PRIVATE_TOKEN_MUST_NOT_BE_STORED"
+        for index in range(1000):
+            self.record_command(trace, "item.started", f"{secret}-{index}", f"curl -H 'Authorization: Bearer {secret}'", index)
+        result = module._finalize_command_timings(trace, 1001)
+        self.assertEqual(len(result["commands"]), 64)
+        self.assertEqual(result["omittedEvents"], 936)
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn("curl", json.dumps(result))
+        self.assertEqual(result["commands"][0]["commandId"], "command-1")
+
+    def test_command_timings_do_not_invent_pairing_for_missing_ids_or_invalid_clocks(self):
+        trace = module._empty_codex_trace()
+        self.record_command(trace, "item.started", None, "cat README", 1)
+        self.record_command(trace, "item.started", "x" * 513, "cat README", 1)
+        self.record_command(trace, "item.started", "invalid", "cat README", float("nan"))
+        self.record_command(trace, "item.started", "clock", {"not": "a command"}, 10)
+        self.record_command(trace, "item.completed", "clock", "cat README", 9, exit_code=True)
+        result = module._finalize_command_timings(trace, 20)
+        self.assertEqual(result["malformedEvents"], 3)
+        self.assertEqual(len(result["commands"]), 1)
+        self.assertIsNone(result["commands"][0]["durationMs"])
+        self.assertIsNone(result["commands"][0]["exitCode"])
+        self.assertTrue(result["commands"][0]["incomplete"])
+
     def test_git_repo_probe_retries_transient_failure(self) -> None:
         calls = []
         original_run = module.subprocess.run

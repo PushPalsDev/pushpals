@@ -6,6 +6,20 @@ import {
 } from "../scripts/reliability-harness";
 
 describe("reliability harness release coverage", () => {
+  test("gates bounded command observability and complete review evidence", () => {
+    expect(listReliabilityHarnessPhaseFiles("worker_command_observability")).toContain(
+      "tests/openai_codex_executor_streaming.test.py",
+    );
+    expect(listReliabilityHarnessPhaseFiles("quality_loop")).toContain(
+      "tests/workerpals.observation-regressions.test.ts",
+    );
+    expect(listReliabilityHarnessPhaseFiles("repair_orchestration")).toContain(
+      "tests/shared.review-evidence.test.ts",
+    );
+    expect(listReliabilityHarnessPhaseFiles("repository_intelligence")).toContain(
+      "tests/remotebuddy.repository-evidence-followup.test.ts",
+    );
+  });
   test("gates RepositoryAgent liveness, durable memory, and autonomy integration", () => {
     const files = listReliabilityHarnessPhaseFiles("repository_intelligence");
 

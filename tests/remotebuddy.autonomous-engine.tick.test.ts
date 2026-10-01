@@ -2194,7 +2194,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
             text: JSON.stringify({
               answer: "Inspect the catalog empty-state label.",
               summary: "A tracked catalog label needs a bounded repair.",
-              data: { candidates: [candidate] },
+              data: { candidates: [candidate], outcome: "candidates_found" },
               confidence: 0.95,
               evidence: [
                 { path: target, startLine: 2, endLine: 2, rationale: "Observed catalog label" },
@@ -2327,7 +2327,10 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
           await engine.tick();
           if (page < rejectedPages) {
             expect((engine as any).lastDetail).toBe("no_eligible_candidates");
-            expect(workerResults[page]!.data).toEqual({ candidates: [] });
+            expect(workerResults[page]!.data).toEqual({
+              candidates: [],
+              outcome: "no_actionable_candidate",
+            });
             expect(requests.countByStatus().pending).toBe(0);
             expect(planningCalls).toBe(0);
             const records = await memory.search({

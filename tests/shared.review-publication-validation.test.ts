@@ -8,6 +8,7 @@ import {
   reviewPublicationFailureDisposition,
   ReviewPublicationDeferredError,
 } from "../apps/source_control_manager/src/review_publication_recovery";
+import { MAX_TRUSTED_VALIDATION_COMMANDS } from "../packages/shared/src/trusted_validation";
 
 describe("reconciled review validation authority", () => {
   test("reruns passed and deferred gates on every changed or restored candidate", () => {
@@ -91,6 +92,17 @@ describe("reconciled review validation authority", () => {
       workerCommands: ["git diff --check"],
     };
     expect(buildReviewPublicationValidationPlan(options).status).toBe("ready");
+    const boundedCommands = Array.from(
+      { length: MAX_TRUSTED_VALIDATION_COMMANDS },
+      (_, i) => `bun test tests/gate-${i}.test.ts`,
+    );
+    expect(
+      buildReviewPublicationValidationPlan({ ...options, workerCommands: boundedCommands }),
+    ).toEqual({
+      version: 1,
+      status: "ready",
+      commands: boundedCommands,
+    });
     expect(buildReviewPublicationValidationPlan({ ...options, complete: false }).status).toBe(
       "pending",
     );
@@ -99,7 +111,12 @@ describe("reconciled review validation authority", () => {
       { workerCommands: ["bun test && git diff --check"] },
       { workerCommands: [] },
       { workerCommands: ["bun test tests/Case.test.ts", "bun test tests/case.test.ts"] },
-      { workerCommands: Array.from({ length: 9 }, (_, i) => `bun test tests/gate-${i}.test.ts`) },
+      {
+        workerCommands: Array.from(
+          { length: MAX_TRUSTED_VALIDATION_COMMANDS + 1 },
+          (_, i) => `bun test tests/gate-${i}.test.ts`,
+        ),
+      },
     ]) {
       const plan = buildReviewPublicationValidationPlan({ ...options, ...invalid });
       expect(plan.status).toBe("invalid");

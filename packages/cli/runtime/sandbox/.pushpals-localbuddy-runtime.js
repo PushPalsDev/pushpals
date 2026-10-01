@@ -1982,6 +1982,16 @@ function sanitizeDiscoveryProgress(value) {
   return {
     page,
     pageCount,
+    ...value.window === undefined ? {} : { window: integer("window", 1, 6667) },
+    ...value.windowCount === undefined ? {} : { windowCount: integer("windowCount", 1, 6667) },
+    ...value.globalPage === undefined ? {} : { globalPage: integer("globalPage", 1, 6667) },
+    ...typeof value.outcome === "string" && [
+      "candidates_found",
+      "no_actionable_candidate",
+      "insufficient_evidence",
+      "delivery_deferred"
+    ].includes(value.outcome) ? { outcome: value.outcome } : {},
+    ...typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt)) ? { retryAt: value.retryAt } : {},
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
     retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
@@ -3005,7 +3015,7 @@ var DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
-var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 65536;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 var DEFAULT_WORKERPALS_EXECUTION_PLATFORM = "auto";

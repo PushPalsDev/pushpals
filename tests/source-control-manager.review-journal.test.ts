@@ -50,12 +50,15 @@ class ReviewHarness {
   malformedLifecycle = false;
   lifecycleStateOverride: unknown = undefined;
   beforeReview: (() => void) | null = null;
+  beforeDiff: (() => void) | null = null;
   beforeProviderProbe: (() => void) | null = null;
   targetBaseSha: string | null = null;
   targetLookupFailure = false;
   targetLookups = 0;
   mergedExpectedHead: string | undefined;
   score = 7.8;
+  diff =
+    "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-old\n+new\n";
   pr: GitHubPR = {
     number: 42,
     html_url: "https://github.com/org/repo/pull/42",
@@ -104,8 +107,10 @@ class ReviewHarness {
         },
         listRecentlyClosedPullRequests: async () => [],
         listPersistedPrLinks: async () => ({ links: [], nextCursor: null }),
-        getPullRequestDiff: async () =>
-          "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-old\n+new\n",
+        getPullRequestDiff: async () => {
+          this.beforeDiff?.();
+          return this.diff;
+        },
         invokeCodexReview: async () => {
           this.reviewCalls++;
           this.beforeReview?.();
@@ -256,6 +261,57 @@ class ReviewHarness {
 }
 
 describe("durable PR review journal and repair ownership", () => {
+  test.each(["head", "base"] as const)(
+    "diff capture is fenced against concurrent %s movement before any model call",
+    async (changed) => {
+      const h = new ReviewHarness();
+      try {
+        h.score = 10;
+        h.beforeDiff = () => {
+          if (changed === "head") h.pr.head.sha = "f".repeat(40);
+          else h.targetBaseSha = "f".repeat(40);
+        };
+        await h.agent().poll();
+        expect(h.reviewCalls).toBe(0);
+        expect(h.mergeCalls).toBe(0);
+        expect(h.enqueueCalls).toBe(0);
+        h.beforeDiff = null;
+        await h.agent().poll();
+        expect(h.reviewCalls).toBe(1);
+        expect(h.mergeCalls).toBe(1);
+      } finally {
+        h.cleanup();
+      }
+    },
+  );
+
+  test("incomplete evidence hold survives SQLite reopen without rescoring, repair or merge", async () => {
+    const h = new ReviewHarness();
+    try {
+      h.score = 10;
+      const complete = h.diff;
+      h.diff = "diff --git a/src/example.ts b/src/example.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+      await h.agent().poll();
+      expect(h.reviewCalls).toBe(0);
+      h.reopen();
+      const restarted = h.agent();
+      restarted.requestReReview(h.pr.number, h.pr.head.sha);
+      await restarted.poll();
+      expect(h.reviewCalls).toBe(0);
+      expect(h.enqueueCalls).toBe(0);
+      expect(h.mergeCalls).toBe(0);
+      expect(h.closeCalls).toBe(0);
+      expect(h.comments).toEqual([]);
+      h.pr.head.sha = "e".repeat(40);
+      h.diff = complete;
+      await restarted.poll();
+      expect(h.reviewCalls).toBe(1);
+      expect(h.mergeCalls).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test.each(["head", "base"] as const)(
     "held conflict on a fresh observed base blocks unchanged review without closing, then permits a changed %s",
     async (changed) => {

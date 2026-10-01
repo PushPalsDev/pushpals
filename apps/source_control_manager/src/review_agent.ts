@@ -10,6 +10,15 @@ import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import { inferRepositoryValidationSteps } from "../../../packages/shared/src/repo_validation.js";
 import { normalizeRepositoryOriginRemote } from "../../../packages/shared/src/repository_identity.js";
 import {
+  analyzeTestHygieneDiff,
+  testRemovalExplicitlyRequested,
+} from "../../../packages/shared/src/test_hygiene.js";
+import {
+  buildCompleteReviewEvidence,
+  assertCompleteReviewEvidence,
+  type CompleteReviewEvidence,
+} from "../../../packages/shared/src/review_evidence.js";
+import {
   DEFAULT_OPENAI_CODEX_MODEL,
   loadPushPalsConfig,
 } from "../../../packages/shared/src/config.js";
@@ -169,6 +178,33 @@ interface ReviewAgentDeps {
 }
 
 const MAX_DIFF_BYTES = 150_000;
+
+function reviewEvidence(diff: string, pr: GitHubPR): CompleteReviewEvidence {
+  const fileCount = (pr as GitHubPR & { changed_files?: number }).changed_files;
+  return buildCompleteReviewEvidence({
+    diff,
+    maxBytes: MAX_DIFF_BYTES,
+    candidateSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    ...(Number.isSafeInteger(fileCount) && Number(fileCount) >= 0
+      ? { expectedFileCount: fileCount }
+      : {}),
+  });
+}
+
+function isReviewEvidenceHold(value: string): boolean {
+  try {
+    const parsed = JSON.parse(value);
+    return (
+      parsed?.event === "review_evidence_hold" &&
+      parsed?.version === 1 &&
+      parsed?.manifest?.complete === false &&
+      Array.isArray(parsed?.reasons)
+    );
+  } catch {
+    return false;
+  }
+}
 const MAX_PR_RE_REVIEW_ENQUEUES = 3;
 const MAX_REVIEW_CONTEXT_COMMENTS = 8;
 const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
@@ -630,18 +666,25 @@ export function buildReviewPrompt(
   diff: string,
   passThreshold: number,
 ): string {
-  const truncatedDiff =
-    diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n...(diff truncated)` : diff;
+  const evidence = reviewEvidence(diff, pr);
+  assertCompleteReviewEvidence(evidence);
+  const hygiene = analyzeTestHygieneDiff(diff);
   const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
-  return loadPromptTemplate("review_agent/review_prompt_template.md", {
-    pass_threshold: normalizedThreshold.toFixed(1),
-    reviewer_md: reviewerMd,
-    pr_number: String(pr.number),
-    pr_title: String(pr.title ?? ""),
-    head_ref: String(pr.head?.ref ?? ""),
-    base_ref: String(pr.base?.ref ?? ""),
-    diff: truncatedDiff,
-  });
+  return (
+    loadPromptTemplate("review_agent/review_prompt_template.md", {
+      pass_threshold: normalizedThreshold.toFixed(1),
+      reviewer_md: reviewerMd,
+      pr_number: String(pr.number),
+      pr_title: String(pr.title ?? ""),
+      head_ref: String(pr.head?.ref ?? ""),
+      base_ref: String(pr.base?.ref ?? ""),
+      diff: evidence.diff,
+    }) +
+    "\n\nComplete patch manifest (host-derived):\n" +
+    JSON.stringify(evidence.manifest) +
+    "\nTest coverage evidence (structural observations, not approval):\n" +
+    JSON.stringify({ files: hygiene.files, semanticReviewNotes: hygiene.semanticReviewNotes })
+  );
 }
 
 function formatRejectionComment(verdict: ReviewVerdict): string {
@@ -974,23 +1017,6 @@ function uniqueNonEmptyLines(values: string[]): string[] {
   return out;
 }
 
-function testDeclarationCounts(diff: string): { added: number; removed: number } {
-  let added = 0;
-  let removed = 0;
-  for (const line of diff.split(/\r?\n/)) {
-    if (!/^[+-](?![+-])/.test(line)) continue;
-    const declaration = line.slice(1).trim();
-    const isTestDeclaration =
-      /^(?:(?:test|it|describe|context|RSpec\.describe)\s*\(|(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|func\s+Test[A-Za-z0-9_]*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|private\s+|internal\s+)?(?:async\s+)?(?:void|Task|ValueTask|func)\s+[Tt]est[A-Za-z0-9_]*\s*\(|(?:public\s+|protected\s+)?function\s+test[A-Za-z0-9_]*\s*\()/i.test(
-        declaration,
-      );
-    if (!isTestDeclaration) continue;
-    if (line.startsWith("+")) added += 1;
-    else removed += 1;
-  }
-  return { added, removed };
-}
-
 function isReviewTestPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/");
   const base = normalized.split("/").pop() ?? normalized;
@@ -1016,18 +1042,6 @@ function isPushPalsSelfRepository(identity: string): boolean {
   return /(?:^|[:/])pushpalsdev\/pushpals(?:\.git)?\/?$/i.test(String(identity ?? "").trim());
 }
 
-function explicitlyAllowsTestRemoval(taskIntent: string): boolean {
-  const normalized = collapseWhitespace(taskIntent);
-  return (
-    /\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b.{0,80}\b(?:test|coverage|suite)s?\b/i.test(
-      normalized,
-    ) ||
-    /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b/i.test(
-      normalized,
-    )
-  );
-}
-
 function addedDiffText(diff: string): string {
   return diff
     .split(/\r?\n/)
@@ -1043,16 +1057,11 @@ export function collectReviewHygieneIssuesFromDiff(
   const changedPaths = parseChangedPathsFromDiff(diff);
   const issues: string[] = [];
 
-  const declarationCounts = testDeclarationCounts(diff);
-  if (
-    declarationCounts.removed >= 3 &&
-    declarationCounts.removed > declarationCounts.added &&
-    !explicitlyAllowsTestRemoval(context.taskIntent ?? "")
-  ) {
-    issues.push(
-      "PR removes multiple existing test declarations without replacing equivalent coverage. Preserve existing coverage unless the task is explicitly a test deletion/refactor.",
-    );
-  }
+  issues.push(
+    ...analyzeTestHygieneDiff(diff, {
+      allowTestRemoval: testRemovalExplicitlyRequested(context.taskIntent ?? ""),
+    }).blockingIssues,
+  );
 
   const changedTestPaths = changedPaths.filter(isReviewTestPath);
   const externalRepo =
@@ -1534,7 +1543,8 @@ export class ReviewAgent {
     const policy = createHash("sha256")
       .update(
         JSON.stringify({
-          contract: 1,
+          contract: 2,
+          completePatchBudgetBytes: MAX_DIFF_BYTES,
           model: this.config.model || DEFAULT_OPENAI_CODEX_MODEL,
           launcher: this.config.codexBin,
           threshold: this.config.passThreshold,
@@ -1559,7 +1569,12 @@ export class ReviewAgent {
     const entry = this.deps.reviewJournal
       ? this.deps.reviewJournal.getReviewDecision(this.reviewRepositoryKey(), pr.number, key)
       : (this.reviewDecisions.get(`${pr.number}:${key}`) ?? null);
-    if (entry && entry.verdictJson !== null && !parseReviewVerdict(entry.verdictJson)) {
+    if (
+      entry &&
+      entry.verdictJson !== null &&
+      !parseReviewVerdict(entry.verdictJson) &&
+      !isReviewEvidenceHold(entry.verdictJson)
+    ) {
       throw new Error(`Refusing review of PR #${pr.number}: durable review evidence is invalid`);
     }
     const count =
@@ -2371,6 +2386,10 @@ export class ReviewAgent {
     }
 
     this.assertReviewPolicyUnchanged(pr);
+    // The diff endpoint is PR-number based, not an immutable-SHA endpoint.
+    // Bind its capture to the same live head/base before retaining evidence or
+    // spending a model call. Publication repeats this fence before side effects.
+    if (!(await this.confirmReviewRevisionCurrent(pr))) return;
     if (!diff.trim()) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has an empty diff - skipping`);
       this.reviewed.set(pr.number, revisionFingerprint);
@@ -2382,16 +2401,30 @@ export class ReviewAgent {
       return;
     }
 
-    if (diff.length > MAX_DIFF_BYTES * 2) {
+    const evidence = reviewEvidence(diff, pr);
+    if (!evidence.complete) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} diff is too large (${diff.length} bytes) - skipping`,
+        `[${ts()}] [ReviewAgent] reviewEvidenceHold=${JSON.stringify({
+          event: "review_evidence_hold",
+          version: 1,
+          prNumber: pr.number,
+          manifest: evidence.manifest,
+          reasons: evidence.reasons,
+          action:
+            "Provide complete reviewable evidence or split the PR; a changed head/base or review policy permits another review. No approval or coding retry was issued.",
+        })}`,
       );
-      this.reviewed.set(pr.number, revisionFingerprint);
       this.saveReviewDecision(pr, revisionFingerprint, {
-        verdictJson: null,
+        verdictJson: JSON.stringify({
+          event: "review_evidence_hold",
+          version: 1,
+          manifest: evidence.manifest,
+          reasons: evidence.reasons,
+        }),
         finalized: true,
         repairEnqueues: 0,
       });
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
 

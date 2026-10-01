@@ -798,6 +798,15 @@ export function createRequestHandler() {
           status,
           headers: { ...jsonHeaders, ...extraHeaders },
         });
+      // Liveness is deliberately before request logging, auth/config reads,
+      // reconciliation, and stores. A blocked log sink must not block a probe.
+      if (pathname === "/healthz" && method === "GET") {
+        return makeJson({
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          diagnostics: runtimeDiagnostics.snapshot(),
+        });
+      }
       const parseLimit = (raw: string | null, fallback = 200): number => {
         const parsed = raw ? parseInt(raw, 10) : NaN;
         if (!Number.isFinite(parsed)) return fallback;
@@ -1514,16 +1523,6 @@ export function createRequestHandler() {
         return null;
       };
 
-      // GET /healthz
-      if (pathname === "/healthz" && method === "GET") {
-        // In-memory diagnostics only: liveness must not wait for DB work or another service.
-        return makeJson({
-          ok: true,
-          protocolVersion: PROTOCOL_VERSION,
-          diagnostics: runtimeDiagnostics.snapshot(),
-        });
-      }
-
       // POST /admin/shutdown (auth protected)
       if (pathname === "/admin/shutdown" && method === "POST") {
         const denied = requireAuth();
@@ -1713,7 +1712,9 @@ export function createRequestHandler() {
         if (denied) return denied;
         let body: Record<string, unknown>;
         try {
-          body = await readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request");
+          body = await runtimeDiagnostics.runAsync("repository_agent.submit.body", () =>
+            readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request"),
+          );
         } catch (error) {
           const bounded = error as BoundedJsonBodyError;
           return makeJson(
@@ -1724,10 +1725,12 @@ export function createRequestHandler() {
         }
         try {
           const request = sanitizeRepositoryAgentRequest(body);
-          const resolved = await resolveRepositoryAgentContext({
-            canonicalRepoRoot: repositoryAgentRepoRoot,
-            requested: request.repository,
-          });
+          const resolved = await runtimeDiagnostics.runAsync("repository_agent.context", () =>
+            resolveRepositoryAgentContext({
+              canonicalRepoRoot: repositoryAgentRepoRoot,
+              requested: request.repository,
+            }),
+          );
           const normalizedRequest: RepositoryAgentRequest = {
             ...request,
             repository: resolved.repository,
@@ -1736,20 +1739,22 @@ export function createRequestHandler() {
               ...(resolved.requestedRootMapped ? { callerRootMappedToHost: true } : {}),
             },
           };
-          const enqueued = repositoryAgentQueue.enqueue({
-            sessionId: request.caller.sessionId ?? "dev",
-            callerService: request.caller.service,
-            purpose: request.purpose,
-            repositoryId: resolved.repository.identity,
-            repositoryRoot: resolved.repository.root,
-            revision: resolved.repository.revision,
-            treeHash: resolved.repository.tree,
-            dirty: resolved.repository.dirty,
-            priority: request.priority,
-            deadlineAt: request.deadlineAt,
-            idempotencyKey: request.idempotencyKey,
-            request: normalizedRequest as unknown as Record<string, unknown>,
-          });
+          const enqueued = runtimeDiagnostics.run("repository_agent.enqueue.store", () =>
+            repositoryAgentQueue.enqueue({
+              sessionId: request.caller.sessionId ?? "dev",
+              callerService: request.caller.service,
+              purpose: request.purpose,
+              repositoryId: resolved.repository.identity,
+              repositoryRoot: resolved.repository.root,
+              revision: resolved.repository.revision,
+              treeHash: resolved.repository.tree,
+              dirty: resolved.repository.dirty,
+              priority: request.priority,
+              deadlineAt: request.deadlineAt,
+              idempotencyKey: request.idempotencyKey,
+              request: normalizedRequest as unknown as Record<string, unknown>,
+            }),
+          );
           if (!enqueued.ok || !enqueued.requestId) {
             return makeJson(
               {
@@ -1790,7 +1795,9 @@ export function createRequestHandler() {
         if (denied) return denied;
         let body: Record<string, unknown>;
         try {
-          body = await readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim");
+          body = await runtimeDiagnostics.runAsync("repository_agent.claim.body", () =>
+            readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim"),
+          );
         } catch (error) {
           const bounded = error as BoundedJsonBodyError;
           return makeJson(
@@ -1803,10 +1810,12 @@ export function createRequestHandler() {
         const identities = Array.isArray(body.repositoryIdentities)
           ? body.repositoryIdentities.map((value) => compactText(value, 1_024)).filter(Boolean)
           : [];
-        const claim = repositoryAgentQueue.claim(agentId, {
-          leaseMs: Number(body.leaseMs),
-          repositoryIdentities: identities,
-        });
+        const claim = runtimeDiagnostics.run("repository_agent.claim.store", () =>
+          repositoryAgentQueue.claim(agentId, {
+            leaseMs: Number(body.leaseMs),
+            repositoryIdentities: identities,
+          }),
+        );
         if (!claim.ok || !claim.request) {
           return makeJson({ ok: true, claim: null, pollAfterMs: 750 }, 200);
         }
@@ -1848,7 +1857,9 @@ export function createRequestHandler() {
         }
         let body: Record<string, unknown>;
         try {
-          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`);
+          body = await runtimeDiagnostics.runAsync("repository_agent.result.body", () =>
+            readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`),
+          );
         } catch (error) {
           const bounded = error as BoundedJsonBodyError;
           return makeJson(
@@ -1899,12 +1910,14 @@ export function createRequestHandler() {
                 409,
               );
             }
-            const completed = repositoryAgentQueue.complete(requestId, {
-              agentId,
-              claimToken,
-              claimGeneration,
-              result: result as unknown as Record<string, unknown>,
-            });
+            const completed = runtimeDiagnostics.run("repository_agent.complete.store", () =>
+              repositoryAgentQueue.complete(requestId, {
+                agentId,
+                claimToken,
+                claimGeneration,
+                result: result as unknown as Record<string, unknown>,
+              }),
+            );
             return completed.ok
               ? makeJson({ ok: true, requestId, status: "completed" }, 200)
               : makeJson({ ok: false, requestId, message: completed.message }, 409);
@@ -1927,12 +1940,14 @@ export function createRequestHandler() {
                 message: "RepositoryAgent request failed",
                 retryable: false,
               };
-        const failed = repositoryAgentQueue.fail(requestId, {
-          agentId,
-          claimToken,
-          claimGeneration,
-          message: JSON.stringify(remoteError),
-        });
+        const failed = runtimeDiagnostics.run("repository_agent.fail.store", () =>
+          repositoryAgentQueue.fail(requestId, {
+            agentId,
+            claimToken,
+            claimGeneration,
+            message: JSON.stringify(remoteError),
+          }),
+        );
         return failed.ok
           ? makeJson(
               {
@@ -2334,7 +2349,9 @@ export function createRequestHandler() {
         if (denied) return denied;
         maybeRecoverStaleClaims();
 
-        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const body = (await runtimeDiagnostics.runAsync("job_claim.body", () =>
+          req.json().catch(() => ({})),
+        )) as Record<string, unknown>;
         const workerId = normalizeJobWorkerId(body.workerId);
         if (!workerId) {
           return makeJson(
@@ -2366,7 +2383,9 @@ export function createRequestHandler() {
         let runtimeCanaryJobId: string | null = null;
         let cachedFailureCircuit: ReturnType<typeof autonomyFailureCircuitSummary> | undefined;
         const claimNextJob = () =>
-          jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION });
+          runtimeDiagnostics.run("job_claim.store", () =>
+            jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION }),
+          );
         let result = claimNextJob();
         while (result.ok && result.job?.id) {
           // Re-run admission for a replay. The claim transaction can commit
@@ -2544,7 +2563,9 @@ export function createRequestHandler() {
         const denied = requireAuth();
         if (denied) return denied;
 
-        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const body = (await runtimeDiagnostics.runAsync("worker_heartbeat.body", () =>
+          req.json().catch(() => ({})),
+        )) as Record<string, unknown>;
         const heartbeatRuntimeGeneration = compactText(body.runtimeGeneration, 200);
         if (
           heartbeatRuntimeGeneration &&
@@ -2562,7 +2583,9 @@ export function createRequestHandler() {
             409,
           );
         }
-        const result = jobQueue.heartbeat(body);
+        const result = runtimeDiagnostics.run("worker_heartbeat.store", () =>
+          jobQueue.heartbeat(body),
+        );
         if (result.ok) {
           for (const recovered of result.recoveredJobs ?? []) {
             projectAuthoritativeClaimRecovery(recovered);
@@ -2876,19 +2899,21 @@ export function createRequestHandler() {
         if (!sessionId) {
           return makeJson({ ok: false, message: "sessionId is required" }, 400);
         }
-        const snapshot = autonomyStore.createSnapshot({
-          sessionId,
-          runId,
-          executionCapability: summarizeWorkerExecutionCapability(
-            jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS),
-          ),
-          requestSlo: requestQueue.sloSummary(24),
-          jobSlo: jobQueue.sloSummary(24),
-          repoHealthFlags: {
-            is_worktree_dirty: parseBool(url.searchParams.get("isWorktreeDirty"), false),
-            is_merge_in_progress: parseBool(url.searchParams.get("isMergeInProgress"), false),
-          },
-        });
+        const snapshot = runtimeDiagnostics.run("autonomy_snapshot.store", () =>
+          autonomyStore.createSnapshot({
+            sessionId,
+            runId,
+            executionCapability: summarizeWorkerExecutionCapability(
+              jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS),
+            ),
+            requestSlo: requestQueue.sloSummary(24),
+            jobSlo: jobQueue.sloSummary(24),
+            repoHealthFlags: {
+              is_worktree_dirty: parseBool(url.searchParams.get("isWorktreeDirty"), false),
+              is_merge_in_progress: parseBool(url.searchParams.get("isMergeInProgress"), false),
+            },
+          }),
+        );
         return makeJson({ ok: true, snapshot }, 200);
       }
 
@@ -4352,12 +4377,16 @@ export function createRequestHandler() {
         const denied = requireAuth();
         if (denied) return denied;
 
-        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const body = (await runtimeDiagnostics.runAsync("completion_claim.body", () =>
+          req.json().catch(() => ({})),
+        )) as Record<string, unknown>;
         const pusherId = compactText(body.pusherId, 128);
         if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
-        const result = completionQueue.claim(pusherId, {
-          leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
-        });
+        const result = runtimeDiagnostics.run("completion_claim.store", () =>
+          completionQueue.claim(pusherId, {
+            leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
+          }),
+        );
         if (result.completion) {
           const parent = jobQueue.getJob(result.completion.jobId);
           const params = parseJsonRecord(parent?.params ?? "");

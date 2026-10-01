@@ -444,3 +444,73 @@ export class RuntimeDiagnostics {
     }
   }
 }
+
+/** Memory-only observations for the synchronous supervisor log sink. This has
+ * deliberately no event callback: reporting a failed/slow write through that
+ * same sink would recurse or add another blocking write to the incident. */
+export class RuntimeLogSinkDiagnostics {
+  private attempts = 0;
+  private failures = 0;
+  private slowWrites = 0;
+  private activeWrites = 0;
+  private lastWriteDurationMs: number | null = null;
+  private maxWriteDurationMs = 0;
+  private lastSlowWriteAt: number | null = null;
+  private lastFailureAt: number | null = null;
+  private readonly threshold: number;
+
+  constructor(private readonly options: { now?: () => number; slowThresholdMs?: number } = {}) {
+    this.threshold = boundedInteger(options.slowThresholdMs ?? 1000, "slowThresholdMs", 86_400_000);
+  }
+
+  /** Best-effort logging must not throw into child-stream or supervision work. */
+  write(append: () => void): boolean {
+    const startedAt = this.readNow();
+    this.attempts = Math.min(Number.MAX_SAFE_INTEGER, this.attempts + 1);
+    this.activeWrites += 1;
+    try {
+      append();
+      return true;
+    } catch {
+      this.failures = Math.min(Number.MAX_SAFE_INTEGER, this.failures + 1);
+      this.lastFailureAt = this.readNow();
+      return false;
+    } finally {
+      this.activeWrites -= 1;
+      const endedAt = this.readNow();
+      this.lastWriteDurationMs =
+        startedAt !== null && endedAt !== null ? Math.max(0, endedAt - startedAt) : null;
+      if (this.lastWriteDurationMs !== null) {
+        this.maxWriteDurationMs = Math.max(this.maxWriteDurationMs, this.lastWriteDurationMs);
+        if (this.lastWriteDurationMs >= this.threshold) {
+          this.slowWrites = Math.min(Number.MAX_SAFE_INTEGER, this.slowWrites + 1);
+          this.lastSlowWriteAt = endedAt;
+        }
+      }
+    }
+  }
+
+  snapshot() {
+    const now = this.readNow();
+    const age = (at: number | null) => (now !== null && at !== null ? Math.max(0, now - at) : null);
+    return {
+      attempts: this.attempts,
+      failures: this.failures,
+      slowWrites: this.slowWrites,
+      activeWrites: this.activeWrites,
+      lastWriteDurationMs: this.lastWriteDurationMs,
+      maxWriteDurationMs: this.maxWriteDurationMs,
+      lastSlowWriteAgoMs: age(this.lastSlowWriteAt),
+      lastFailureAgoMs: age(this.lastFailureAt),
+    };
+  }
+
+  private readNow(): number | null {
+    try {
+      const value = (this.options.now ?? (() => performance.now()))();
+      return finiteMeasurement(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+}

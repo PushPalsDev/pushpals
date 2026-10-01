@@ -7,6 +7,9 @@ export interface JobTokenUsage {
   estimated?: boolean;
   backend?: string;
   modelId?: string;
+  /** Subsets of input/output respectively, not additional billable totals. */
+  cachedInputTokens?: number;
+  reasoningOutputTokens?: number;
 }
 
 export type JobUsageStage =

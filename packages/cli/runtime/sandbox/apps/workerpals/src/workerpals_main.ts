@@ -83,6 +83,7 @@ import {
 } from "shared";
 import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 import { WorkerStartupBudget } from "./startup_budget.js";
+import { createJobLogActivity } from "./job_log_activity.js";
 import {
   WorkerExecutionReadinessGate,
   checkWorkerExecutionReadiness,
@@ -2582,7 +2583,7 @@ async function workerLoop(
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
           const jobClaimedAtMs = Date.now();
-          let lastForwardedJobLogAt = jobClaimedAtMs;
+          const jobLogActivity = createJobLogActivity(jobClaimedAtMs);
           let currentJobPhase: WorkerJobPhase | null = null;
           const phaseSpans: Array<{
             phase: WorkerJobPhase;
@@ -2598,7 +2599,11 @@ async function workerLoop(
           };
 
           const emitJobLog = job.sessionId
-            ? (stream: "stdout" | "stderr", line: string): boolean => {
+            ? (
+                stream: "stdout" | "stderr",
+                line: string,
+                source: "execution" | "status" = "execution",
+              ): boolean => {
                 const cleaned = sanitizeJobLogLine(line);
                 if (!cleaned) return false;
 
@@ -2610,7 +2615,7 @@ async function workerLoop(
                 if (cleaned === lastCleanLog && now - lastCleanLogAt < 1_000) return false;
                 lastCleanLog = cleaned;
                 lastCleanLogAt = now;
-                lastForwardedJobLogAt = now;
+                jobLogActivity.note(source, now);
                 noteJobPhase(inferWorkerJobPhaseFromLogLine(cleaned), now);
                 const logTs = new Date(now).toISOString();
 
@@ -2655,7 +2660,7 @@ async function workerLoop(
             emitJobLog && jobProgressLogEveryMs > 0
               ? setInterval(() => {
                   const now = Date.now();
-                  const quietForMs = Math.max(0, now - lastForwardedJobLogAt);
+                  const quietForMs = jobLogActivity.quietForMs(now);
                   if (quietForMs < jobProgressLogEveryMs) return;
                   emitJobLog(
                     "stdout",
@@ -2664,6 +2669,7 @@ async function workerLoop(
                     )} (kind=${job.kind}, worker=${opts.workerId}, phase=${
                       currentJobPhase ?? "unknown"
                     }, quiet_for=${formatDurationMs(quietForMs)}).`,
+                    "status",
                   );
                 }, jobProgressLogEveryMs)
               : null;

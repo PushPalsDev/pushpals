@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadLocalBuddyRuntimeSnapshotFromFiles } from "../packages/shared/src/localbuddy_runtime";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
@@ -161,6 +161,65 @@ async function waitForHealth(
 }
 
 describe("server runtime config route integration", () => {
+  test("health bypasses logging and every SQLite operation while retaining origin checks", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const entry = pathToFileURL(resolve(repoRoot, "apps/server/src/server_main.ts")).href;
+    const script = `
+      const { Database } = await import("bun:sqlite");
+      // Isolate the liveness route from unrelated maintenance timer callbacks.
+      const timers = [];
+      const scheduleInterval = globalThis.setInterval;
+      globalThis.setInterval = (...args) => { const timer = scheduleInterval(...args); timers.push(timer); return timer; };
+      const { createRequestHandler } = await import(${JSON.stringify(entry)});
+      globalThis.setInterval = scheduleInterval;
+      for (const timer of timers) clearInterval(timer);
+      const server = createRequestHandler();
+      let logs = 0, stores = 0;
+      for (const method of ["log", "warn", "error"]) console[method] = () => { logs++; throw new Error("logger forbidden in health"); };
+      for (const method of ["query", "prepare", "exec", "run", "transaction"]) Database.prototype[method] = () => { stores++; throw new Error("database forbidden in health"); };
+      try {
+        const response = await fetch("http://127.0.0.1:${port}/healthz", { signal: AbortSignal.timeout(2000) });
+        const body = await response.json();
+        const denied = await fetch("http://127.0.0.1:${port}/healthz", { headers: { origin: "https://untrusted.example" }, signal: AbortSignal.timeout(2000) });
+        const ok = response.status === 200 && body.ok === true && body.diagnostics.service === "server" && denied.status === 403 && logs === 0 && stores === 0;
+        process.stdout.write(JSON.stringify({ testHealth: true, ok, logs, stores, status: response.status }) + "\\n");
+        await server.stop(true);
+        process.exit(ok ? 0 : 1);
+      } catch (error) { process.stderr.write(String(error)); process.exit(1); }
+    `;
+    const proc = Bun.spawn([bunExecPath, "--eval", script], {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
+        PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
+        PUSHPALS_PORT: String(port),
+      },
+    });
+    const server: SpawnedServer = {
+      proc,
+      stdout: new Response(proc.stdout).text(),
+      stderr: new Response(proc.stderr).text(),
+      exitCode: null,
+    };
+    spawnedServers.push(server);
+    const killTimer = setTimeout(() => proc.kill(), 10_000);
+    try {
+      server.exitCode = await proc.exited;
+      const output = await server.stdout;
+      expect({ exitCode: server.exitCode, stderr: await server.stderr }).toMatchObject({
+        exitCode: 0,
+      });
+      expect(output).toContain('"testHealth":true,"ok":true,"logs":0,"stores":0,"status":200');
+    } finally {
+      clearTimeout(killTimer);
+    }
+  }, 15_000);
+
   test("POST /config/runtime applies LocalBuddy env aliases and exposes correct restart warnings", async () => {
     const root = makeTempDir();
     const authToken = "runtime-route-token";

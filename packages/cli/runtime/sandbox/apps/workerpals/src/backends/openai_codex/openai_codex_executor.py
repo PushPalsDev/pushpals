@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 from shutil import rmtree, which
@@ -1905,6 +1906,7 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "meaningful_progress_count": 0,
         "last_meaningful_progress_at": None,
         "thread_id": "",
+        "command_timings": {"records": {}, "omittedEvents": 0, "malformedEvents": 0, "duplicateEvents": 0},
     }
 
 
@@ -1918,6 +1920,123 @@ def _looks_like_codex_command_item(value: Any) -> bool:
     if any(marker in type_text for marker in ("command_execution", "exec_command", "shell_command")):
         return True
     return any(key in value for key in ("command", "cmd", "exit_code", "aggregated_output"))
+
+
+_MAX_COMMAND_TIMINGS = 64
+
+
+def _command_timing_category(command: str) -> str:
+    """Fixed labels only: never persist an executable, argument, path, or secret."""
+    # Shell wrappers, pipelines and substitutions are ambiguous. A filename or
+    # search term containing "test" must never label a discovery read a test.
+    if re.search(r"[;&|`\n\r]|\$\(", command):
+        return "other"
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return "other"
+    if not tokens:
+        return "other"
+    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    if executable in {"rg", "grep", "find", "ls", "cat", "head", "tail", "pwd"}:
+        return "discovery"
+    if executable == "sed":
+        return "edit" if any(token == "-i" or token.startswith("--in-place") for token in tokens[1:]) else "discovery"
+    if executable in {"pytest", "vitest", "jest", "tsc", "eslint", "playwright"}:
+        return "validation"
+    if executable == "git":
+        return "scm"
+    if executable in {"apply_patch", "patch"}:
+        return "edit"
+    if executable in {"tsup", "webpack", "vite"}:
+        return "build"
+    args = tokens[1:]
+    if executable in {"bun", "npm", "pnpm", "yarn", "cargo", "go", "mvn", "gradle", "gradlew", "pip", "pip3", "uv", "poetry"}:
+        if args and args[0] == "run":
+            args = args[1:]
+        subcommand = args[0].lower() if args else ""
+        if subcommand in {"test", "typecheck", "lint", "validate", "check"}:
+            return "validation"
+        if subcommand in {"install", "restore", "sync"}:
+            return "dependency"
+        if subcommand in {"build", "compile"}:
+            return "build"
+    return "other"
+
+
+def _record_command_timing(parsed: Dict[str, Any], event_type: str, trace: Dict[str, Any], now: float) -> None:
+    """Observation-only collector. It never updates watchdog or progress clocks."""
+    item = parsed.get("item")
+    source = item if _looks_like_codex_command_item(item) else parsed
+    if not _looks_like_codex_command_item(source):
+        return
+    state = trace.setdefault("command_timings", {"records": {}, "omittedEvents": 0, "malformedEvents": 0, "duplicateEvents": 0})
+    if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
+        state["malformedEvents"] += 1
+        return
+    command = source.get("command", source.get("cmd", ""))
+    if not isinstance(command, str):
+        command = ""
+    command = command[:8192]
+    provider_id = source.get("id", source.get("call_id", source.get("item_id")))
+    if not isinstance(provider_id, str) or not provider_id or len(provider_id) > 512:
+        # No reliable pairing key: never infer durations from command text.
+        state["malformedEvents"] += 1
+        return
+    key = hashlib.sha256(provider_id.encode("utf-8", errors="replace")).hexdigest()
+    event = event_type.lower()[:128]
+    status = source.get("status", "")
+    status = status.lower()[:64] if isinstance(status, str) else ""
+    completed = any(value in event for value in ("completed", "failed", "error")) or status in {"completed", "failed", "cancelled", "canceled", "exited"}
+    started = "started" in event
+    records = state["records"]
+    row = records.get(key)
+    if row is None:
+        if len(records) >= _MAX_COMMAND_TIMINGS:
+            state["omittedEvents"] += 1
+            return
+        row = {
+            "commandId": f"command-{len(records) + 1}",
+            "category": _command_timing_category(command),
+            "digest": hashlib.sha256(command.encode("utf-8", errors="replace")).hexdigest() if command else None,
+            "digestSource": "bounded_command_prefix",
+            "startedAt": float(now) if started and not completed else None,
+            "finishedAt": None,
+            "exitCode": None,
+        }
+        records[key] = row
+    elif row["finishedAt"] is not None or started:
+        state["duplicateEvents"] += 1
+        return
+    if completed:
+        row["finishedAt"] = float(now)
+        exit_code = source.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and -(2 ** 31) <= exit_code < 2 ** 31:
+            row["exitCode"] = exit_code
+
+
+def _finalize_command_timings(trace: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    state = trace.get("command_timings") or {}
+    rows = state.get("records") or {}
+    ended = time.monotonic() if now is None else now
+    output = []
+    for row in list(rows.values())[:_MAX_COMMAND_TIMINGS]:
+        start, finish = row["startedAt"], row["finishedAt"]
+        valid_clock = isinstance(ended, (float, int)) and math.isfinite(ended)
+        observed_end = finish if finish is not None else ended
+        duration = int((observed_end - start) * 1000) if start is not None and valid_clock and observed_end >= start else None
+        if duration is not None:
+            duration = min(duration, 86_400_000)
+        output.append({
+            "commandId": row["commandId"], "category": row["category"], "digest": row["digest"],
+            "digestSource": row["digestSource"], "exitCode": row["exitCode"],
+            "durationMs": duration if finish is not None else None,
+            "observedDurationMs": duration,
+            "incomplete": start is None or finish is None or duration is None,
+        })
+    return {"commands": output, **{key: to_int(state.get(key), 0) for key in ("omittedEvents", "malformedEvents", "duplicateEvents")}}
 
 
 _SEARCH_OPTIONS_WITH_VALUE = {
@@ -2241,6 +2360,7 @@ def _record_live_codex_stdout_line(
                 if thread_id:
                     trace["thread_id"] = thread_id
             _record_codex_command_activity(parsed, event_type, trace, observed_at)
+            _record_command_timing(parsed, event_type, trace, observed_at)
             event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
             summary = _summarize_json_event(parsed)
             # Reasoning can arrive under generic event types (for example item.updated).
@@ -2334,6 +2454,7 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "command_event_count": command_event_count,
+        "command_timings": _finalize_command_timings(trace),
         "thread_id": thread_id,
     }
 
@@ -4102,6 +4223,7 @@ def _run_codex_task(
                 "stage": "executor" if len(usage_attempts) == 0 else "executor_recovery",
                 "attempt": len(usage_attempts) + 1,
                 "source": "openai_codex",
+                "_commandTimings": stdout_trace.get("command_timings", {}),
                 **({"timedOut": True} if timed_out else {}),
             }
         )
@@ -4841,6 +4963,17 @@ def main() -> int:
         }
 
     if usage_attempts:
+        command_attempts = []
+        for index, attempt in enumerate(usage_attempts):
+            timings = attempt.pop("_commandTimings", None)
+            if isinstance(timings, dict):
+                command_attempts.append({"attempt": index + 1, **timings})
+        if command_attempts:
+            result["diagnostics"] = {"metadata": {"codexCommandTimings": {
+                "schemaVersion": 1,
+                "attempts": command_attempts[-4:],
+                "omittedAttempts": max(0, len(command_attempts) - 4),
+            }}}
         result["usageAttempts"] = usage_attempts
 
     emit(result)

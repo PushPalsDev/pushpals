@@ -5,7 +5,7 @@ var __require = import.meta.require;
 import { parseArgs } from "util";
 import { isAbsolute as isAbsolute4, join as join8, relative as relative4, resolve as resolve14 } from "path";
 import { mkdirSync as mkdirSync5 } from "fs";
-import { createHash as createHash8, randomUUID as randomUUID4 } from "crypto";
+import { createHash as createHash9, randomUUID as randomUUID4 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -420,7 +420,7 @@ var DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
-var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 65536;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 var DEFAULT_WORKERPALS_EXECUTION_PLATFORM = "auto";
@@ -3115,6 +3115,16 @@ function sanitizeDiscoveryProgress(value) {
   return {
     page,
     pageCount,
+    ...value.window === undefined ? {} : { window: integer("window", 1, 6667) },
+    ...value.windowCount === undefined ? {} : { windowCount: integer("windowCount", 1, 6667) },
+    ...value.globalPage === undefined ? {} : { globalPage: integer("globalPage", 1, 6667) },
+    ...typeof value.outcome === "string" && [
+      "candidates_found",
+      "no_actionable_candidate",
+      "insufficient_evidence",
+      "delivery_deferred"
+    ].includes(value.outcome) ? { outcome: value.outcome } : {},
+    ...typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt)) ? { retryAt: value.retryAt } : {},
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
     retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
@@ -4517,7 +4527,7 @@ import { closeSync as closeSync2, existsSync as existsSync4, openSync as openSyn
 import { basename as basename2, dirname as dirname2, extname, relative as relative3, resolve as resolve7 } from "path";
 
 // packages/shared/src/trusted_validation.ts
-var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
+var MAX_TRUSTED_VALIDATION_COMMANDS = 32;
 var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
   "bazel",
@@ -7690,9 +7700,327 @@ async function maintainIntegrationBeforeCompletionClaim(options) {
 
 // apps/source_control_manager/src/review_agent.ts
 import { existsSync as existsSync5, readFileSync as readFileSync7 } from "fs";
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash4 } from "crypto";
 import { tmpdir } from "os";
 import { basename as basename3, delimiter, isAbsolute as isAbsolute3, join as join6, resolve as resolve9 } from "path";
+
+// packages/shared/src/review_evidence.ts
+import { createHash as createHash3 } from "crypto";
+function gitPath(value) {
+  let path = value.trim();
+  if (path.startsWith('"')) {
+    try {
+      const octalEncoded = /\\[0-7]{3}/.test(path);
+      path = path.replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8)));
+      path = JSON.parse(path);
+      if (octalEncoded)
+        path = Buffer.from(path, "latin1").toString("utf8");
+    } catch {
+      return "";
+    }
+  }
+  return path.replace(/^[ab]\//, "");
+}
+function splitReviewPatch(diff) {
+  const files = [];
+  let current;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      const match = line.match(/^diff --git ("(?:\\.|[^"\\])*"|a\/.*?) ("(?:\\.|[^"\\])*"|b\/.*)$/);
+      current = {
+        previousPath: match ? gitPath(match[1]) : "",
+        path: match ? gitPath(match[2]) : "",
+        lines: []
+      };
+      files.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  return files;
+}
+function patchHunksComplete(files) {
+  for (const file of files) {
+    let hunk = null;
+    let sawHunk = false;
+    const finished = () => hunk === null || hunk.old === 0 && hunk.next === 0;
+    for (const line of file.lines) {
+      if (line.startsWith("@@")) {
+        if (!finished())
+          return false;
+        const match = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?:.*)$/);
+        if (!match)
+          return false;
+        const old = match[1] === undefined ? 1 : Number(match[1]);
+        const next = match[2] === undefined ? 1 : Number(match[2]);
+        if (!Number.isSafeInteger(old) || !Number.isSafeInteger(next))
+          return false;
+        hunk = { old, next };
+        sawHunk = true;
+      } else if (hunk) {
+        if (line === "\\ No newline at end of file")
+          continue;
+        if (line.startsWith("-"))
+          hunk.old--;
+        else if (line.startsWith("+"))
+          hunk.next--;
+        else if (line.startsWith(" ")) {
+          hunk.old--;
+          hunk.next--;
+        } else if (line !== "" || !finished())
+          return false;
+        if (hunk.old < 0 || hunk.next < 0)
+          return false;
+      }
+    }
+    if (!finished())
+      return false;
+    if (!sawHunk && file.lines.some((line) => /^(?:---|\+\+\+) /.test(line)))
+      return false;
+  }
+  return true;
+}
+function buildCompleteReviewEvidence(options) {
+  const bytes = Buffer.byteLength(options.diff, "utf8");
+  const files = splitReviewPatch(options.diff);
+  const paths = [...new Set(files.map((file) => file.path))];
+  const reasons = [];
+  if (!options.diff.trim())
+    reasons.push("The patch is empty; no implementation review is possible.");
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1 || bytes > options.maxBytes)
+    reasons.push(`The complete patch is ${bytes} UTF-8 bytes, exceeding the ${options.maxBytes}-byte review budget. Split the change or provide a complete bounded review mechanism.`);
+  if (options.captureComplete === false)
+    reasons.push("Patch capture was incomplete. Recapture the complete immutable candidate before review.");
+  if (!files.length || files.some((file) => !file.path))
+    reasons.push("The patch does not provide an unambiguous complete file manifest.");
+  if (!patchHunksComplete(files))
+    reasons.push("Unified patch hunk lengths are incomplete or malformed. Recapture the full patch without trimming its context lines.");
+  if (files.some((file) => file.lines.some((line) => /^(?:Binary files |GIT binary patch)/.test(line))))
+    reasons.push("The patch contains binary changes without reviewable binary evidence.");
+  if (/^(?:\.\.\.\(diff truncated\)|\.\.\. diff truncated .*|\[diff truncated\])$/m.test(options.diff))
+    reasons.push("Patch text explicitly reports truncation.");
+  if (options.expectedPaths) {
+    const observed = new Set(files.flatMap((file) => [file.path, file.previousPath]));
+    const missing = options.expectedPaths.filter((path) => !observed.has(path));
+    if (missing.length)
+      reasons.push(`Patch evidence is missing ${missing.length} expected changed file(s): ${missing.slice(0, 8).join(", ")}.`);
+  }
+  if (options.expectedFileCount !== undefined && options.expectedFileCount !== files.length)
+    reasons.push(`Provider reports ${options.expectedFileCount} changed files, but the patch contains ${files.length}. Recapture matching head/base evidence.`);
+  const complete = reasons.length === 0;
+  return {
+    complete,
+    diff: complete ? options.diff : "",
+    reasons,
+    manifest: {
+      version: 1,
+      candidateSha: options.candidateSha ?? null,
+      baseSha: options.baseSha ?? null,
+      sha256: createHash3("sha256").update(options.diff).digest("hex"),
+      byteLength: bytes,
+      maxBytes: options.maxBytes,
+      paths,
+      expectedPaths: options.expectedPaths ?? null,
+      captureComplete: options.captureComplete !== false,
+      complete
+    }
+  };
+}
+function assertCompleteReviewEvidence(evidence) {
+  if (!evidence.complete || !evidence.manifest.complete)
+    throw new Error(`Review evidence incomplete: ${evidence.reasons.join(" ")}`);
+}
+
+// packages/shared/src/test_hygiene.ts
+function testRemovalExplicitlyRequested(taskIntent) {
+  const text = String(taskIntent ?? "").replace(/[\u2019\u2018]/g, "'").replace(/\s+/g, " ").trim();
+  if (/\b(?:not|never|without|avoid|forbid|forbidden|prohibit|prohibited|prevent|don't|doesn't|mustn't|shouldn't|cannot|can't)\b.{0,100}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b.{0,100}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:not|never|mustn't|shouldn't|cannot|can't)\b.{0,40}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b/i.test(text) || /\b(?:preserve|retain|maintain|keep)\b.{0,100}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b/i.test(text) && /\b(?:not|never|without|avoid|don't|mustn't|shouldn't|cannot|can't)\b.{0,80}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b/i.test(text))
+    return false;
+  return /(?:^|[.;:]\s*|\bplease\s+)(?:delete|remove|retire|replace|consolidate|migrate|refactor)\b[^.;:!?]{0,80}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b.{0,40}\b(?:must|should|need to)\s+be\s+(?:deleted|removed|retired|replaced|consolidated|migrated|refactored)\b/i.test(text);
+}
+function empty() {
+  return { cases: 0, suites: 0, parameterized: 0, disabled: 0, focused: 0, unknown: 0 };
+}
+function testSourcePath(path) {
+  if (!/\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|kts|cs|fs|php|swift)$/i.test(path))
+    return false;
+  return /(?:^|\/)(?:__tests__|tests?|specs?)(?:\/|$)|\.(?:test|spec)\.|(?:^|\/)test_[^/]+\.py$|_test\.go$|_spec\.rb$|(?:Test|Tests|Spec)\.(?:java|kt|kts|cs|fs|php|swift)$/i.test(path) || /\.rs$/.test(path);
+}
+function codeLine(source, state, path) {
+  let line = source.trim();
+  if (state.triple) {
+    if (line.includes(state.triple))
+      state.triple = null;
+    return "";
+  }
+  if (/\.py$/.test(path) && /^(?:[rubf]*)?(?:'''|""")/i.test(line)) {
+    const marker = line.includes('"""') ? '"""' : "'''";
+    if (line.indexOf(marker) === line.lastIndexOf(marker))
+      state.triple = marker;
+    return "";
+  }
+  if (state.template) {
+    if (/(?<!\\)`/.test(line))
+      state.template = false;
+    return "";
+  }
+  if (/\.rb$/.test(path) && /^=begin\b/.test(line)) {
+    state.triple = "=end";
+    return "";
+  }
+  if (state.block) {
+    const end = line.indexOf("*/");
+    if (end < 0)
+      return "";
+    state.block = false;
+    line = line.slice(end + 2).trim();
+  }
+  while (line.startsWith("/*")) {
+    const end = line.indexOf("*/", 2);
+    if (end < 0) {
+      state.block = true;
+      return "";
+    }
+    line = line.slice(end + 2).trim();
+  }
+  if (/^(?:\/\/|\*|#(?!\[))/.test(line))
+    return "";
+  let code = "";
+  for (let index = 0;index < line.length; index++) {
+    const char = line[index];
+    if (line.startsWith("//", index) || /\.(?:py|rb)$/.test(path) && char === "#")
+      break;
+    if (line.startsWith("/*", index)) {
+      const end = line.indexOf("*/", index + 2);
+      if (end < 0) {
+        state.block = true;
+        break;
+      }
+      index = end + 1;
+      continue;
+    }
+    const triple = line.slice(index, index + 3);
+    if (/\.(?:py|java|kt|kts)$/.test(path) && (triple === '"""' || triple === "'''")) {
+      const end = line.indexOf(triple, index + 3);
+      if (end < 0) {
+        state.triple = triple;
+        break;
+      }
+      index = end + 2;
+      code += "'text'";
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      code += char;
+      let end = index + 1;
+      for (;end < line.length; end++) {
+        if (line[end] === "\\") {
+          end++;
+          continue;
+        }
+        if (line[end] === char)
+          break;
+      }
+      if (end >= line.length && char === "`")
+        state.template = true;
+      code += char;
+      index = end;
+      continue;
+    }
+    code += char;
+  }
+  return code.trim();
+}
+function observe(line, counts) {
+  if (!line)
+    return;
+  if (/^(?:(?:test|it|describe|context|suite)(?:\.[A-Za-z_$][\w$]*)*\s*$|\.(?:each|for|only|skip|todo|skipIf|runIf)\b)/.test(line)) {
+    counts.unknown += 1;
+    if (/\.(?:each|for)\b/.test(line))
+      counts.parameterized += 1;
+    return;
+  }
+  const js = line.match(/^(?:await\s+)?(test|it|describe|context|suite|xdescribe|xcontext|xtest|xit|fdescribe|fit)(\s*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:\(|`)/);
+  if (js) {
+    const name = js[1];
+    const modifiers = js[2] ?? "";
+    const suite = /describe|context|suite/.test(name);
+    if (suite)
+      counts.suites += 1;
+    else
+      counts.cases += 1;
+    if (/\.(?:each|for)\b/.test(modifiers))
+      counts.parameterized += 1;
+    if (/^x/.test(name) || /\.(?:skip|todo|fixme)\b/.test(modifiers))
+      counts.disabled += 1;
+    if (/^f/.test(name) || /\.only\b/.test(modifiers))
+      counts.focused += 1;
+    if (/\.(?:skipIf|runIf)\b/.test(modifiers))
+      counts.unknown += 1;
+    return;
+  }
+  if (/^(?:RSpec\.)?(?:describe|context)\b/.test(line))
+    counts.suites += 1;
+  else if (/^(?:it|specify|scenario)\s+["']/.test(line))
+    counts.cases += 1;
+  else if (/^(?:(?:async\s+)?def\s+test_\w*\s*\(|func\s+[Tt]est\w*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|protected\s+)?function\s+test\w*\s*\()/i.test(line))
+    counts.cases += 1;
+  if (/^(?:@(?:pytest\.mark\.)?(?:parametrize|ParameterizedTest)|\[(?:Theory|TestCase)|#\[(?:rstest|case))\b/.test(line))
+    counts.parameterized += 1;
+  if (/^(?:@(?:pytest\.mark\.|unittest\.)?(?:skip|skipIf|skipUnless|xfail|Disabled|Ignore)\b|#\[ignore\b|\[(?:Ignore|Explicit)\b|\[(?:Fact|Theory|TestCase)[^\]]*\bSkip\s*=)/i.test(line))
+    counts.disabled += 1;
+  if (/^(?:pytest\.skip|pytest\.xfail|t\.Skip(?:f|Now)?|GTEST_SKIP)\s*\(/.test(line))
+    counts.disabled += 1;
+}
+function analyzeTestHygieneDiff(diff, options = {}) {
+  const files = [];
+  const blockingIssues = [];
+  const semanticReviewNotes = [];
+  for (const patch of splitReviewPatch(diff)) {
+    if (!testSourcePath(patch.path) && !testSourcePath(patch.previousPath))
+      continue;
+    const file = {
+      path: patch.path,
+      previousPath: patch.previousPath,
+      added: empty(),
+      removed: empty(),
+      context: empty(),
+      disposition: "no_structural_change"
+    };
+    const before = { block: false, triple: null, template: false };
+    const after = { block: false, triple: null, template: false };
+    for (const raw of patch.lines) {
+      if (/^(?:---|\+\+\+|@@|\\ No newline)/.test(raw))
+        continue;
+      if (raw.startsWith("-"))
+        observe(codeLine(raw.slice(1), before, patch.previousPath), file.removed);
+      else if (raw.startsWith("+"))
+        observe(codeLine(raw.slice(1), after, patch.path), file.added);
+      else if (raw.startsWith(" ")) {
+        const line = codeLine(raw.slice(1), before, patch.previousPath);
+        codeLine(raw.slice(1), after, patch.path);
+        observe(line, file.context);
+      }
+    }
+    const newlyDisabled = file.added.disabled > file.removed.disabled;
+    const addedWeakening = file.added.focused > file.removed.focused || newlyDisabled && (file.removed.cases > 0 || file.removed.suites > 0 || file.context.cases > 0 || file.context.suites > 0);
+    const ambiguous = file.added.cases > 0 || file.added.parameterized > 0 || file.removed.parameterized > 0 || file.context.parameterized > 0 || file.added.unknown > 0 || file.removed.unknown > 0;
+    if (addedWeakening) {
+      file.disposition = "blocking";
+      blockingIssues.push(`${file.path}: adds skipped/disabled or focused-only test execution. Restore normal coverage or explicitly resolve the test policy before publication.`);
+    } else if (file.removed.cases >= 3 && !ambiguous && !options.allowTestRemoval) {
+      file.disposition = "blocking";
+      blockingIssues.push(`${file.path}: removes ${file.removed.cases} existing test declarations without replacement cases in that file. Preserve equivalent coverage or justify the explicit test-removal task.`);
+    } else if (file.added.cases || file.removed.cases || file.added.suites || file.removed.suites || file.added.parameterized || file.removed.parameterized || file.added.unknown || file.removed.unknown || newlyDisabled || patch.path !== patch.previousPath) {
+      file.disposition = "semantic_review";
+      semanticReviewNotes.push(`${file.path}: compare actual assertions and exercised cases across the refactor (cases -${file.removed.cases}/+${file.added.cases}, suites -${file.removed.suites}/+${file.added.suites}, parameterized/unknown=${ambiguous}). Counts do not prove equivalent coverage; do not approve solely from this structural check.`);
+    }
+    files.push(file);
+  }
+  return { files, blockingIssues, semanticReviewNotes };
+}
+
+// apps/source_control_manager/src/review_agent.ts
 async function listPersistedPrLinks(opts) {
   const headers = {};
   if (opts.authToken)
@@ -7745,6 +8073,24 @@ async function listPersistedPrLinks(opts) {
   return { links, nextCursor: nextCursor || null };
 }
 var MAX_DIFF_BYTES = 150000;
+function reviewEvidence(diff, pr) {
+  const fileCount = pr.changed_files;
+  return buildCompleteReviewEvidence({
+    diff,
+    maxBytes: MAX_DIFF_BYTES,
+    candidateSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    ...Number.isSafeInteger(fileCount) && Number(fileCount) >= 0 ? { expectedFileCount: fileCount } : {}
+  });
+}
+function isReviewEvidenceHold(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed?.event === "review_evidence_hold" && parsed?.version === 1 && parsed?.manifest?.complete === false && Array.isArray(parsed?.reasons);
+  } catch {
+    return false;
+  }
+}
 var MAX_PR_RE_REVIEW_ENQUEUES = 3;
 var MAX_REVIEW_CONTEXT_COMMENTS = 8;
 var MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
@@ -8102,8 +8448,9 @@ function extractPrMeta(body) {
   };
 }
 function buildReviewPrompt(reviewerMd, pr, diff, passThreshold) {
-  const truncatedDiff = diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}
-...(diff truncated)` : diff;
+  const evidence = reviewEvidence(diff, pr);
+  assertCompleteReviewEvidence(evidence);
+  const hygiene = analyzeTestHygieneDiff(diff);
   const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
   return loadPromptTemplate("review_agent/review_prompt_template.md", {
     pass_threshold: normalizedThreshold.toFixed(1),
@@ -8112,8 +8459,13 @@ function buildReviewPrompt(reviewerMd, pr, diff, passThreshold) {
     pr_title: String(pr.title ?? ""),
     head_ref: String(pr.head?.ref ?? ""),
     base_ref: String(pr.base?.ref ?? ""),
-    diff: truncatedDiff
-  });
+    diff: evidence.diff
+  }) + `
+
+Complete patch manifest (host-derived):
+` + JSON.stringify(evidence.manifest) + `
+Test coverage evidence (structural observations, not approval):
+` + JSON.stringify({ files: hygiene.files, semanticReviewNotes: hygiene.semanticReviewNotes });
 }
 function formatRejectionComment(verdict) {
   const reasoning = deriveReviewGuidance(verdict).items;
@@ -8372,23 +8724,6 @@ function uniqueNonEmptyLines(values) {
   }
   return out;
 }
-function testDeclarationCounts(diff) {
-  let added = 0;
-  let removed = 0;
-  for (const line of diff.split(/\r?\n/)) {
-    if (!/^[+-](?![+-])/.test(line))
-      continue;
-    const declaration = line.slice(1).trim();
-    const isTestDeclaration = /^(?:(?:test|it|describe|context|RSpec\.describe)\s*\(|(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|func\s+Test[A-Za-z0-9_]*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|private\s+|internal\s+)?(?:async\s+)?(?:void|Task|ValueTask|func)\s+[Tt]est[A-Za-z0-9_]*\s*\(|(?:public\s+|protected\s+)?function\s+test[A-Za-z0-9_]*\s*\()/i.test(declaration);
-    if (!isTestDeclaration)
-      continue;
-    if (line.startsWith("+"))
-      added += 1;
-    else
-      removed += 1;
-  }
-  return { added, removed };
-}
 function isReviewTestPath(path) {
   const normalized = path.replace(/\\/g, "/");
   const base = normalized.split("/").pop() ?? normalized;
@@ -8397,10 +8732,6 @@ function isReviewTestPath(path) {
 function isPushPalsSelfRepository(identity) {
   return /(?:^|[:/])pushpalsdev\/pushpals(?:\.git)?\/?$/i.test(String(identity ?? "").trim());
 }
-function explicitlyAllowsTestRemoval(taskIntent) {
-  const normalized = collapseWhitespace(taskIntent);
-  return /\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b.{0,80}\b(?:test|coverage|suite)s?\b/i.test(normalized) || /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b/i.test(normalized);
-}
 function addedDiffText(diff) {
   return diff.split(/\r?\n/).filter((line) => line.startsWith("+") && !line.startsWith("+++")).map((line) => line.slice(1)).join(`
 `);
@@ -8408,10 +8739,9 @@ function addedDiffText(diff) {
 function collectReviewHygieneIssuesFromDiff(diff, context = {}) {
   const changedPaths = parseChangedPathsFromDiff(diff);
   const issues = [];
-  const declarationCounts = testDeclarationCounts(diff);
-  if (declarationCounts.removed >= 3 && declarationCounts.removed > declarationCounts.added && !explicitlyAllowsTestRemoval(context.taskIntent ?? "")) {
-    issues.push("PR removes multiple existing test declarations without replacing equivalent coverage. Preserve existing coverage unless the task is explicitly a test deletion/refactor.");
-  }
+  issues.push(...analyzeTestHygieneDiff(diff, {
+    allowTestRemoval: testRemovalExplicitlyRequested(context.taskIntent ?? "")
+  }).blockingIssues);
   const changedTestPaths = changedPaths.filter(isReviewTestPath);
   const externalRepo = Boolean(String(context.repositoryIdentity ?? "").trim()) && !isPushPalsSelfRepository(context.repositoryIdentity ?? "");
   const leakedInternalSourceLayout = /(?:^|["'`\s(])(?:\.\.\/)*(?:apps\/(?:workerpals|remotebuddy|source_control_manager)|packages\/cli\/runtime\/sandbox\/apps\/(?:workerpals|remotebuddy|source_control_manager))(?:\/|["'`\s)])/im.test(addedDiffText(diff).replace(/\\/g, "/"));
@@ -8785,8 +9115,9 @@ class ReviewAgent {
   deps;
   headPrefix;
   reviewDecisionKey(pr) {
-    const policy = createHash3("sha256").update(JSON.stringify({
-      contract: 1,
+    const policy = createHash4("sha256").update(JSON.stringify({
+      contract: 2,
+      completePatchBudgetBytes: MAX_DIFF_BYTES,
       model: this.config.model || DEFAULT_OPENAI_CODEX_MODEL,
       launcher: this.config.codexBin,
       threshold: this.config.passThreshold,
@@ -8803,7 +9134,7 @@ class ReviewAgent {
   }
   loadReviewDecision(pr, key) {
     const entry = this.deps.reviewJournal ? this.deps.reviewJournal.getReviewDecision(this.reviewRepositoryKey(), pr.number, key) : this.reviewDecisions.get(`${pr.number}:${key}`) ?? null;
-    if (entry && entry.verdictJson !== null && !parseReviewVerdict(entry.verdictJson)) {
+    if (entry && entry.verdictJson !== null && !parseReviewVerdict(entry.verdictJson) && !isReviewEvidenceHold(entry.verdictJson)) {
       throw new Error(`Refusing review of PR #${pr.number}: durable review evidence is invalid`);
     }
     const count = this.deps.reviewJournal?.getReviewRepairEnqueueCount(this.reviewRepositoryKey(), pr.number) ?? 0;
@@ -9405,6 +9736,8 @@ class ReviewAgent {
       return;
     }
     this.assertReviewPolicyUnchanged(pr);
+    if (!await this.confirmReviewRevisionCurrent(pr))
+      return;
     if (!diff.trim()) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has an empty diff - skipping`);
       this.reviewed.set(pr.number, revisionFingerprint);
@@ -9415,14 +9748,27 @@ class ReviewAgent {
       });
       return;
     }
-    if (diff.length > MAX_DIFF_BYTES * 2) {
-      this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} diff is too large (${diff.length} bytes) - skipping`);
-      this.reviewed.set(pr.number, revisionFingerprint);
+    const evidence = reviewEvidence(diff, pr);
+    if (!evidence.complete) {
+      this.deps.logWarn(`[${ts()}] [ReviewAgent] reviewEvidenceHold=${JSON.stringify({
+        event: "review_evidence_hold",
+        version: 1,
+        prNumber: pr.number,
+        manifest: evidence.manifest,
+        reasons: evidence.reasons,
+        action: "Provide complete reviewable evidence or split the PR; a changed head/base or review policy permits another review. No approval or coding retry was issued."
+      })}`);
       this.saveReviewDecision(pr, revisionFingerprint, {
-        verdictJson: null,
+        verdictJson: JSON.stringify({
+          event: "review_evidence_hold",
+          version: 1,
+          manifest: evidence.manifest,
+          reasons: evidence.reasons
+        }),
         finalized: true,
         repairEnqueues: 0
       });
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
     const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff, {
@@ -10551,7 +10897,7 @@ function resolveReconciledReviewValidationPlan(value, deferredCommands) {
 }
 
 // apps/source_control_manager/src/validation_repair_publication.ts
-import { createHash as createHash4 } from "crypto";
+import { createHash as createHash5 } from "crypto";
 var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 var MAX_REPAIR_CHAIN_COMMITS = 32;
 function normalizeSha3(value) {
@@ -10559,7 +10905,7 @@ function normalizeSha3(value) {
   return SHA_RE2.test(normalized) ? normalized : "";
 }
 function validationCheckpointNamespace(completionId) {
-  const key = createHash4("sha256").update(String(completionId)).digest("hex").slice(0, 32);
+  const key = createHash5("sha256").update(String(completionId)).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function validationCheckpointRefs(completionId, claimGeneration) {
@@ -11126,6 +11472,46 @@ function assertReviewPublicationBaseUnchanged(expectedBaseSha, current) {
     throw new ReviewPublicationDeferredError("review_base_moved", `Review target base advanced from ${expectedBaseSha.slice(0, 8)} to ${current.baseSha.slice(0, 8)} during validation; retaining the candidate for a fresh bounded host reconciliation.`, { expectedBaseSha, currentBaseSha: current.baseSha });
 }
 
+// apps/source_control_manager/src/publication_validation.ts
+class PublicationValidationUnavailableError extends Error {
+  pending;
+  constructor(pending, message) {
+    super(message);
+    this.pending = pending;
+    this.name = "PublicationValidationUnavailableError";
+  }
+}
+async function resolveOrdinaryPublicationValidation(options) {
+  const tree = async (sha) => {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha))
+      return null;
+    try {
+      const result = await options.git(["rev-parse", "--verify", `${sha}^{tree}`]);
+      const value = result.stdout.trim();
+      return result.ok && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value) ? value.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  };
+  const workerTreeSha = await tree(options.originalCandidateSha);
+  const candidateTreeSha = await tree(options.candidateSha);
+  if (workerTreeSha && workerTreeSha === candidateTreeSha) {
+    return {
+      commandsJson: options.deferredCommandsJson,
+      binding: { workerTreeSha, candidateTreeSha, planSource: "identical_worker_tree" }
+    };
+  }
+  const plan = resolveReconciledReviewValidationPlan(options.fullPlan, options.deferredCommandsJson);
+  if (plan.status !== "ready") {
+    const pending = plan.status === "pending" && options.claimGeneration < 3;
+    throw new PublicationValidationUnavailableError(pending, `${plan.reason ?? "Full worker validation authority is unavailable."} ${pending ? "Retaining the candidate for a bounded diagnostics-aware claim retry." : "Publication is held; the exact candidate is retained and other completions may proceed."}`);
+  }
+  return {
+    commandsJson: JSON.stringify(plan.commands),
+    binding: { workerTreeSha, candidateTreeSha, planSource: "full_worker_plan" }
+  };
+}
+
 // apps/source_control_manager/src/pr_title.ts
 function firstNonEmptyLine(value) {
   const raw = (value ?? "").trim();
@@ -11522,7 +11908,7 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 }
 
 // apps/source_control_manager/src/dependency_artifact_cache.ts
-import { createHash as createHash5 } from "crypto";
+import { createHash as createHash6 } from "crypto";
 import {
   accessSync,
   closeSync as closeSync3,
@@ -11637,7 +12023,7 @@ function resolveTrustedDependencyArtifactCache(options) {
     const stat = statSync4(executable);
     executableStat = { size: stat.size, mtimeMs: stat.mtimeMs };
   } catch {}
-  const identity = createHash5("sha256").update(JSON.stringify({
+  const identity = createHash6("sha256").update(JSON.stringify({
     version: 1,
     platform: options.platform ?? process.platform,
     arch: options.arch ?? process.arch,
@@ -11717,7 +12103,7 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash7, randomUUID as randomUUID3 } from "crypto";
 import {
   closeSync as closeSync4,
   existsSync as existsSync6,
@@ -11739,7 +12125,7 @@ var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
 var MAX_ADDITIONAL_VALIDATION_REFS = 24;
 function validationNamespace(completionId) {
-  const key = createHash6("sha256").update(completionId).digest("hex").slice(0, 32);
+  const key = createHash7("sha256").update(completionId).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function isSafePushpalsRef(value) {
@@ -11858,7 +12244,7 @@ class CompletionGcJournal {
     mkdirSync4(this.directory, { recursive: true });
   }
   pathFor(record) {
-    const key = createHash6("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    const key = createHash7("sha256").update(record.completionId).digest("hex").slice(0, 32);
     return join7(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
@@ -12246,7 +12632,7 @@ async function isValidationCheckpointPublished(options) {
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash as createHash7 } from "crypto";
+import { createHash as createHash8 } from "crypto";
 import { existsSync as existsSync7, readFileSync as readFileSync9, rmSync, writeFileSync as writeFileSync4 } from "fs";
 import { basename as basename5, resolve as resolve12 } from "path";
 
@@ -12262,7 +12648,7 @@ var VALIDATION_SUBSTEP_LIMITS = Object.freeze({
   ignoredLines: 1e6
 });
 
-// apps/source_control_manager/src/validation_substeps.ts
+// packages/shared/src/validation_substep_collector.ts
 function parseLine(raw) {
   const line = raw.replace(/\u001b\[[0-9;]*m/g, "").replace(/\r$/, "");
   if (/[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(line))
@@ -12464,7 +12850,6 @@ function createValidationSubstepCollector(options = {}) {
     }
   };
 }
-
 // apps/source_control_manager/src/trusted_validation.ts
 function createTrustedValidationSubstepLogger(identity, log = console.log) {
   return (event) => {
@@ -12602,7 +12987,7 @@ function trustedValidationInstallFingerprint(options) {
   ].find((path) => existsSync7(path));
   if (!existsSync7(packagePath) || !lockPath)
     return null;
-  const hash = createHash7("sha256");
+  const hash = createHash8("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
@@ -13331,7 +13716,7 @@ console.log(`[${ts2()}] Lock acquired`);
 var dbPath = join8(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
-var sourceControlManagerPusherId = `source_control_manager-${createHash8("sha256").update(`${config.repoPath}
+var sourceControlManagerPusherId = `source_control_manager-${createHash9("sha256").update(`${config.repoPath}
 ${config.mainBranch}
 ${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID4().slice(0, 8)}`;
 var repositoryServices = createRepositoryAgentServiceClients({
@@ -13894,6 +14279,7 @@ async function tick() {
     let trustedValidationAffectedPaths = [];
     let trustedValidationResults = [];
     let validationCommandsJson = completion.trustedValidationCommandsJson;
+    let publicationValidationBinding;
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
     let validationCheckpointPersisted = false;
@@ -13908,12 +14294,13 @@ async function tick() {
     let preparedReviewBaseSha = null;
     let originalReviewPushAttempted = false;
     const completionValidationRefs = validationCheckpointRefs(completion.id, completionClaimGeneration);
-    const trustedValidationReport = () => completion.trustedValidationCommandsJson || isOriginalPrReviewPublication ? {
+    const trustedValidationReport = () => trustedValidationCandidateSha ? {
       version: 1,
       baselineSha: trustedValidationBaselineSha,
       candidateSha: trustedValidationCandidateSha,
       candidateRef: trustedValidationCandidateRef,
-      results: trustedValidationResults
+      results: trustedValidationResults,
+      treeBinding: publicationValidationBinding
     } : null;
     const persistExactValidationCheckpoint = async () => {
       if (validationCheckpointPersisted || !trustedValidationBaselineSha || !trustedValidationCandidateSha) {
@@ -14244,6 +14631,24 @@ async function tick() {
           deferredCommandsJson: completion.trustedValidationCommandsJson,
           fullPlan: completion.reviewValidationPlan
         });
+      } else if (!skipValidationForDurableRecovery && !reviewPublicationLease) {
+        const validation = await resolveOrdinaryPublicationValidation({
+          originalCandidateSha: completion.commitSha,
+          candidateSha: trustedValidationCandidateSha,
+          claimGeneration: completionClaimGeneration,
+          deferredCommandsJson: completion.trustedValidationCommandsJson,
+          fullPlan: completion.reviewValidationPlan,
+          git: validationGit
+        });
+        validationCommandsJson = validation.commandsJson;
+        publicationValidationBinding = validation.binding;
+        console.log(`[${ts2()}] publicationValidationBinding=${JSON.stringify({
+          completionId: completion.id,
+          jobId: completion.jobId,
+          workerCandidateSha: completion.commitSha,
+          candidateSha: trustedValidationCandidateSha,
+          ...validation.binding
+        })}`);
       }
       if (!skipValidationForDurableRecovery && validationCommandsJson && trustedValidationBaselineSha && trustedValidationCandidateSha) {
         const affectedPathDiff = await validationGit([
@@ -14600,6 +15005,7 @@ async function tick() {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err) {
+      const ordinaryValidationUnavailable = err instanceof PublicationValidationUnavailableError ? err : null;
       let reviewDeferred = err instanceof ReviewPublicationDeferredError ? err : null;
       let reviewSuperseded = err instanceof ReviewPublicationSupersededError ? err : null;
       const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
@@ -14648,6 +15054,16 @@ async function tick() {
         }
       }
       let publicationOutcome;
+      if (ordinaryValidationUnavailable && !ordinaryValidationUnavailable.pending && validationCheckpointPersisted && trustedValidationCandidateSha && trustedValidationCandidateRef) {
+        publicationOutcome = {
+          version: 1,
+          code: "publication_validation_unavailable",
+          scope: "ordinary_completion",
+          workerCandidateSha: completion.commitSha,
+          retainedCandidateSha: trustedValidationCandidateSha,
+          retainedCandidateRef: trustedValidationCandidateRef
+        };
+      }
       if (reviewSuperseded || reviewDeferred?.code === "review_base_conflict" || reviewDeferred?.code === "review_validation_unavailable") {
         try {
           publicationOutcome = buildReviewPublicationSettlement({
@@ -14666,13 +15082,14 @@ async function tick() {
           reviewDeferred = settlementError instanceof ReviewPublicationDeferredError ? settlementError : new ReviewPublicationDeferredError("review_authority_unavailable", String(settlementError));
         }
       }
-      const failureDisposition = reviewPublicationFailureDisposition(reviewDeferred, publicationFailureDisposition({
+      const baseFailureDisposition = reviewPublicationFailureDisposition(reviewDeferred, publicationFailureDisposition({
         publicationReadyForFinalization,
         publicationAttemptUncertain,
         publicationConfirmationPending,
         authoritativeReprobe,
         validatedCheckpointRecoveryPending
       }));
+      const failureDisposition = ordinaryValidationUnavailable?.pending && baseFailureDisposition === "fail" ? "reconcile" : baseFailureDisposition;
       if (failureDisposition === "finalize") {
         console.warn(`[${ts2()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`);
         try {
@@ -14681,6 +15098,15 @@ async function tick() {
           console.warn(`[${ts2()}] Could not emit pending-finalization status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }
       } else if (failureDisposition === "reconcile") {
+        if (ordinaryValidationUnavailable)
+          console.warn(`[${ts2()}] publicationValidationDeferred=${JSON.stringify({
+            event: "publication_validation_deferred",
+            completionId: completion.id,
+            jobId: completion.jobId,
+            claimGeneration: completionClaimGeneration,
+            retry: "bounded_next_completion_lease",
+            detail: ordinaryValidationUnavailable.message
+          })}`);
         if (reviewDeferred)
           console.warn(`[${ts2()}] reviewPublicationDeferred=${JSON.stringify({
             event: "review_publication_deferred",
@@ -14695,7 +15121,7 @@ async function tick() {
           })}`);
         console.warn(`[${ts2()}] Publication outcome is not yet confirmed for ${completion.id}. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`);
         try {
-          await emitPusherMessage(comm, reviewDeferred ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.` : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`, completion.id, completionEventMeta);
+          await emitPusherMessage(comm, ordinaryValidationUnavailable ? `Publication validation evidence is pending for ${completion.id.slice(0, 8)}. The exact candidate is retained for a bounded diagnostics-aware retry; no PR authority or worker coding retry is required.` : reviewDeferred ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.` : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`, completion.id, completionEventMeta);
         } catch (messageError) {
           console.warn(`[${ts2()}] Could not emit uncertain-publication status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }

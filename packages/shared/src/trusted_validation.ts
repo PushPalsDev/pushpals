@@ -1,6 +1,8 @@
 import type { ValidationSubstepReport } from "./validation_substeps.js";
 
-export const MAX_TRUSTED_VALIDATION_COMMANDS = 8;
+// A full publication plan includes worker gates plus explicit planning gates.
+// Keep a hard bound, but do not reject ordinary 9–16 gate worker plans.
+export const MAX_TRUSTED_VALIDATION_COMMANDS = 32;
 export const MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1_000;
 
 const TRUSTED_VALIDATION_EXECUTABLES = new Set([
@@ -102,6 +104,12 @@ export interface TrustedValidationReport {
   /** Durable hidden ref retaining the exact tree that trusted validation executed. */
   candidateRef: string | null;
   results: TrustedValidationExecutionResult[];
+  /** Host-observed immutable tree comparison, never supplied as worker proof. */
+  treeBinding?: {
+    workerTreeSha: string | null;
+    candidateTreeSha: string | null;
+    planSource: "identical_worker_tree" | "full_worker_plan";
+  };
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;

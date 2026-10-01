@@ -158,6 +158,15 @@ export interface RepositoryAgentDiscoveryProgress {
   /** The host durably advanced from this window's final page to another window. */
   nextWindowAvailable?: boolean;
   excludedCandidateCount: number;
+  window?: number;
+  windowCount?: number;
+  globalPage?: number;
+  outcome?:
+    | "candidates_found"
+    | "no_actionable_candidate"
+    | "insufficient_evidence"
+    | "delivery_deferred";
+  retryAt?: string;
 }
 
 export interface RepositoryAgentResult {
@@ -959,6 +968,21 @@ function sanitizeDiscoveryProgress(value: unknown): RepositoryAgentDiscoveryProg
   return {
     page,
     pageCount,
+    ...(value.window === undefined ? {} : { window: integer("window", 1, 6_667) }),
+    ...(value.windowCount === undefined ? {} : { windowCount: integer("windowCount", 1, 6_667) }),
+    ...(value.globalPage === undefined ? {} : { globalPage: integer("globalPage", 1, 6_667) }),
+    ...(typeof value.outcome === "string" &&
+    [
+      "candidates_found",
+      "no_actionable_candidate",
+      "insufficient_evidence",
+      "delivery_deferred",
+    ].includes(value.outcome)
+      ? { outcome: value.outcome as RepositoryAgentDiscoveryProgress["outcome"] }
+      : {}),
+    ...(typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt))
+      ? { retryAt: value.retryAt }
+      : {}),
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
     retryEligible:

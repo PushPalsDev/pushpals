@@ -214,7 +214,7 @@ The compare-and-set `expectedRevision` option prevents lost updates. A staged wr
 
 RepositoryAgent cache keys include schema version, repository identity, content tree, purpose, assigned model, and prompt version. Ordinary questions additionally include their exact revision and question/context so an empty commit or changed history cannot reuse a history-sensitive answer. RemoteBuddy autonomy-priority requests instead use the `vision.md` fingerprint, normalized deterministic candidate policy, and stable operation/question protocol, deliberately excluding revision-specific Git history, recalled observations, volatile runtime snapshots, open-objective lists, and signal ordering. A same-tree autonomy hit revalidates each cited blob and rebinds it to the current revision before use; downstream deterministic eligibility still filters a reused candidate against current objectives and cooldowns. Only clean snapshots with a cache-permitting freshness policy are eligible. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
 
-The current source uses prompt/cache version `repository-agent-v9-resumable-discovery`.
+The current source uses prompt/cache version `repository-agent-v10-bounded-evidence-followup`.
 This separates resumable analysis and coverage records from earlier cache
 entries; it does not rewrite or clear a running installation's memory. The worker
 applies snapshot-stable candidate admission after evidence verification and before
@@ -415,6 +415,29 @@ For memory issues:
 
 ## Tests That Define the Boundary
 
+Autonomy discovery distinguishes `candidates_found`, `no_actionable_candidate`,
+and `insufficient_evidence`. Only grounded no-action conclusions become durable
+negative coverage. Insufficient context advances the bounded cursor temporarily,
+with a five-minute retry time; an exhausted temporary window does not repeatedly
+call the provider or become a 24-hour negative answer.
+
+The model can request one host-mediated evidence follow-up: at most four tracked
+regular-file windows and two literal searches, with at most 16 KiB of additional
+evidence. Searches inspect a bounded non-sensitive tracked-path index, not the
+whole repository. The clean revision stays fixed, and no model shell or tools
+are enabled. Retrieval has a five-second deadline and must leave twenty seconds
+for synthesis under the original request deadline. Follow-up and schema repair
+share a two-provider-call maximum; ordinary successful analysis remains one call.
+Followed-up negative coverage is conservatively invalidated on tree changes,
+including changes to non-matching search inputs. Other negative pages retain
+consulted-path dependencies. Model-proposed impact should cite an active caller,
+entrypoint, or public contract rather than infer usage from a helper declaration.
+
+Durable discovery progress now includes the global page, window/window count,
+outcome, and temporary retry time. A never-dispatched scheduling rejection does
+not create an executed-work diversity cooldown; normal downstream eligibility
+and hourly budgets remain authoritative.
+
 - `tests/shared.repository-agent-client.test.ts` - sanitization, auth, bounded polling, errors, and worker-control calls.
 - `tests/shared.repository-identity.test.ts` - stable, credential-free identity behavior.
 - `tests/shared.repository-snapshot.test.ts` - clean/dirty snapshots and fail-closed bounded Git behavior.
@@ -425,6 +448,7 @@ For memory issues:
 - `tests/shared.memory.test.ts` and `tests/server.memory-store.test.ts` - scope, evidence, expiry, compare-and-set, reinforcement observations, and restart persistence.
 - `tests/remotebuddy.llm-repository-context.test.ts` - neutral Codex workspace and disabled instruction/tool surfaces.
 - `tests/remotebuddy.repository-agent.test.ts` - deterministic retrieval, structural caching, fresh/cached static admission, bounded progression after rejected proposals, persistent circuit/half-open recovery, partial evidence memory, dirty-snapshot policy, deadlines, and shutdown.
+- `tests/remotebuddy.repository-evidence-followup.test.ts` - path/secret/command boundaries, bounded literal-query proposals, and complete UTF-8 line windows.
 - `tests/remotebuddy.autonomy-candidate-admission.test.ts` - source-verified naming repairs, provenance/range checks, safe rendering, and rejection of genuine internal-work proposals.
 - `tests/remotebuddy.autonomous-engine.tick.test.ts` - downstream eligibility and composed worker-to-engine-to-Server admission without product-specific fixtures.
 

@@ -57,6 +57,96 @@ const OPENAI_CODEX_MIN_REVISION_TURN_BUDGET_MS = 120_000;
 const OPENAI_CODEX_MIN_REVISION_VALIDATION_RESERVE_MS = 90_000;
 const OPENAI_CODEX_VALIDATION_RESERVE_RATIO = 0.25;
 
+/** Allowlist observation-only child metadata; never retain raw commands or ids. */
+export function coerceCodexCommandTimings(value: unknown): Record<string, unknown> | undefined {
+  const object = (entry: unknown): entry is Record<string, unknown> =>
+    Boolean(entry) && typeof entry === "object" && !Array.isArray(entry);
+  if (!object(value) || value.schemaVersion !== 1 || !Array.isArray(value.attempts))
+    return undefined;
+  const counter = (entry: unknown) =>
+    typeof entry === "number" && Number.isInteger(entry) && entry >= 0
+      ? Math.min(entry, 1_000_000)
+      : 0;
+  const duration = (entry: unknown) =>
+    typeof entry === "number" && Number.isFinite(entry) && entry >= 0 && entry <= 86_400_000
+      ? Math.floor(entry)
+      : null;
+  const categories = new Set([
+    "validation",
+    "dependency",
+    "build",
+    "scm",
+    "edit",
+    "discovery",
+    "other",
+  ]);
+  const attempts = value.attempts.slice(-4).flatMap((entry) => {
+    if (
+      !object(entry) ||
+      !Array.isArray(entry.commands) ||
+      !Number.isInteger(entry.attempt) ||
+      Number(entry.attempt) < 1 ||
+      Number(entry.attempt) > 32
+    )
+      return [];
+    const commands = entry.commands.slice(0, 24).flatMap((command) => {
+      if (
+        !object(command) ||
+        typeof command.commandId !== "string" ||
+        !/^command-\d{1,3}$/.test(command.commandId) ||
+        !categories.has(String(command.category)) ||
+        typeof command.incomplete !== "boolean"
+      )
+        return [];
+      return [
+        {
+          commandId: command.commandId,
+          category: command.category as string,
+          digest:
+            typeof command.digest === "string" && /^[a-f\d]{64}$/.test(command.digest)
+              ? command.digest
+              : null,
+          digestSource: "bounded_command_prefix",
+          durationMs: duration(command.durationMs),
+          observedDurationMs: duration(command.observedDurationMs),
+          incomplete: command.incomplete || duration(command.durationMs) === null,
+          exitCode:
+            typeof command.exitCode === "number" &&
+            Number.isInteger(command.exitCode) &&
+            Math.abs(command.exitCode) <= 2_147_483_647
+              ? command.exitCode
+              : null,
+        },
+      ];
+    });
+    return [
+      {
+        attempt: entry.attempt as number,
+        commands,
+        omittedCommands:
+          counter(entry.omittedCommands) + Math.max(0, entry.commands.length - commands.length),
+        omittedEvents: counter(entry.omittedEvents),
+        malformedEvents: counter(entry.malformedEvents),
+        duplicateEvents: counter(entry.duplicateEvents),
+      },
+    ];
+  });
+  const result = {
+    schemaVersion: 1,
+    attempts,
+    omittedAttempts:
+      counter(value.omittedAttempts) + Math.max(0, value.attempts.length - attempts.length),
+  };
+  // Fits inside durable per-attempt metadata, including four recovery runs.
+  while (Buffer.byteLength(JSON.stringify(result), "utf8") > 12_000) {
+    const largest = [...attempts].sort((a, b) => b.commands.length - a.commands.length)[0];
+    if (!largest?.commands.length) return undefined;
+    largest.commands.pop();
+    largest.omittedCommands++;
+  }
+  return attempts.length ? result : undefined;
+}
+
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
 }
@@ -466,6 +556,9 @@ function genericExecutorBoundaryDiagnostics(params: {
   metadata?: Record<string, unknown>;
 }): JobDiagnostics {
   return {
+    ...(params.metadata?.codexCommandTimings
+      ? { metadata: { codexCommandTimings: params.metadata.codexCommandTimings } }
+      : {}),
     terminal: {
       failureClass: params.failureClass,
       terminalStage: "executor",
@@ -776,6 +869,13 @@ export function createGenericPythonExecutor(
       );
       const usageAttempts = coerceJobUsageAttempts(parsed.usageAttempts, backendName, modelId);
       const candidateState = coerceJobCandidateState(parsed.candidateState);
+      const childDiagnostics = parsed.diagnostics as
+        | { metadata?: { codexCommandTimings?: unknown } }
+        | undefined;
+      const commandTimings = coerceCodexCommandTimings(
+        childDiagnostics?.metadata?.codexCommandTimings,
+      );
+      const commandTimingMetadata = commandTimings ? { codexCommandTimings: commandTimings } : {};
       const envelope = validateStructuredJobResultEnvelope(parsed);
       const malformedResult: JobResult | null = envelope.valid
         ? null
@@ -803,7 +903,7 @@ export function createGenericPythonExecutor(
                 exitCode: malformedExitCode,
                 timeoutMs,
                 structuredResult: true,
-                metadata: { schemaValidationError: envelope.detail },
+                metadata: { schemaValidationError: envelope.detail, ...commandTimingMetadata },
               }),
             };
           })();
@@ -836,7 +936,7 @@ export function createGenericPythonExecutor(
             exitCode: 124,
             timeoutMs,
             structuredResult: true,
-            metadata: { processTimedOut: true },
+            metadata: { processTimedOut: true, ...commandTimingMetadata },
           }),
         };
       }
@@ -868,6 +968,7 @@ export function createGenericPythonExecutor(
             metadata: {
               streamDrainTimedOut: true,
               processStateOverrodeStructuredResult: true,
+              ...commandTimingMetadata,
             },
           }),
         };
@@ -910,6 +1011,7 @@ export function createGenericPythonExecutor(
         usage,
         ...(usageAttempts ? { usageAttempts } : {}),
         ...(candidateState ? { candidateState } : {}),
+        ...(commandTimings ? { diagnostics: { metadata: commandTimingMetadata } } : {}),
       };
     } catch (err) {
       const internalErrorDetail = workerOwnedInternalErrorDetail(err);

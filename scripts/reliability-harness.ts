@@ -35,6 +35,7 @@ const phases: HarnessPhase[] = [
       "tests/server.memory-repository-agent-routes.test.ts",
       "tests/remotebuddy.repository-agent.test.ts",
       "tests/remotebuddy.repository-evidence.test.ts",
+      "tests/remotebuddy.repository-evidence-followup.test.ts",
       "tests/remotebuddy.autonomy-candidate-admission.test.ts",
       "tests/remotebuddy.autonomy-validation-filesystem.test.ts",
       "tests/remotebuddy.llm-repository-context.test.ts",
@@ -81,6 +82,9 @@ const phases: HarnessPhase[] = [
     name: "repair_orchestration",
     files: [
       "tests/shared.review-publication-validation.test.ts",
+      "tests/shared.review-evidence.test.ts",
+      "tests/shared.test-hygiene.test.ts",
+      "tests/source-control-manager.publication-validation.test.ts",
       "tests/remotebuddy.autonomous-engine.tick.test.ts",
       "tests/source-control-manager.bounded-process.test.ts",
       "tests/source-control-manager.completion-callback.test.ts",
@@ -109,6 +113,8 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.execute-job-clarification.test.ts",
       "tests/workerpals.quality-gate-issues.test.ts",
       "tests/workerpals.quality-loop-durability.test.ts",
+      "tests/workerpals.observation-regressions.test.ts",
+      "tests/workerpals.job-log-activity.test.ts",
       "tests/workerpals.executor-timeout-recovery.test.ts",
       "tests/workerpals.capability-revision-circuit.test.ts",
       "tests/workerpals.docker-deadline.test.ts",
@@ -137,9 +143,22 @@ const phases: HarnessPhase[] = [
     timeoutMs: 300_000,
   },
   {
+    name: "worker_command_observability",
+    files: ["tests/openai_codex_executor_streaming.test.py"],
+    // The dotted filename is a standalone script, not an importable unittest module.
+    command: [
+      process.env.PYTHON?.trim() || "python",
+      "-u",
+      "tests/openai_codex_executor_streaming.test.py",
+    ],
+    timeoutMs: 30_000,
+  },
+  {
     name: "runtime_boundary",
     files: [
       "tests/server.bounded-json-body.test.ts",
+      "tests/shared.runtime-diagnostics.test.ts",
+      "tests/server.runtime-config-route.test.ts",
       "tests/remotebuddy.worker-startup-progress.test.ts",
       "tests/shared.worker-startup.test.ts",
       "tests/worker-startup.integration.test.ts",

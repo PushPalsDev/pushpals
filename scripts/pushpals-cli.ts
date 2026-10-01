@@ -53,6 +53,7 @@ import {
   type FetchLike,
 } from "../packages/shared/src/bounded_fetch.js";
 import { resolveGitStateFilePath } from "../packages/shared/src/repo.js";
+import { RuntimeLogSinkDiagnostics } from "../packages/shared/src/runtime_diagnostics.js";
 import {
   MINIMUM_SUPPORTED_BUN_VERSION,
   isSupportedBunVersion,
@@ -2711,14 +2712,25 @@ export function buildRuntimeServiceLogPaths(
   };
 }
 
+const runtimeLogSinkDiagnostics = new RuntimeLogSinkDiagnostics();
+
+export function buildEmbeddedRuntimeHealthEnvelope(
+  event: Extract<ManagedServiceLifecycleEvent, { type: "health" }>,
+  logSink: Pick<RuntimeLogSinkDiagnostics, "snapshot"> = runtimeLogSinkDiagnostics,
+) {
+  return {
+    ...event,
+    event: "embedded_runtime_health" as const,
+    supervisorLogSink: logSink.snapshot(),
+  };
+}
+
 function appendRuntimeServicesLogLine(logPath: string, line: string): void {
   const text = String(line ?? "").trim();
   if (!text) return;
-  try {
+  runtimeLogSinkDiagnostics.write(() => {
     appendFileSync(logPath, `${new Date().toISOString()} ${text}\n`, "utf8");
-  } catch {
-    // best-effort diagnostics only
-  }
+  });
 }
 
 function readLogTail(logPath: string, maxLines = 40): string {
@@ -6249,7 +6261,9 @@ async function autoStartRuntimeServices(opts: {
     },
     onLifecycleEvent: (event) => {
       if (event.type === "health") {
-        const line = `[pushpals] embeddedRuntimeHealth=${JSON.stringify({ ...event, event: "embedded_runtime_health" })}`;
+        // Snapshot before this event is written. Sink diagnostics never emit
+        // logs themselves, including on a slow/failed write of this envelope.
+        const line = `[pushpals] embeddedRuntimeHealth=${JSON.stringify(buildEmbeddedRuntimeHealthEnvelope(event))}`;
         appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
         return;
       }
@@ -6293,6 +6307,7 @@ async function autoStartRuntimeServices(opts: {
         restartAttempt: event.restartAttempt,
         observedAt: event.observedAt,
         recoveredAt: recoveryOutcome === "recovered" ? event.observedAt : null,
+        supervisorLogSink: runtimeLogSinkDiagnostics.snapshot(),
       };
       if (event.type !== "restarted") pendingCrashEnvelopes.delete(event.service);
       const line = `[pushpals] embeddedRuntimeRecovery=${JSON.stringify(recovery)}`;
@@ -6357,12 +6372,12 @@ async function autoStartRuntimeServices(opts: {
       },
       onStdoutLine: (line) => {
         const serviceLine = `[stdout] ${line}`;
-        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+        runtimeLogSinkDiagnostics.write(() => appendFileSync(logPath, `${serviceLine}\n`, "utf8"));
         appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
       },
       onStderrLine: (line) => {
         const serviceLine = `[stderr] ${line}`;
-        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+        runtimeLogSinkDiagnostics.write(() => appendFileSync(logPath, `${serviceLine}\n`, "utf8"));
         appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
       },
       healthCheck: embeddedServiceHealthCheck(name, opts.serverUrl, opts.sourceControlManagerPort),

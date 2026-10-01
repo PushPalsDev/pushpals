@@ -60,6 +60,7 @@ export interface CompletionRow {
   error: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Legacy wire name; authoritative full plan for every publication kind. */
   reviewValidationPlan?: ReviewPublicationValidationPlan;
   reviewPublicationAuthority?: {
     repositoryIdentity: string;
@@ -104,6 +105,52 @@ export interface PublicationConflictOutcome extends Omit<
   observedBaseSha: string;
   retainedCandidateSha: string;
   retainedCandidateRef: string;
+}
+
+interface OrdinaryPublicationValidationHold {
+  version: 1;
+  code: "publication_validation_unavailable";
+  scope: "ordinary_completion";
+  workerCandidateSha: string;
+  retainedCandidateSha: string;
+  retainedCandidateRef: string;
+}
+
+function exactOrdinaryPublicationValidationHold(
+  value: unknown,
+  completion: Pick<CompletionRow, "commitSha" | "branch">,
+  jobParams: string,
+): OrdinaryPublicationValidationHold | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  try {
+    // PR repairs retain the stricter original PR tuple/lifecycle authority.
+    const review = JSON.parse(jobParams)?.reviewAgent;
+    if (["review_fix", "merge_conflict"].includes(String(review?.resolutionType))) return null;
+  } catch {
+    return null;
+  }
+  if (completion.branch?.startsWith("refs/pushpals/review/")) return null;
+  if (
+    input.version !== 1 ||
+    input.code !== "publication_validation_unavailable" ||
+    input.scope !== "ordinary_completion" ||
+    input.workerCandidateSha !== completion.commitSha ||
+    typeof input.workerCandidateSha !== "string" ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(input.workerCandidateSha) ||
+    typeof input.retainedCandidateSha !== "string" ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(input.retainedCandidateSha) ||
+    typeof input.retainedCandidateRef !== "string"
+  )
+    return null;
+  return {
+    version: 1,
+    code: "publication_validation_unavailable",
+    scope: "ordinary_completion",
+    workerCandidateSha: input.workerCandidateSha,
+    retainedCandidateSha: input.retainedCandidateSha,
+    retainedCandidateRef: input.retainedCandidateRef,
+  };
 }
 
 function exactPublicationOutcome(
@@ -399,12 +446,30 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
   const candidateSha = trustedValidationText(input.candidateSha, 128) || null;
   const candidateRef = trustedValidationText(input.candidateRef, 512) || null;
   const hasExactCandidateProvenance = Boolean(candidateSha && candidateRef);
+  const binding =
+    input.treeBinding && typeof input.treeBinding === "object"
+      ? (input.treeBinding as Record<string, unknown>)
+      : null;
+  const treeSha = (value: unknown): string | null =>
+    typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value)
+      ? value.toLowerCase()
+      : null;
   return {
     version: 1,
     baselineSha: trustedValidationText(input.baselineSha, 128) || null,
     candidateSha: hasExactCandidateProvenance ? candidateSha : null,
     candidateRef: hasExactCandidateProvenance ? candidateRef : null,
     results,
+    ...(binding &&
+    (binding.planSource === "identical_worker_tree" || binding.planSource === "full_worker_plan")
+      ? {
+          treeBinding: {
+            workerTreeSha: treeSha(binding.workerTreeSha),
+            candidateTreeSha: treeSha(binding.candidateTreeSha),
+            planSource: binding.planSource,
+          },
+        }
+      : {}),
   };
 }
 
@@ -1349,7 +1414,7 @@ export class CompletionQueue {
 
       const claimed = this.getCompletion(row.id);
       if (claimed) {
-        const plan = this.snapshotReviewValidationPlan(claimed, now);
+        const plan = this.snapshotPublicationValidationPlan(claimed, now);
         if (plan) claimed.reviewValidationPlan = plan;
       }
       return claimed;
@@ -1683,7 +1748,12 @@ export class CompletionQueue {
         publicationOutcomeInput === undefined
           ? null
           : exactPublicationOutcome(publicationOutcomeInput, job.params);
-      if (publicationOutcomeInput !== undefined && !publicationOutcome) {
+      const ordinaryHold = exactOrdinaryPublicationValidationHold(
+        publicationOutcomeInput,
+        completion,
+        job.params,
+      );
+      if (publicationOutcomeInput !== undefined && !publicationOutcome && !ordinaryHold) {
         return { ok: false, message: "Invalid exact publication outcome evidence" };
       }
       const superseded = publicationOutcome?.code === "publication_superseded";
@@ -1708,10 +1778,11 @@ export class CompletionQueue {
         if (!lifecycle)
           return { ok: false, message: "Publication no longer owns its exact repair lifecycle" };
       }
-      if (conflict) {
+      const retainedHold = conflict ?? ordinaryHold;
+      if (retainedHold) {
         const namespace = `refs/pushpals/validation/${createHash("sha256").update(completion.id).digest("hex").slice(0, 32)}/`;
-        const suffix = conflict.retainedCandidateRef.startsWith(namespace)
-          ? conflict.retainedCandidateRef.slice(namespace.length)
+        const suffix = retainedHold.retainedCandidateRef.startsWith(namespace)
+          ? retainedHold.retainedCandidateRef.slice(namespace.length)
           : "";
         const match = suffix.match(/^([1-9][0-9]*)\/candidate$/);
         const generation = Number(match?.[1]);
@@ -1719,8 +1790,8 @@ export class CompletionQueue {
           !match ||
           !Number.isSafeInteger(generation) ||
           generation > completion.claimGeneration ||
-          trustedReport?.candidateSha !== conflict.retainedCandidateSha ||
-          trustedReport?.candidateRef !== conflict.retainedCandidateRef
+          trustedReport?.candidateSha !== retainedHold.retainedCandidateSha ||
+          trustedReport?.candidateRef !== retainedHold.retainedCandidateRef
         ) {
           return {
             ok: false,
@@ -1729,8 +1800,9 @@ export class CompletionQueue {
           };
         }
       }
-      const retainedFailure = publicationOutcome
-        ? JSON.stringify({ message: failure, publicationOutcome })
+      const retainedOutcome = publicationOutcome ?? ordinaryHold;
+      const retainedFailure = retainedOutcome
+        ? JSON.stringify({ message: failure, publicationOutcome: retainedOutcome })
         : failure;
 
       const completionUpdated = this.db
@@ -1787,7 +1859,7 @@ export class CompletionQueue {
               : "Candidate publication failed",
             detail: failure,
             completionId,
-            ...(publicationOutcome ? { publicationOutcome } : {}),
+            ...(retainedOutcome ? { publicationOutcome: retainedOutcome } : {}),
           }),
           superseded ? null : now,
           superseded ? now : null,
@@ -1801,8 +1873,8 @@ export class CompletionQueue {
           status: superseded ? "abandoned" : "publish_blocked",
           ...(superseded
             ? { failureClass: "publication_superseded", terminalStage: "publication" }
-            : conflict
-              ? { failureClass: conflict.code, terminalStage: "publication" }
+            : retainedHold
+              ? { failureClass: retainedHold.code, terminalStage: "publication" }
               : this.publicationFailureDiagnostics(completion)),
           summary: failure,
           now,
@@ -1841,13 +1913,13 @@ export class CompletionQueue {
         durationMs: saved?.durationMs ?? undefined,
         publishBlockedAt: saved?.publishBlockedAt ?? undefined,
         ...(superseded ? { publicationSuperseded: true } : {}),
-        ...(conflict ? { publicationHeld: true } : {}),
+        ...(retainedHold ? { publicationHeld: true } : {}),
       };
     });
     return tx();
   }
 
-  private snapshotReviewValidationPlan(
+  private snapshotPublicationValidationPlan(
     completion: CompletionRow,
     now: string,
   ): ReviewPublicationValidationPlan | null {
@@ -1863,9 +1935,16 @@ export class CompletionQueue {
     } catch {
       return null;
     }
-    const review = params?.reviewAgent as Record<string, unknown> | undefined;
-    if (!review || !["review_fix", "merge_conflict"].includes(String(review.resolutionType)))
-      return null;
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      return {
+        version: 1,
+        status: "invalid",
+        commands: [],
+        reason: "The job has malformed validation planning authority.",
+      };
+    }
+    // Every completion may be applied onto a newer integration tree. Ordinary
+    // work needs the same immutable full-plan authority as PR repair work.
     const frozen = this.db
       .query(
         `SELECT jobId, workerClaimGeneration, candidateSha, commandsJson
@@ -1926,7 +2005,11 @@ export class CompletionQueue {
       return fields.flatMap((value) => value as unknown[]);
     };
     const plan = buildReviewPublicationValidationPlan({
-      complete: Boolean(snapshot && snapshot.claimGeneration === job.claimGeneration),
+      complete: Boolean(
+        snapshot &&
+        snapshot.claimGeneration === job.claimGeneration &&
+        snapshot.commandsJson !== "null",
+      ),
       requiredValidationSteps: joinedSteps("requiredValidationSteps"),
       validationSteps: joinedSteps("validationSteps"),
       workerCommands: snapshot?.commandsJson,
@@ -1987,7 +2070,12 @@ export class CompletionQueue {
         const job = this.db.query("SELECT params FROM jobs WHERE id = ?").get(completion.jobId) as {
           params: string;
         } | null;
-        const outcome = job && exactPublicationOutcome(retained, job.params);
+        const fullCompletion = this.getCompletion(completion.id);
+        const outcome =
+          job &&
+          (exactPublicationOutcome(retained, job.params) ??
+            (fullCompletion &&
+              exactOrdinaryPublicationValidationHold(retained, fullCompletion, job.params)));
         if (outcome) return { failureClass: outcome.code, terminalStage: "publication" };
       }
     } catch {
@@ -2098,6 +2186,7 @@ export class CompletionQueue {
           baselineSha: report.baselineSha,
           candidateSha: report.candidateSha,
           candidateRef: report.candidateRef,
+          treeBinding: report.treeBinding,
           failureFingerprint,
           failureFingerprintVersion: 3,
           failedTests,

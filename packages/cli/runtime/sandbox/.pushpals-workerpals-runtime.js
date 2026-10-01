@@ -2097,6 +2097,16 @@ function sanitizeDiscoveryProgress(value) {
   return {
     page,
     pageCount,
+    ...value.window === undefined ? {} : { window: integer("window", 1, 6667) },
+    ...value.windowCount === undefined ? {} : { windowCount: integer("windowCount", 1, 6667) },
+    ...value.globalPage === undefined ? {} : { globalPage: integer("globalPage", 1, 6667) },
+    ...typeof value.outcome === "string" && [
+      "candidates_found",
+      "no_actionable_candidate",
+      "insufficient_evidence",
+      "delivery_deferred"
+    ].includes(value.outcome) ? { outcome: value.outcome } : {},
+    ...typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt)) ? { retryAt: value.retryAt } : {},
     advanced: value.advanced === true,
     boundedCoverageExhausted: value.boundedCoverageExhausted === true,
     retryEligible: value.retryEligible === true && value.advanced === true && value.boundedCoverageExhausted === false && (page < pageCount || nextWindowAvailable),
@@ -2931,7 +2941,7 @@ var DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
-var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 65536;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 var DEFAULT_WORKERPALS_EXECUTION_PLATFORM = "auto";
@@ -7023,6 +7033,65 @@ var OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 540000;
 var OPENAI_CODEX_MIN_REVISION_TURN_BUDGET_MS = 120000;
 var OPENAI_CODEX_MIN_REVISION_VALIDATION_RESERVE_MS = 90000;
 var OPENAI_CODEX_VALIDATION_RESERVE_RATIO = 0.25;
+function coerceCodexCommandTimings(value) {
+  const object = (entry) => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry);
+  if (!object(value) || value.schemaVersion !== 1 || !Array.isArray(value.attempts))
+    return;
+  const counter = (entry) => typeof entry === "number" && Number.isInteger(entry) && entry >= 0 ? Math.min(entry, 1e6) : 0;
+  const duration = (entry) => typeof entry === "number" && Number.isFinite(entry) && entry >= 0 && entry <= 86400000 ? Math.floor(entry) : null;
+  const categories = new Set([
+    "validation",
+    "dependency",
+    "build",
+    "scm",
+    "edit",
+    "discovery",
+    "other"
+  ]);
+  const attempts = value.attempts.slice(-4).flatMap((entry) => {
+    if (!object(entry) || !Array.isArray(entry.commands) || !Number.isInteger(entry.attempt) || Number(entry.attempt) < 1 || Number(entry.attempt) > 32)
+      return [];
+    const commands = entry.commands.slice(0, 24).flatMap((command) => {
+      if (!object(command) || typeof command.commandId !== "string" || !/^command-\d{1,3}$/.test(command.commandId) || !categories.has(String(command.category)) || typeof command.incomplete !== "boolean")
+        return [];
+      return [
+        {
+          commandId: command.commandId,
+          category: command.category,
+          digest: typeof command.digest === "string" && /^[a-f\d]{64}$/.test(command.digest) ? command.digest : null,
+          digestSource: "bounded_command_prefix",
+          durationMs: duration(command.durationMs),
+          observedDurationMs: duration(command.observedDurationMs),
+          incomplete: command.incomplete || duration(command.durationMs) === null,
+          exitCode: typeof command.exitCode === "number" && Number.isInteger(command.exitCode) && Math.abs(command.exitCode) <= 2147483647 ? command.exitCode : null
+        }
+      ];
+    });
+    return [
+      {
+        attempt: entry.attempt,
+        commands,
+        omittedCommands: counter(entry.omittedCommands) + Math.max(0, entry.commands.length - commands.length),
+        omittedEvents: counter(entry.omittedEvents),
+        malformedEvents: counter(entry.malformedEvents),
+        duplicateEvents: counter(entry.duplicateEvents)
+      }
+    ];
+  });
+  const result = {
+    schemaVersion: 1,
+    attempts,
+    omittedAttempts: counter(value.omittedAttempts) + Math.max(0, value.attempts.length - attempts.length)
+  };
+  while (Buffer.byteLength(JSON.stringify(result), "utf8") > 12000) {
+    const largest = [...attempts].sort((a, b) => b.commands.length - a.commands.length)[0];
+    if (!largest?.commands.length)
+      return;
+    largest.commands.pop();
+    largest.omittedCommands++;
+  }
+  return attempts.length ? result : undefined;
+}
 function estimateTokensFromText(text) {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
 }
@@ -7263,6 +7332,7 @@ function appendExecutorFailureDetail(existing, detail) {
 }
 function genericExecutorBoundaryDiagnostics(params) {
   return {
+    ...params.metadata?.codexCommandTimings ? { metadata: { codexCommandTimings: params.metadata.codexCommandTimings } } : {},
     terminal: {
       failureClass: params.failureClass,
       terminalStage: "executor",
@@ -7481,6 +7551,9 @@ function createGenericPythonExecutor(config) {
       const usage = coerceJobTokenUsage(parsed.usage, estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr));
       const usageAttempts = coerceJobUsageAttempts(parsed.usageAttempts, backendName, modelId);
       const candidateState = coerceJobCandidateState(parsed.candidateState);
+      const childDiagnostics = parsed.diagnostics;
+      const commandTimings = coerceCodexCommandTimings(childDiagnostics?.metadata?.codexCommandTimings);
+      const commandTimingMetadata = commandTimings ? { codexCommandTimings: commandTimings } : {};
       const envelope = validateStructuredJobResultEnvelope(parsed);
       const malformedResult = envelope.valid ? null : (() => {
         const malformedSummary = `${backendName} wrapper returned a malformed structured result for ${kind}`;
@@ -7500,7 +7573,7 @@ function createGenericPythonExecutor(config) {
             exitCode: malformedExitCode,
             timeoutMs,
             structuredResult: true,
-            metadata: { schemaValidationError: envelope.detail }
+            metadata: { schemaValidationError: envelope.detail, ...commandTimingMetadata }
           })
         };
       })();
@@ -7532,7 +7605,7 @@ function createGenericPythonExecutor(config) {
             exitCode: 124,
             timeoutMs,
             structuredResult: true,
-            metadata: { processTimedOut: true }
+            metadata: { processTimedOut: true, ...commandTimingMetadata }
           })
         };
       }
@@ -7556,7 +7629,8 @@ function createGenericPythonExecutor(config) {
             structuredResult: true,
             metadata: {
               streamDrainTimedOut: true,
-              processStateOverrodeStructuredResult: true
+              processStateOverrodeStructuredResult: true,
+              ...commandTimingMetadata
             }
           })
         };
@@ -7589,7 +7663,8 @@ function createGenericPythonExecutor(config) {
         exitCode: finalExitCode,
         usage,
         ...usageAttempts ? { usageAttempts } : {},
-        ...candidateState ? { candidateState } : {}
+        ...candidateState ? { candidateState } : {},
+        ...commandTimings ? { diagnostics: { metadata: commandTimingMetadata } } : {}
       };
     } catch (err) {
       const internalErrorDetail = workerOwnedInternalErrorDetail(err);
@@ -8556,7 +8631,7 @@ class Logger {
 }
 
 // apps/workerpals/src/execute_job.ts
-import { createHash as createHash7 } from "crypto";
+import { createHash as createHash8 } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import {
   closeSync as closeSync2,
@@ -8565,6 +8640,7 @@ import {
   fstatSync,
   lstatSync as lstatSync2,
   mkdirSync as mkdirSync3,
+  mkdtempSync as mkdtempSync2,
   openSync as openSync2,
   readdirSync as readdirSync4,
   readFileSync as readFileSync9,
@@ -8689,6 +8765,12 @@ function normalizeUsage(usage) {
     completionTokens,
     totalTokens: promptTokens + completionTokens,
     estimated: usage.estimated === true,
+    ...typeof usage.cachedInputTokens === "number" ? {
+      cachedInputTokens: Math.min(promptTokens, Math.max(0, Math.floor(usage.cachedInputTokens)))
+    } : {},
+    ...typeof usage.reasoningOutputTokens === "number" ? {
+      reasoningOutputTokens: Math.min(completionTokens, Math.max(0, Math.floor(usage.reasoningOutputTokens)))
+    } : {},
     ...usage.backend ? { backend: usage.backend } : {},
     ...usage.modelId ? { modelId: usage.modelId } : {}
   };
@@ -8742,6 +8824,21 @@ class UsageAccumulator {
       usageAttempts: this.attempts(),
       diagnostics: {
         ...result.diagnostics ?? {},
+        terminal: {
+          ...result.diagnostics?.terminal ?? {},
+          metadata: {
+            ...result.diagnostics?.terminal?.metadata ?? {},
+            usageAttempts: this.attempts().slice(-50),
+            usageAttemptCount: this.records.length,
+            usageAttemptsTruncated: this.records.length > 50,
+            usageAttemptsDropped: Math.max(0, this.records.length - 50),
+            usageAccounting: {
+              providerReportedTokens: this.records.filter((r) => !r.estimated).reduce((n, r) => n + r.promptTokens + r.completionTokens, 0),
+              estimatedTextTokens: this.records.filter((r) => r.estimated).reduce((n, r) => n + r.promptTokens + r.completionTokens, 0),
+              aggregation: "detail_of_job_total"
+            }
+          }
+        },
         metadata: {
           ...result.diagnostics?.metadata ?? {},
           usageAttemptCount: this.records.length,
@@ -8752,8 +8849,612 @@ class UsageAccumulator {
   }
 }
 
-// apps/workerpals/src/capability_revision_circuit.ts
+// apps/workerpals/src/codex_usage.ts
+var tokenCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+function parseCodexTerminalUsage(jsonl) {
+  let result = null;
+  for (const line of jsonl.split(/\r?\n/)) {
+    if (!line.includes('"turn.completed"') || line.length > 64000)
+      continue;
+    try {
+      const event = JSON.parse(line);
+      if (event?.type !== "turn.completed")
+        continue;
+      const input = tokenCount(event.usage?.input_tokens);
+      const output = tokenCount(event.usage?.output_tokens);
+      if (input === null || output === null)
+        continue;
+      const cached = tokenCount(event.usage?.cached_input_tokens);
+      const reasoning = tokenCount(event.usage?.reasoning_output_tokens);
+      result = {
+        promptTokens: input,
+        completionTokens: output,
+        totalTokens: input + output,
+        estimated: false,
+        ...cached !== null ? { cachedInputTokens: Math.min(cached, input) } : {},
+        ...reasoning !== null ? { reasoningOutputTokens: Math.min(reasoning, output) } : {}
+      };
+    } catch {}
+  }
+  return result;
+}
+function codexUsageAttempt(options) {
+  const exact = parseCodexTerminalUsage(options.jsonl);
+  const promptTokens = Math.ceil(Math.max(0, options.promptChars) / 3);
+  const completionTokens = Math.ceil(options.finalMessage.length / 3);
+  return {
+    ...exact ?? {
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      estimated: true
+    },
+    stage: options.stage,
+    source: options.source,
+    backend: options.source,
+    modelId: options.modelId,
+    attempt: options.attempt,
+    ...options.timedOut ? { timedOut: true } : {}
+  };
+}
+
+// apps/workerpals/src/command_timing_diagnostics.ts
+function durableCodexCommandTimings(value) {
+  const report = coerceCodexCommandTimings(value);
+  if (!report)
+    return;
+  const attempts = report.attempts;
+  const commands = attempts.flatMap((attempt) => attempt.commands.map((command) => ({
+    recoveryAttempt: attempt.attempt,
+    ...command
+  })));
+  const total = (key) => attempts.reduce((sum, attempt) => sum + Number(attempt[key] ?? 0), 0);
+  return {
+    schemaVersion: 1,
+    observationOnly: true,
+    commands: commands.slice(-50),
+    observedAttemptCount: attempts.length,
+    omittedAttempts: report.omittedAttempts,
+    omittedCommands: total("omittedCommands") + Math.max(0, commands.length - 50),
+    omittedEvents: total("omittedEvents"),
+    malformedEvents: total("malformedEvents"),
+    duplicateEvents: total("duplicateEvents")
+  };
+}
+
+// packages/shared/src/review_evidence.ts
 import { createHash as createHash5 } from "crypto";
+function gitPath(value) {
+  let path = value.trim();
+  if (path.startsWith('"')) {
+    try {
+      const octalEncoded = /\\[0-7]{3}/.test(path);
+      path = path.replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8)));
+      path = JSON.parse(path);
+      if (octalEncoded)
+        path = Buffer.from(path, "latin1").toString("utf8");
+    } catch {
+      return "";
+    }
+  }
+  return path.replace(/^[ab]\//, "");
+}
+function splitReviewPatch(diff) {
+  const files = [];
+  let current;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      const match = line.match(/^diff --git ("(?:\\.|[^"\\])*"|a\/.*?) ("(?:\\.|[^"\\])*"|b\/.*)$/);
+      current = {
+        previousPath: match ? gitPath(match[1]) : "",
+        path: match ? gitPath(match[2]) : "",
+        lines: []
+      };
+      files.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  return files;
+}
+function patchHunksComplete(files) {
+  for (const file of files) {
+    let hunk = null;
+    let sawHunk = false;
+    const finished = () => hunk === null || hunk.old === 0 && hunk.next === 0;
+    for (const line of file.lines) {
+      if (line.startsWith("@@")) {
+        if (!finished())
+          return false;
+        const match = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@(?:.*)$/);
+        if (!match)
+          return false;
+        const old = match[1] === undefined ? 1 : Number(match[1]);
+        const next = match[2] === undefined ? 1 : Number(match[2]);
+        if (!Number.isSafeInteger(old) || !Number.isSafeInteger(next))
+          return false;
+        hunk = { old, next };
+        sawHunk = true;
+      } else if (hunk) {
+        if (line === "\\ No newline at end of file")
+          continue;
+        if (line.startsWith("-"))
+          hunk.old--;
+        else if (line.startsWith("+"))
+          hunk.next--;
+        else if (line.startsWith(" ")) {
+          hunk.old--;
+          hunk.next--;
+        } else if (line !== "" || !finished())
+          return false;
+        if (hunk.old < 0 || hunk.next < 0)
+          return false;
+      }
+    }
+    if (!finished())
+      return false;
+    if (!sawHunk && file.lines.some((line) => /^(?:---|\+\+\+) /.test(line)))
+      return false;
+  }
+  return true;
+}
+function buildCompleteReviewEvidence(options) {
+  const bytes = Buffer.byteLength(options.diff, "utf8");
+  const files = splitReviewPatch(options.diff);
+  const paths = [...new Set(files.map((file) => file.path))];
+  const reasons = [];
+  if (!options.diff.trim())
+    reasons.push("The patch is empty; no implementation review is possible.");
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1 || bytes > options.maxBytes)
+    reasons.push(`The complete patch is ${bytes} UTF-8 bytes, exceeding the ${options.maxBytes}-byte review budget. Split the change or provide a complete bounded review mechanism.`);
+  if (options.captureComplete === false)
+    reasons.push("Patch capture was incomplete. Recapture the complete immutable candidate before review.");
+  if (!files.length || files.some((file) => !file.path))
+    reasons.push("The patch does not provide an unambiguous complete file manifest.");
+  if (!patchHunksComplete(files))
+    reasons.push("Unified patch hunk lengths are incomplete or malformed. Recapture the full patch without trimming its context lines.");
+  if (files.some((file) => file.lines.some((line) => /^(?:Binary files |GIT binary patch)/.test(line))))
+    reasons.push("The patch contains binary changes without reviewable binary evidence.");
+  if (/^(?:\.\.\.\(diff truncated\)|\.\.\. diff truncated .*|\[diff truncated\])$/m.test(options.diff))
+    reasons.push("Patch text explicitly reports truncation.");
+  if (options.expectedPaths) {
+    const observed = new Set(files.flatMap((file) => [file.path, file.previousPath]));
+    const missing = options.expectedPaths.filter((path) => !observed.has(path));
+    if (missing.length)
+      reasons.push(`Patch evidence is missing ${missing.length} expected changed file(s): ${missing.slice(0, 8).join(", ")}.`);
+  }
+  if (options.expectedFileCount !== undefined && options.expectedFileCount !== files.length)
+    reasons.push(`Provider reports ${options.expectedFileCount} changed files, but the patch contains ${files.length}. Recapture matching head/base evidence.`);
+  const complete = reasons.length === 0;
+  return {
+    complete,
+    diff: complete ? options.diff : "",
+    reasons,
+    manifest: {
+      version: 1,
+      candidateSha: options.candidateSha ?? null,
+      baseSha: options.baseSha ?? null,
+      sha256: createHash5("sha256").update(options.diff).digest("hex"),
+      byteLength: bytes,
+      maxBytes: options.maxBytes,
+      paths,
+      expectedPaths: options.expectedPaths ?? null,
+      captureComplete: options.captureComplete !== false,
+      complete
+    }
+  };
+}
+function assertCompleteReviewEvidence(evidence) {
+  if (!evidence.complete || !evidence.manifest.complete)
+    throw new Error(`Review evidence incomplete: ${evidence.reasons.join(" ")}`);
+}
+
+// packages/shared/src/test_hygiene.ts
+function testRemovalExplicitlyRequested(taskIntent) {
+  const text = String(taskIntent ?? "").replace(/[\u2019\u2018]/g, "'").replace(/\s+/g, " ").trim();
+  if (/\b(?:not|never|without|avoid|forbid|forbidden|prohibit|prohibited|prevent|don't|doesn't|mustn't|shouldn't|cannot|can't)\b.{0,100}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b.{0,100}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:not|never|mustn't|shouldn't|cannot|can't)\b.{0,40}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b/i.test(text) || /\b(?:preserve|retain|maintain|keep)\b.{0,100}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b/i.test(text) && /\b(?:not|never|without|avoid|don't|mustn't|shouldn't|cannot|can't)\b.{0,80}\b(?:weaken|delet|reduc|remov|drop|retir|replac|consolidat|migrat|refactor)\w*\b/i.test(text))
+    return false;
+  return /(?:^|[.;:]\s*|\bplease\s+)(?:delete|remove|retire|replace|consolidate|migrate|refactor)\b[^.;:!?]{0,80}\b(?:test|coverage|suite)s?\b/i.test(text) || /\b(?:test|coverage|suite)s?\b.{0,40}\b(?:must|should|need to)\s+be\s+(?:deleted|removed|retired|replaced|consolidated|migrated|refactored)\b/i.test(text);
+}
+function empty() {
+  return { cases: 0, suites: 0, parameterized: 0, disabled: 0, focused: 0, unknown: 0 };
+}
+function testSourcePath(path) {
+  if (!/\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|kts|cs|fs|php|swift)$/i.test(path))
+    return false;
+  return /(?:^|\/)(?:__tests__|tests?|specs?)(?:\/|$)|\.(?:test|spec)\.|(?:^|\/)test_[^/]+\.py$|_test\.go$|_spec\.rb$|(?:Test|Tests|Spec)\.(?:java|kt|kts|cs|fs|php|swift)$/i.test(path) || /\.rs$/.test(path);
+}
+function codeLine(source, state, path) {
+  let line = source.trim();
+  if (state.triple) {
+    if (line.includes(state.triple))
+      state.triple = null;
+    return "";
+  }
+  if (/\.py$/.test(path) && /^(?:[rubf]*)?(?:'''|""")/i.test(line)) {
+    const marker = line.includes('"""') ? '"""' : "'''";
+    if (line.indexOf(marker) === line.lastIndexOf(marker))
+      state.triple = marker;
+    return "";
+  }
+  if (state.template) {
+    if (/(?<!\\)`/.test(line))
+      state.template = false;
+    return "";
+  }
+  if (/\.rb$/.test(path) && /^=begin\b/.test(line)) {
+    state.triple = "=end";
+    return "";
+  }
+  if (state.block) {
+    const end = line.indexOf("*/");
+    if (end < 0)
+      return "";
+    state.block = false;
+    line = line.slice(end + 2).trim();
+  }
+  while (line.startsWith("/*")) {
+    const end = line.indexOf("*/", 2);
+    if (end < 0) {
+      state.block = true;
+      return "";
+    }
+    line = line.slice(end + 2).trim();
+  }
+  if (/^(?:\/\/|\*|#(?!\[))/.test(line))
+    return "";
+  let code = "";
+  for (let index = 0;index < line.length; index++) {
+    const char = line[index];
+    if (line.startsWith("//", index) || /\.(?:py|rb)$/.test(path) && char === "#")
+      break;
+    if (line.startsWith("/*", index)) {
+      const end = line.indexOf("*/", index + 2);
+      if (end < 0) {
+        state.block = true;
+        break;
+      }
+      index = end + 1;
+      continue;
+    }
+    const triple = line.slice(index, index + 3);
+    if (/\.(?:py|java|kt|kts)$/.test(path) && (triple === '"""' || triple === "'''")) {
+      const end = line.indexOf(triple, index + 3);
+      if (end < 0) {
+        state.triple = triple;
+        break;
+      }
+      index = end + 2;
+      code += "'text'";
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      code += char;
+      let end = index + 1;
+      for (;end < line.length; end++) {
+        if (line[end] === "\\") {
+          end++;
+          continue;
+        }
+        if (line[end] === char)
+          break;
+      }
+      if (end >= line.length && char === "`")
+        state.template = true;
+      code += char;
+      index = end;
+      continue;
+    }
+    code += char;
+  }
+  return code.trim();
+}
+function observe(line, counts) {
+  if (!line)
+    return;
+  if (/^(?:(?:test|it|describe|context|suite)(?:\.[A-Za-z_$][\w$]*)*\s*$|\.(?:each|for|only|skip|todo|skipIf|runIf)\b)/.test(line)) {
+    counts.unknown += 1;
+    if (/\.(?:each|for)\b/.test(line))
+      counts.parameterized += 1;
+    return;
+  }
+  const js = line.match(/^(?:await\s+)?(test|it|describe|context|suite|xdescribe|xcontext|xtest|xit|fdescribe|fit)(\s*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:\(|`)/);
+  if (js) {
+    const name = js[1];
+    const modifiers = js[2] ?? "";
+    const suite = /describe|context|suite/.test(name);
+    if (suite)
+      counts.suites += 1;
+    else
+      counts.cases += 1;
+    if (/\.(?:each|for)\b/.test(modifiers))
+      counts.parameterized += 1;
+    if (/^x/.test(name) || /\.(?:skip|todo|fixme)\b/.test(modifiers))
+      counts.disabled += 1;
+    if (/^f/.test(name) || /\.only\b/.test(modifiers))
+      counts.focused += 1;
+    if (/\.(?:skipIf|runIf)\b/.test(modifiers))
+      counts.unknown += 1;
+    return;
+  }
+  if (/^(?:RSpec\.)?(?:describe|context)\b/.test(line))
+    counts.suites += 1;
+  else if (/^(?:it|specify|scenario)\s+["']/.test(line))
+    counts.cases += 1;
+  else if (/^(?:(?:async\s+)?def\s+test_\w*\s*\(|func\s+[Tt]est\w*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|protected\s+)?function\s+test\w*\s*\()/i.test(line))
+    counts.cases += 1;
+  if (/^(?:@(?:pytest\.mark\.)?(?:parametrize|ParameterizedTest)|\[(?:Theory|TestCase)|#\[(?:rstest|case))\b/.test(line))
+    counts.parameterized += 1;
+  if (/^(?:@(?:pytest\.mark\.|unittest\.)?(?:skip|skipIf|skipUnless|xfail|Disabled|Ignore)\b|#\[ignore\b|\[(?:Ignore|Explicit)\b|\[(?:Fact|Theory|TestCase)[^\]]*\bSkip\s*=)/i.test(line))
+    counts.disabled += 1;
+  if (/^(?:pytest\.skip|pytest\.xfail|t\.Skip(?:f|Now)?|GTEST_SKIP)\s*\(/.test(line))
+    counts.disabled += 1;
+}
+function analyzeTestHygieneDiff(diff, options = {}) {
+  const files = [];
+  const blockingIssues = [];
+  const semanticReviewNotes = [];
+  for (const patch of splitReviewPatch(diff)) {
+    if (!testSourcePath(patch.path) && !testSourcePath(patch.previousPath))
+      continue;
+    const file = {
+      path: patch.path,
+      previousPath: patch.previousPath,
+      added: empty(),
+      removed: empty(),
+      context: empty(),
+      disposition: "no_structural_change"
+    };
+    const before = { block: false, triple: null, template: false };
+    const after = { block: false, triple: null, template: false };
+    for (const raw of patch.lines) {
+      if (/^(?:---|\+\+\+|@@|\\ No newline)/.test(raw))
+        continue;
+      if (raw.startsWith("-"))
+        observe(codeLine(raw.slice(1), before, patch.previousPath), file.removed);
+      else if (raw.startsWith("+"))
+        observe(codeLine(raw.slice(1), after, patch.path), file.added);
+      else if (raw.startsWith(" ")) {
+        const line = codeLine(raw.slice(1), before, patch.previousPath);
+        codeLine(raw.slice(1), after, patch.path);
+        observe(line, file.context);
+      }
+    }
+    const newlyDisabled = file.added.disabled > file.removed.disabled;
+    const addedWeakening = file.added.focused > file.removed.focused || newlyDisabled && (file.removed.cases > 0 || file.removed.suites > 0 || file.context.cases > 0 || file.context.suites > 0);
+    const ambiguous = file.added.cases > 0 || file.added.parameterized > 0 || file.removed.parameterized > 0 || file.context.parameterized > 0 || file.added.unknown > 0 || file.removed.unknown > 0;
+    if (addedWeakening) {
+      file.disposition = "blocking";
+      blockingIssues.push(`${file.path}: adds skipped/disabled or focused-only test execution. Restore normal coverage or explicitly resolve the test policy before publication.`);
+    } else if (file.removed.cases >= 3 && !ambiguous && !options.allowTestRemoval) {
+      file.disposition = "blocking";
+      blockingIssues.push(`${file.path}: removes ${file.removed.cases} existing test declarations without replacement cases in that file. Preserve equivalent coverage or justify the explicit test-removal task.`);
+    } else if (file.added.cases || file.removed.cases || file.added.suites || file.removed.suites || file.added.parameterized || file.removed.parameterized || file.added.unknown || file.removed.unknown || newlyDisabled || patch.path !== patch.previousPath) {
+      file.disposition = "semantic_review";
+      semanticReviewNotes.push(`${file.path}: compare actual assertions and exercised cases across the refactor (cases -${file.removed.cases}/+${file.added.cases}, suites -${file.removed.suites}/+${file.added.suites}, parameterized/unknown=${ambiguous}). Counts do not prove equivalent coverage; do not approve solely from this structural check.`);
+    }
+    files.push(file);
+  }
+  return { files, blockingIssues, semanticReviewNotes };
+}
+
+// packages/shared/src/validation_substeps.ts
+var VALIDATION_SUBSTEP_LIMITS = Object.freeze({
+  stages: 64,
+  lines: 65536,
+  lineChars: 4096,
+  labelChars: 512,
+  stageTokenChars: 128,
+  ordinal: 1e4,
+  durationMs: 24 * 60 * 60 * 1000,
+  ignoredLines: 1e6
+});
+
+// packages/shared/src/validation_substep_collector.ts
+function parseLine(raw) {
+  const line = raw.replace(/\u001b\[[0-9;]*m/g, "").replace(/\r$/, "");
+  if (/[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(line))
+    return null;
+  const text = line.trim();
+  const start = /^\[(?:([^\[\]]{1,96})[ \t]+)?([1-9]\d{0,4})\/([1-9]\d{0,4})\][ \t]+\[([^\[\]]+)\][ \t]+(.+)$/.exec(text);
+  if (start) {
+    const aggregatePrefix = (start[1] ?? "").trim().replace(/[ \t]+/g, " ");
+    const ordinal = Number(start[2]);
+    const total = Number(start[3]);
+    const label2 = start[5].trim();
+    if (ordinal > total || total > VALIDATION_SUBSTEP_LIMITS.ordinal || !start[4].trim() || !label2)
+      return null;
+    if (start[4].length > VALIDATION_SUBSTEP_LIMITS.stageTokenChars || label2.length > VALIDATION_SUBSTEP_LIMITS.labelChars)
+      return "limit";
+    return { kind: "start", ordinal, total, label: label2, aggregatePrefix };
+  }
+  const complete = /^\[(ok|fail|error)\][ \t]+/.exec(text);
+  if (!complete)
+    return null;
+  const durationOffset = text.lastIndexOf("(");
+  if (durationOffset <= complete[0].length || !/[ \t]/.test(text[durationOffset - 1]))
+    return null;
+  const duration = /^\((\d+(?:\.\d+)?) ms\)$/.exec(text.slice(durationOffset));
+  if (!duration)
+    return null;
+  const label = text.slice(complete[0].length, durationOffset).trim();
+  const reportedDurationMs = Number(duration[1]);
+  if (!label || !Number.isFinite(reportedDurationMs) || reportedDurationMs > VALIDATION_SUBSTEP_LIMITS.durationMs)
+    return null;
+  if (label.length > VALIDATION_SUBSTEP_LIMITS.labelChars)
+    return "limit";
+  return {
+    kind: "complete",
+    label,
+    marker: complete[1],
+    reportedDurationMs
+  };
+}
+function createValidationSubstepCollector(options = {}) {
+  const stages = new Map;
+  const labelUses = new Map;
+  const ignoredStartLabels = new Set;
+  let ignoredStartLabelsOverflowed = false;
+  let total = null;
+  let aggregatePrefix = null;
+  let observedLines = 0;
+  let ignoredLines = 0;
+  let truncated = false;
+  let finished = false;
+  const now = () => {
+    try {
+      const value = (options.nowMs ?? (() => performance.now()))();
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const elapsed = (startedAt, endedAt) => {
+    if (startedAt == null || endedAt == null)
+      return null;
+    const value = endedAt - startedAt;
+    return value >= 0 && value <= VALIDATION_SUBSTEP_LIMITS.durationMs ? value : null;
+  };
+  const ignore = () => {
+    ignoredLines = Math.min(VALIDATION_SUBSTEP_LIMITS.ignoredLines, ignoredLines + 1);
+  };
+  const observeIgnoredStart = (label) => {
+    if (labelUses.has(label)) {
+      labelUses.set(label, 2);
+    } else if (!ignoredStartLabels.has(label)) {
+      if (ignoredStartLabels.size < VALIDATION_SUBSTEP_LIMITS.stages) {
+        ignoredStartLabels.add(label);
+      } else {
+        ignoredStartLabelsOverflowed = true;
+        truncated = true;
+      }
+    }
+  };
+  const emit = (timing) => {
+    try {
+      const returned = options.onEvent?.(Object.freeze({ ...timing }));
+      if (returned != null && typeof returned.then === "function") {
+        Promise.resolve(returned).catch(() => {});
+      }
+    } catch {}
+  };
+  const onLine = (raw) => {
+    if (finished)
+      return;
+    if (observedLines >= VALIDATION_SUBSTEP_LIMITS.lines) {
+      truncated = true;
+      ignore();
+      return;
+    }
+    observedLines++;
+    if (typeof raw !== "string" || raw.length > VALIDATION_SUBSTEP_LIMITS.lineChars) {
+      truncated = true;
+      ignore();
+      return;
+    }
+    const parsed = parseLine(raw);
+    if (parsed === "limit") {
+      truncated = true;
+      ignore();
+      return;
+    }
+    if (!parsed) {
+      ignore();
+      return;
+    }
+    if (parsed.kind === "start") {
+      if (stages.has(parsed.ordinal) || total != null && total !== parsed.total || aggregatePrefix != null && aggregatePrefix !== parsed.aggregatePrefix) {
+        observeIgnoredStart(parsed.label);
+        ignore();
+        return;
+      }
+      if (stages.size >= VALIDATION_SUBSTEP_LIMITS.stages) {
+        observeIgnoredStart(parsed.label);
+        truncated = true;
+        ignore();
+        return;
+      }
+      total = parsed.total;
+      aggregatePrefix = parsed.aggregatePrefix;
+      const startedAtMs = now();
+      const timing = {
+        source: "aggregate_lines",
+        observationOnly: true,
+        stageId: `substep-${parsed.ordinal}`,
+        ordinal: parsed.ordinal,
+        total: parsed.total,
+        boundary: "start",
+        durationMs: null,
+        observedElapsedMs: startedAtMs == null ? null : 0,
+        reportedDurationMs: null
+      };
+      stages.set(parsed.ordinal, { label: parsed.label, startedAtMs, timing });
+      labelUses.set(parsed.label, labelUses.has(parsed.label) || ignoredStartLabels.has(parsed.label) || ignoredStartLabelsOverflowed ? 2 : 1);
+      emit(timing);
+      return;
+    }
+    const matching = [...stages.values()].filter((stage2) => stage2.timing.boundary === "start" && stage2.label === parsed.label);
+    if (matching.length !== 1 || labelUses.get(parsed.label) !== 1) {
+      ignore();
+      return;
+    }
+    const stage = matching[0];
+    const observedElapsedMs = elapsed(stage.startedAtMs, now());
+    stage.timing = {
+      ...stage.timing,
+      boundary: "complete",
+      durationMs: observedElapsedMs,
+      observedElapsedMs,
+      reportedDurationMs: parsed.reportedDurationMs,
+      completionMarker: parsed.marker
+    };
+    stage.label = "";
+    emit(stage.timing);
+  };
+  return {
+    onStdoutLine: onLine,
+    onStderrLine: onLine,
+    finish(reason = "command_finished") {
+      if (!finished) {
+        finished = true;
+        const endedAtMs = now();
+        const safeReason = [
+          "command_finished",
+          "timed_out",
+          "aborted",
+          "output_incomplete"
+        ].includes(reason) ? reason : "command_finished";
+        const terminalEvents = [];
+        for (const stage of stages.values()) {
+          if (stage.timing.boundary !== "start")
+            continue;
+          stage.timing = {
+            ...stage.timing,
+            boundary: "incomplete",
+            durationMs: null,
+            observedElapsedMs: elapsed(stage.startedAtMs, endedAtMs),
+            incompleteReason: truncated ? "observation_limit" : safeReason
+          };
+          stage.label = "";
+          terminalEvents.push(stage.timing);
+        }
+        labelUses.clear();
+        ignoredStartLabels.clear();
+        aggregatePrefix = null;
+        for (const event of terminalEvents)
+          emit(event);
+      }
+      return {
+        stages: [...stages.values()].map((stage) => ({ ...stage.timing })),
+        truncated,
+        ignoredLines
+      };
+    }
+  };
+}
+
+// apps/workerpals/src/capability_revision_circuit.ts
+import { createHash as createHash6 } from "crypto";
 function reportsUnavailableBrowser(executorResult) {
   const text = [executorResult.summary, executorResult.stdout].filter(Boolean).join(`
 `).split(/\b(?:Previous )?Codex event trace(?: excerpt)?:/i)[0].split(/\r?\n/).filter((line) => !/\b(?:item|thread|turn)\.(?:started|completed)\s*(?:\||$)/i.test(line)).join(`
@@ -8778,7 +9479,7 @@ class CapabilityRevisionCircuit {
     const targets = [
       ...new Set(options.targetPaths.map((path) => path.trim().replace(/\\/g, "/").replace(/^\.\//, "")).filter(Boolean))
     ].sort();
-    const fingerprint = createHash5("sha256").update(JSON.stringify(["browser_capture", "rendered_artifacts", targets])).digest("hex");
+    const fingerprint = createHash6("sha256").update(JSON.stringify(["browser_capture", "rendered_artifacts", targets])).digest("hex");
     this.occurrences = this.previousFingerprint === fingerprint ? this.occurrences + 1 : 1;
     this.previousFingerprint = fingerprint;
     if (this.occurrences < 2)
@@ -8829,7 +9530,7 @@ function withCapabilityBlockedResult(result, blocker, changedPaths) {
 }
 
 // apps/workerpals/src/common/worktree_dependency_artifacts.ts
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash7 } from "crypto";
 import {
   copyFileSync,
   lstatSync,
@@ -8867,7 +9568,7 @@ function linkTypeForHost() {
 }
 var MUTABLE_DEPENDENCY_DIRS = new Set([".cache", ".expo", ".vite"]);
 function dependencySnapshotKey(repo) {
-  const hash = createHash6("sha256");
+  const hash = createHash7("sha256");
   let included = 0;
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
     const path = resolve11(repo, name);
@@ -9832,23 +10533,26 @@ function validationEvidenceId(run) {
     run.ok === true ? "pass" : "fail",
     Number.isFinite(Number(run.exitCode)) ? String(run.exitCode) : "unknown",
     run.terminalStatusSource ?? "process_exit",
-    createHash7("sha256").update(`${run.stdout ?? ""}
+    createHash8("sha256").update(`${run.stdout ?? ""}
 ${run.stderr ?? ""}`).digest("hex").slice(0, 16)
   ].join("\x00") : validationCommandKey(run.command);
-  return `validation:${createHash7("sha256").update(provenance).digest("hex").slice(0, 12)}`;
+  return `validation:${createHash8("sha256").update(provenance).digest("hex").slice(0, 12)}`;
 }
 function buildValidationRunDiagnostics(runs, attempt) {
   return runs.slice(0, 20).map((run) => ({
     attempt,
     command: run.command,
-    exitCode: run.exitCode,
+    exitCode: run.executionState && run.executionState !== "executed" ? null : run.exitCode,
     durationMs: run.elapsedMs,
     passed: run.ok,
-    failureClass: classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run),
+    failureClass: run.executionState && run.executionState !== "executed" ? null : classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...run.browserSignal || run.inheritedFailureClass || run.deferredByCommand || run.evidenceId || run.plannedEvidenceId || run.capability ? {
+    ...run.executionState || run.substepTimings || run.browserSignal || run.inheritedFailureClass || run.deferredByCommand || run.evidenceId || run.plannedEvidenceId || run.capability ? {
       metadata: {
+        executionState: run.executionState ?? "executed",
+        ...run.substepTimings ? { substepTimings: run.substepTimings } : {},
+        ...run.deferralReason ? { deferralReason: run.deferralReason } : {},
         evidenceId: run.evidenceId ?? validationEvidenceId(run),
         ...run.plannedEvidenceId ? { plannedEvidenceId: run.plannedEvidenceId } : {},
         ...run.capability ? { capability: run.capability } : {},
@@ -10332,6 +11036,8 @@ function captureValidationStream(stream, onChunk) {
   let browserFailureSignalDetected = false;
   let browserSuccessSignalDetected = false;
   let done = false;
+  let complete = false;
+  let cancelled = false;
   const reader = stream?.getReader();
   const decoder = new TextDecoder;
   const append = (chunk) => {
@@ -10370,6 +11076,7 @@ function captureValidationStream(stream, onChunk) {
         append(decoder.decode(result.value, { stream: true }));
       }
       append(decoder.decode());
+      complete = !cancelled;
     } catch {} finally {
       done = true;
       try {
@@ -10378,14 +11085,18 @@ function captureValidationStream(stream, onChunk) {
     }
   })() : Promise.resolve().then(() => {
     done = true;
+    complete = true;
   });
   return {
     cancel: async () => {
+      if (!done)
+        cancelled = true;
       try {
         await Promise.race([reader?.cancel() ?? Promise.resolve(), Bun.sleep(250)]);
       } catch {}
     },
     isDone: () => done,
+    isComplete: () => complete,
     promise,
     text: retainedText,
     hasBrowserFailureSignal: () => browserFailureSignalDetected,
@@ -10455,8 +11166,30 @@ async function runValidationArgv(repo, command, argv, env, timeoutMs, outputPoli
       elapsedMs: Math.max(1, Date.now() - startedAt)
     };
   }
-  const stdoutCapture = captureValidationStream(proc.stdout ?? null);
-  const stderrCapture = captureValidationStream(proc.stderr ?? null);
+  const substeps = createValidationSubstepCollector();
+  const substepBuffers = { stdout: "", stderr: "" };
+  const substepDropping = { stdout: false, stderr: false };
+  const substepChunk = (stream) => (chunk) => {
+    for (const [index, part] of chunk.split(`
+`).entries()) {
+      if (index > 0) {
+        if (!substepDropping[stream]) {
+          (stream === "stdout" ? substeps.onStdoutLine : substeps.onStderrLine)(substepBuffers[stream]);
+        }
+        substepBuffers[stream] = "";
+        substepDropping[stream] = false;
+      }
+      if (substepDropping[stream])
+        continue;
+      if (substepBuffers[stream].length + part.length > 4096) {
+        substepBuffers[stream] = "";
+        substepDropping[stream] = true;
+      } else
+        substepBuffers[stream] += part;
+    }
+  };
+  const stdoutCapture = captureValidationStream(proc.stdout ?? null, substepChunk("stdout"));
+  const stderrCapture = captureValidationStream(proc.stderr ?? null, substepChunk("stderr"));
   const timeout = Math.max(1, Math.floor(timeoutMs));
   let timeoutTimer = null;
   const timeoutPromise = new Promise((resolveTimeout) => {
@@ -10491,6 +11224,10 @@ async function runValidationArgv(repo, command, argv, env, timeoutMs, outputPoli
   const browserFailureSignalDetected = stdoutCapture.hasBrowserFailureSignal() || stderrCapture.hasBrowserFailureSignal();
   const browserSuccessSignalDetected = stdoutCapture.hasBrowserSuccessSignal() || stderrCapture.hasBrowserSuccessSignal();
   const browserSignal = browserFailureSignalDetected ? browserSuccessSignalDetected ? "failure_and_success" : "failure" : browserSuccessSignalDetected ? "success" : undefined;
+  if (stdoutCapture.isComplete() && !substepDropping.stdout && substepBuffers.stdout)
+    substeps.onStdoutLine(substepBuffers.stdout);
+  if (stderrCapture.isComplete() && !substepDropping.stderr && substepBuffers.stderr)
+    substeps.onStderrLine(substepBuffers.stderr);
   return {
     step: command,
     command,
@@ -10501,7 +11238,9 @@ async function runValidationArgv(repo, command, argv, env, timeoutMs, outputPoli
 `), outputPolicy),
     elapsedMs: Math.max(1, Date.now() - startedAt),
     ...browserSignal ? { browserSignal } : {},
-    terminalStatusSource: timedOut ? "deadline" : "process_exit"
+    terminalStatusSource: timedOut ? "deadline" : "process_exit",
+    executionState: "executed",
+    substepTimings: substeps.finish(timedOut ? "timed_out" : !stdoutCapture.isComplete() || !stderrCapture.isComplete() ? "output_incomplete" : "command_finished")
   };
 }
 async function runValidationCommand(repo, command, timeoutMs, outputPolicy) {
@@ -11134,7 +11873,7 @@ function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorke
   const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH ?? "").trim();
   if (!browsersPath || browsersPath === "0")
     return null;
-  const cacheKey = createHash7("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
+  const cacheKey = createHash8("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
   return resolve13(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
@@ -11319,9 +12058,9 @@ function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun
     const path = resolve13(repo, name);
     if (!existsSync10(path))
       continue;
-    hashInput.push(createHash7("sha256").update(readFileSync9(path)).digest("hex"));
+    hashInput.push(createHash8("sha256").update(readFileSync9(path)).digest("hex"));
   }
-  let key = createHash7("sha256").update(`${hashInput.join(`
+  let key = createHash8("sha256").update(`${hashInput.join(`
 `)}
 `).digest("hex");
   const packageJson = readJsonRecord(packagePath);
@@ -11732,7 +12471,8 @@ function isolatePureEnvironmentValidationDeferral(quality) {
     const environmentCommands = new Set(environmentRuns.map((run) => run.command));
     const actionableRuns = quality.validationRuns.filter((run) => !environmentRuns.includes(run));
     const actionableFailures = collectRequiredValidationFailures(actionableRuns.filter((run) => !run.ok).map((run) => run.command), actionableRuns);
-    const requiredValidationFailures = quality.requiredValidationFailures.filter((failure) => ![...environmentCommands].some((command) => failure.startsWith(`${command} exited `)));
+    const environmentFailureTexts = new Set(collectRequiredValidationFailures([...environmentCommands], environmentRuns));
+    const requiredValidationFailures = quality.requiredValidationFailures.filter((failure) => !environmentFailureTexts.has(failure) && !environmentRuns.some((run) => [" exited ", " deferred ", " not_started "].some((separator) => failure.startsWith(`${run.command}${separator}`))));
     const validationIssues = [
       ...quality.validationIssues.filter((issue) => !issue.startsWith("Required vision.md validation failed:")),
       ...requiredValidationFailures.length > 0 ? [`Required vision.md validation failed: ${requiredValidationFailures.join("; ")}`] : [],
@@ -12004,7 +12744,7 @@ function higherTierValidationDeferralAfterFailure(command, previousRuns) {
   };
 }
 function validationFileFingerprint(repo, changedPaths) {
-  const hash = createHash7("sha256");
+  const hash = createHash8("sha256");
   hash.update(`${process.platform}\x00${process.arch}\x00`);
   const fingerprintPaths = ["bun.lock", "bun.lockb", "package.json", ...changedPaths].map((entry) => entry.replace(/\\/g, "/")).filter((entry, index, values) => values.indexOf(entry) === index).sort();
   for (const relativePath of fingerprintPaths) {
@@ -12777,9 +13517,9 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
 function extractValidationFailureRetryDigest(run, repo) {
   const baseDigest = extractValidationFailureDigest(run);
   const failedTests = validationFailedTestIdentities(run);
-  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash7("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
+  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash8("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
   const assertionContext = validationFailureAssertionContext(run);
-  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash7("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
+  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash8("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
   if (!isLongRunningBrowserValidationCommand(run.command) && !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))) {
     return toSingleLine([baseDigest, failedTestDigest, assertionDigest].filter(Boolean).join(" | "), 900);
   }
@@ -12886,6 +13626,9 @@ function collectRequiredValidationFailures(requiredCommands, validationRuns) {
   if (requiredKeys.size === 0)
     return [];
   return validationRuns.filter((run) => requiredKeys.has(validationCommandKey(run.command)) && !run.ok).map((run) => {
+    if (run.executionState && run.executionState !== "executed") {
+      return `${run.command} ${run.executionState}${run.deferredByCommand ? ` after ${run.deferredByCommand}` : ""} (still required)`;
+    }
     const exitCode = Number.isFinite(Number(run.exitCode)) ? Number(run.exitCode) : "unknown";
     const digest = extractValidationFailureDigest(run);
     return `${run.command} exited ${exitCode}${digest ? ` (${digest})` : ""}`;
@@ -13511,6 +14254,15 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
     for (const issue of collectWriteScopeIssuesFromChangedPaths(changedPaths, planning)) {
       addScopeIssue(issue);
     }
+    if (changedTestPaths.length > 0) {
+      try {
+        const hygiene = analyzeTestHygieneDiff(await buildCriticDiffText(repo, changedTestPaths, deadlineLedger), { allowTestRemoval: testRemovalExplicitlyRequested(instruction) });
+        for (const issue of hygiene.blockingIssues)
+          addScopeIssue(issue);
+      } catch (error) {
+        addScopeIssue(`Could not capture complete test hygiene evidence: ${toSingleLine(error, 240)}`);
+      }
+    }
     if (isTestTask && changedTestPaths.length === 0 && !allowsValidationToolingOnlyChangeForTestFocusedTask({
       instruction,
       planning,
@@ -13589,6 +14341,8 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
     stdout: "",
     stderr: "Validation did not start because the absolute WorkerPal job deadline was exhausted; this is not a passing validation result.",
     elapsedMs: 0,
+    executionState: "not_started",
+    deferralReason: "job_deadline",
     terminalStatusSource: "deadline",
     failureClass: "deadline"
   });
@@ -13643,10 +14397,12 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
               exitCode: 125,
               stdout: "",
               stderr,
-              elapsedMs: 1,
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferredByCommand: higherTierDeferral.blockerCommand,
+              deferralReason: higherTierDeferral.reason,
               ...higherTierDeferral.inheritedFailureClass ? {
-                inheritedFailureClass: higherTierDeferral.inheritedFailureClass,
-                deferredByCommand: higherTierDeferral.blockerCommand
+                inheritedFailureClass: higherTierDeferral.inheritedFailureClass
               } : {}
             });
             onLog?.("stderr", `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferral.reason})`);
@@ -13675,7 +14431,9 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
                     exitCode: 127,
                     stdout: "",
                     stderr,
-                    elapsedMs: 1
+                    elapsedMs: 0,
+                    executionState: "not_started",
+                    deferralReason: "missing_toolchain"
                   },
                   stream: "stderr",
                   summary: `[ValidationGate] Validation skipped (missing toolchain): ${command2}`
@@ -13720,7 +14478,9 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
               exitCode: 127,
               stdout: "",
               stderr,
-              elapsedMs: 1
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferralReason: "missing_toolchain"
             });
             onLog?.("stderr", `[ValidationGate] Validation skipped (missing toolchain): ${command}`);
             continue;
@@ -13735,7 +14495,10 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
               exitCode: 125,
               stdout: "",
               stderr,
-              elapsedMs: 1
+              elapsedMs: 0,
+              executionState: "not_started",
+              deferralReason: deferredReason,
+              deferredByCommand: validationRuns.find(isDeterministicFastValidationFailure)?.command
             });
             onLog?.("stderr", `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`);
             continue;
@@ -13749,7 +14512,9 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
               exitCode: 1,
               stdout: "",
               stderr: trustedEnvironmentDeferral,
-              elapsedMs: 0
+              elapsedMs: 0,
+              executionState: "deferred",
+              deferralReason: "trusted_host_required"
             });
             onLog?.("stderr", `[ValidationGate] Deferred Docker-dependent validation to the trusted host without executing it: ${command}`);
             continue;
@@ -13929,9 +14694,9 @@ function resolveQualityCriticModel(runtimeConfig, fallback = "") {
 }
 function resolveQualityCriticMaxDiffChars(runtimeConfig, compact = false) {
   const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
-  const max = Number.isFinite(value) ? value : 16000;
+  const max = Number.isFinite(value) ? value : 65536;
   const bounded = Math.max(256, Math.min(524288, Math.floor(max)));
-  return compact ? Math.min(bounded, 6000) : bounded;
+  return bounded;
 }
 function resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact = false) {
   const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
@@ -13948,7 +14713,7 @@ function buildCriticValidationSummary(quality, maxValidationOutputChars) {
     return [
       `Evidence ID: ${evidenceId}`,
       `Command: ${run.command}`,
-      `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
+      run.executionState && run.executionState !== "executed" ? `Result: ${run.executionState} (not executed; still required)${run.deferredByCommand ? ` after ${run.deferredByCommand}` : ""}` : `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
       output ? `Output:
 ${output}` : ""
     ].filter(Boolean).join(`
@@ -14140,9 +14905,7 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog, 
   if (apiKey)
     headers.Authorization = `Bearer ${apiKey}`;
   const buildAttemptPayload = async (compact) => {
-    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
-    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
+    const diffText = await buildCompleteWorkerReviewDiff(repo, criticChangedPaths, resolveQualityCriticMaxDiffChars(runtimeConfig), deadlineLedger, instruction);
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
     const criticUserBase = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
       instruction,
@@ -14277,7 +15040,7 @@ ${criticUser}`).length;
     }
     return { kind: "verdict", review: attempt.review, usageAttempts };
   } catch (err) {
-    onLog?.("stderr", `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`);
+    onLog?.("stderr", `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (candidate requires review before publication).`);
     return {
       kind: "unavailable",
       reason: toSingleLine(err, 220),
@@ -14454,7 +15217,7 @@ function buildQualityRevisionHint(issues, critic, planning, reviewFixContext, va
   if (validationBlocker) {
     lines.push(`Validation blocker: ${validationBlocker.category} - ${toSingleLine(validationBlocker.detail, 300)}`);
   }
-  const failedValidationRuns = validationRuns.filter((run) => !run.ok);
+  const failedValidationRuns = validationRuns.filter((run) => !run.ok && (!run.executionState || run.executionState === "executed"));
   if (failedValidationRuns.length > 0) {
     lines.push("Validation repair continuity rule: existing content changes from earlier repair attempts are prepared candidate fixes. Preserve them unless the latest failing command proves a specific change is wrong; do not revert them merely to restore the original narrow file count, target paths, or write globs.");
     if (changedPaths.length > 0) {
@@ -14642,9 +15405,10 @@ async function git2(cwd, args, deadlineLedger, deadlinePhase = "total") {
     });
     return {
       ok: !result.timedOut && !result.drainTimedOut && result.exitCode === 0,
-      stdout: result.stdout.trimEnd(),
+      stdout: args[0] === "diff" ? result.stdout : result.stdout.trimEnd(),
       stderr: result.stderr.trim(),
-      exitCode: result.exitCode
+      exitCode: result.exitCode,
+      captureComplete: !result.stdoutTruncated && !result.stdoutReadError && !result.stdoutDecodeError && !result.drainTimedOut
     };
   } catch (err) {
     return { ok: false, stdout: "", stderr: String(err), exitCode: null };
@@ -14659,29 +15423,56 @@ async function buildCriticDiffText(repo, changedPaths, deadlineLedger) {
     return "";
   const chunks = [];
   const trackedDiff = await gitDuringJobWork(repo, ["diff", "HEAD", "--", ...paths], deadlineLedger);
-  if (trackedDiff.stdout) {
+  if (trackedDiff.captureComplete === false)
+    throw new Error("Review evidence incomplete: tracked diff capture failed or was truncated");
+  if (trackedDiff.ok && trackedDiff.stdout) {
     chunks.push(trackedDiff.stdout);
   } else if (!trackedDiff.ok) {
     const [unstagedDiff, stagedDiff] = await Promise.all([
       gitDuringJobWork(repo, ["diff", "--", ...paths], deadlineLedger),
       gitDuringJobWork(repo, ["diff", "--cached", "--", ...paths], deadlineLedger)
     ]);
+    if (!unstagedDiff.ok || !stagedDiff.ok || unstagedDiff.captureComplete === false || stagedDiff.captureComplete === false)
+      throw new Error("Review evidence incomplete: could not read tracked changes");
     if (unstagedDiff.stdout)
       chunks.push(unstagedDiff.stdout);
     if (stagedDiff.stdout)
       chunks.push(stagedDiff.stdout);
   }
   const untrackedResult = await gitDuringJobWork(repo, ["ls-files", "-z", "--others", "--exclude-standard", "--", ...paths], deadlineLedger);
+  if (!untrackedResult.ok || untrackedResult.captureComplete === false)
+    throw new Error("Review evidence incomplete: could not enumerate untracked files");
   if (untrackedResult.ok) {
     const untrackedPaths = untrackedResult.stdout.split("\x00").map((path) => normalizeChangedPathForCommit(path)).filter((path) => Boolean(path));
     for (const path of untrackedPaths) {
       const newFileDiff = await gitDuringJobWork(repo, ["diff", "--no-index", "--", "/dev/null", path], deadlineLedger);
+      if (newFileDiff.exitCode !== 0 && newFileDiff.exitCode !== 1 || newFileDiff.captureComplete === false)
+        throw new Error(`Review evidence incomplete: could not capture new file ${path}`);
       if (newFileDiff.stdout)
         chunks.push(newFileDiff.stdout);
     }
   }
   return chunks.join(`
 `);
+}
+async function buildCompleteWorkerReviewDiff(repo, paths, maxBytes, ledger, taskIntent = "") {
+  const base = await gitDuringJobWork(repo, ["rev-parse", "HEAD"], ledger);
+  const evidence = buildCompleteReviewEvidence({
+    diff: await buildCriticDiffText(repo, paths, ledger),
+    maxBytes,
+    expectedPaths: publishableChangedPaths(paths),
+    captureComplete: true,
+    ...base.ok ? { baseSha: base.stdout.trim() } : {}
+  });
+  assertCompleteReviewEvidence(evidence);
+  const hygiene = analyzeTestHygieneDiff(evidence.diff, {
+    allowTestRemoval: testRemovalExplicitlyRequested(taskIntent)
+  });
+  return `Patch manifest: ${JSON.stringify(evidence.manifest)}
+${[...hygiene.blockingIssues, ...hygiene.semanticReviewNotes].join(`
+`)}
+
+${evidence.diff}`;
 }
 async function trackedPathHasGitContentDelta(repo, path, deadlineLedger) {
   const tracked = await gitDuringJobWork(repo, ["ls-files", "--error-unmatch", "--", path], deadlineLedger);
@@ -14773,7 +15564,7 @@ class CandidateCheckpointError extends Error {
 }
 function retainedCandidateRefComponent(value) {
   const readable = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 48);
-  return readable || createHash7("sha256").update(value).digest("hex").slice(0, 16);
+  return readable || createHash8("sha256").update(value).digest("hex").slice(0, 16);
 }
 async function checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig = DEFAULT_CONFIG3, baselineSha, deadlineLedger) {
   if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
@@ -15177,7 +15968,7 @@ function inferCommitArea(kind, params, changedPaths = []) {
     return "client";
   if (pick("apps/server/"))
     return "server";
-  if (pick("README.md") || pick("docs/"))
+  if (targets.length > 0 && targets.every(isDocPath))
     return "docs";
   return inferRepoNativeCommitArea(targets) ?? "repo";
 }
@@ -16142,18 +16933,6 @@ function restoreRepoLocalCodexFilesForCodexCli(masked) {
     }
   }
 }
-function normalizeCodexReasoningEffort(value, model = "") {
-  const normalized = String(value ?? "").trim().toLowerCase();
-  const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(String(model ?? "").trim());
-  const defaultEffort = supportsExtraHigh ? "xhigh" : "high";
-  if (normalized === "low" || normalized === "medium" || normalized === "high" || normalized === "xhigh") {
-    return normalized === "xhigh" && !supportsExtraHigh ? "high" : normalized;
-  }
-  if (normalized === "extra high" || normalized === "extra-high" || normalized === "extrahigh" || normalized === "x-high") {
-    return supportsExtraHigh ? "xhigh" : "high";
-  }
-  return defaultEffort;
-}
 function estimatedCommitMessageUsageAttempt(options) {
   const promptTokens = Math.max(1, Math.ceil(Math.max(0, options.promptChars) / 3));
   const completionTokens = Math.max(0, Math.ceil(Math.max(0, options.completionChars ?? 0) / 3));
@@ -16209,6 +16988,51 @@ function buildCommitMessageGeneratorPrompt(diff, opts) {
   const userMessage = buildCommitMessageGeneratorUserMessage(opts.instruction, opts.validationSteps, diff);
   return { systemPrompt, userMessage };
 }
+function resolveIsolatedCodexCommandPrefix(repo, prefix) {
+  return prefix.map((arg, index) => {
+    if (arg.startsWith("-") || isAbsolute4(arg) || /^[A-Za-z]:[\\/]/.test(arg))
+      return arg;
+    const explicitRelative = /^(?:\.{1,2}[\\/])/.test(arg);
+    const pathLike = /[\\/]/.test(arg) && !arg.includes("://");
+    if (explicitRelative || pathLike && (index === 0 || existsSync10(resolve13(repo, arg))))
+      return resolve13(repo, arg);
+    return arg;
+  });
+}
+function buildCommitMessageCodexCommand(prefix, model, outputPath) {
+  return [
+    ...prefix,
+    "-c",
+    'model_reasoning_effort="low"',
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "project_doc_fallback_filenames=[]",
+    "-c",
+    'web_search="disabled"',
+    "--strict-config",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "apps",
+    "-a",
+    "never",
+    "-s",
+    "read-only",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--json",
+    "--color",
+    "never",
+    "--output-last-message",
+    outputPath,
+    ...model ? ["-m", model] : [],
+    "-"
+  ];
+}
 async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtimeConfig) {
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!model)
@@ -16221,35 +17045,19 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
   const timeoutMs = finalizationLedger ? finalizationLedger.capTotalTimeout(configuredTimeoutMs) : configuredTimeoutMs;
   if (timeoutMs <= 0)
     return null;
-  const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort, model);
-  const tmpOutputPath = resolve13(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
-  const cmd = [
-    ...codexPrefix,
-    "-c",
-    `model_reasoning_effort="${reasoningEffort}"`,
-    "-a",
-    "never",
-    "-s",
-    "read-only",
-    "exec",
-    "--color",
-    "never",
-    "--output-last-message",
-    tmpOutputPath
-  ];
-  if (model)
-    cmd.push("-m", model);
-  cmd.push("-");
+  const neutralWorkspace = mkdtempSync2(resolve13(tmpdir4(), "pushpals-commit-neutral-"));
+  const tmpOutputPath = resolve13(neutralWorkspace, "last-message.txt");
+  const cmd = buildCommitMessageCodexCommand(resolveIsolatedCodexCommandPrefix(repo, codexPrefix), model, tmpOutputPath);
   const env = buildWorkerSandboxWritableEnv(repo);
-  const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
   const stdinText = `${prompt.systemPrompt}
 
 ${prompt.userMessage}`;
   let callStarted = false;
+  const callStartedAt = performance.now();
   try {
     callStarted = true;
     const processResult = await runBoundedProcess(cmd, {
-      cwd: repo,
+      cwd: neutralWorkspace,
       env,
       stdin: new Blob([stdinText]),
       timeoutMs,
@@ -16262,16 +17070,24 @@ ${prompt.userMessage}`;
     } catch {
       content = "";
     }
-    if (!content) {
-      content = processResult.stdout.trim();
-    }
-    const usageAttempt = estimatedCommitMessageUsageAttempt({
+    const usageAttempt = codexUsageAttempt({
+      jsonl: processResult.stdout,
       promptChars: stdinText.length,
-      completionChars: content.length + processResult.stderr.length,
-      backend: "commit_message_codex",
+      finalMessage: content,
+      stage: "finalization",
+      source: "commit_message_codex",
+      attempt: 1,
       modelId: model,
       timedOut: processResult.timedOut || processResult.drainTimedOut
     });
+    console.info(`[WorkerPals] commitMessageOutcome=${JSON.stringify({
+      status: processResult.timedOut ? "timeout" : processResult.drainTimedOut ? "drain_timeout" : processResult.exitCode !== 0 ? "process_error" : content ? "response_received" : "empty_response",
+      configuredTimeoutMs,
+      timeoutMs,
+      exitCode: processResult.exitCode,
+      elapsedMs: Math.round(performance.now() - callStartedAt),
+      usageSource: usageAttempt.estimated ? "text_estimate" : "provider"
+    })}`);
     if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
       return { message: null, usageAttempts: [usageAttempt] };
     }
@@ -16289,9 +17105,8 @@ ${prompt.userMessage}`;
       ]
     } : null;
   } finally {
-    restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
-      unlinkSync(tmpOutputPath);
+      rmSync3(neutralWorkspace, { recursive: true, force: true });
     } catch {}
   }
 }
@@ -16806,9 +17621,7 @@ async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog,
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
   const buildCriticInstruction = async (compact) => {
-    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
-    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
+    const diffText = await buildCompleteWorkerReviewDiff(repo, criticChangedPaths, resolveQualityCriticMaxDiffChars(runtimeConfig), deadlineLedger, instruction);
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
     const criticInstructionBase = loadPromptTemplate("workerpals/codex_quality_critic_instruction_prompt.md", {
       instruction,
@@ -16843,6 +17656,7 @@ Evidence contract: Every finding or must_fix claim about tests, validation, comm
       "-a",
       "never",
       "exec",
+      "--json",
       "-s",
       "read-only",
       "--color",
@@ -16876,11 +17690,17 @@ Evidence contract: Every finding or must_fix claim about tests, validation, comm
       outputLimitBytes: 524288,
       retainOutputTail: true
     });
-    usageAttempts.push(estimatedCriticUsageAttempt({
+    let finalMessageForUsage = "";
+    try {
+      finalMessageForUsage = (await Bun.file(tmpOutputPath).text()).trim();
+    } catch {}
+    usageAttempts.push(codexUsageAttempt({
+      jsonl: processResult.stdout,
       promptChars: payload.promptChars,
-      completionChars: processResult.stdout.length + processResult.stderr.length,
-      backend: "quality_critic_codex",
-      modelId: criticModel || undefined,
+      finalMessage: finalMessageForUsage,
+      stage: "critic",
+      source: "quality_critic_codex",
+      modelId: criticModel,
       attempt,
       timedOut: processResult.timedOut || processResult.drainTimedOut
     }));
@@ -17133,6 +17953,7 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
     ...terminalResult,
     diagnostics: {
       ...terminalResult.diagnostics ?? {},
+      attempts: [...diagnosticExecutorAttempts, ...terminalResult.diagnostics?.attempts ?? []],
       validationRuns: [
         ...new Set([
           ...diagnosticValidationRuns,
@@ -17157,6 +17978,7 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
   const passingValidationCache = new Map;
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns = [];
+  const diagnosticExecutorAttempts = [];
   const diagnosticPatchSnapshots = [];
   const diagnosticQualityReviews = [];
   let nextQualityRevisionExecuteBudgets = null;
@@ -17217,7 +18039,21 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
           exitCode: 124
         });
       }
+      const executorCallStartedAt = Date.now();
+      const executorCallStartedMonotonic = performance.now();
       const currentResult = await runExecutor(kind, attemptParams, repo, runtimeConfig, onLog, currentExecuteBudgets);
+      const commandTimings = durableCodexCommandTimings(currentResult.diagnostics?.metadata?.codexCommandTimings);
+      if (commandTimings)
+        diagnosticExecutorAttempts.push({
+          attempt: revisionAttempt,
+          backend: executor,
+          startedAt: new Date(executorCallStartedAt).toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationMs: Math.round(performance.now() - executorCallStartedMonotonic),
+          exitCode: currentResult.exitCode,
+          terminalReason: currentResult.ok ? "executor_completed" : "executor_failed",
+          metadata: { mergeConflictPass, codexCommandTimings: commandTimings }
+        });
       if ((currentResult.usageAttempts?.length ?? 0) > 0) {
         usageAccumulator.addAttempts(currentResult.usageAttempts);
       } else {
@@ -17965,7 +18801,7 @@ ${result.stderr ?? ""}`;
 }
 
 // apps/workerpals/src/docker_executor.ts
-import { createHash as createHash8, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash9, randomUUID as randomUUID2 } from "crypto";
 import { existsSync as existsSync12, mkdirSync as mkdirSync4, readFileSync as readFileSync10, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
 import { isAbsolute as isAbsolute5, relative as relative5, resolve as resolve14 } from "path";
@@ -19132,8 +19968,8 @@ class DockerExecutor {
     this.worktreeDir = resolve14(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     const dependencyRepoPath = resolve14(this.options.repo);
-    this.dependencyVolumeName = `pushpals-deps-${createHash8("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
-    this.codexVolumeName = `pushpals-codex-${createHash8("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
+    this.dependencyVolumeName = `pushpals-deps-${createHash9("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
+    this.codexVolumeName = `pushpals-codex-${createHash9("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(this.config.workerpals.dockerWarmRetryBackoffMs, 2000, 250, 60000);
@@ -22166,6 +23002,20 @@ class WorkerStartupBudget {
   }
 }
 
+// apps/workerpals/src/job_log_activity.ts
+function createJobLogActivity(startedAtMs) {
+  let lastExecutionOutputAt = startedAtMs;
+  return {
+    note(source, atMs) {
+      if (source === "execution" && Number.isFinite(atMs))
+        lastExecutionOutputAt = Math.max(lastExecutionOutputAt, atMs);
+    },
+    quietForMs(nowMs) {
+      return Math.max(0, nowMs - lastExecutionOutputAt);
+    }
+  };
+}
+
 // apps/workerpals/src/execution_readiness.ts
 function shouldUseLegacyWorkerCooldown(cooldownMs, readiness) {
   return typeof cooldownMs === "number" && Number.isFinite(cooldownMs) && cooldownMs > 0 && readiness?.executionReadiness.status !== "blocked";
@@ -23949,7 +24799,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
           const jobClaimedAtMs = Date.now();
-          let lastForwardedJobLogAt = jobClaimedAtMs;
+          const jobLogActivity = createJobLogActivity(jobClaimedAtMs);
           let currentJobPhase = null;
           const phaseSpans = [];
           const noteJobPhase = (phase, atMs = Date.now()) => {
@@ -23961,7 +24811,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
             currentJobPhase = phase;
             phaseSpans.push({ phase, startedAtMs: atMs });
           };
-          const emitJobLog = job.sessionId ? (stream, line) => {
+          const emitJobLog = job.sessionId ? (stream, line, source = "execution") => {
             const cleaned = sanitizeJobLogLine(line);
             if (!cleaned)
               return false;
@@ -23972,7 +24822,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
               return false;
             lastCleanLog = cleaned;
             lastCleanLogAt = now;
-            lastForwardedJobLogAt = now;
+            jobLogActivity.note(source, now);
             noteJobPhase(inferWorkerJobPhaseFromLogLine(cleaned), now);
             const logTs = new Date(now).toISOString();
             const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
@@ -24006,10 +24856,10 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
           const jobProgressLogEveryMs = resolveJobProgressLogEveryMs();
           const jobProgressTimer = emitJobLog && jobProgressLogEveryMs > 0 ? setInterval(() => {
             const now = Date.now();
-            const quietForMs = Math.max(0, now - lastForwardedJobLogAt);
+            const quietForMs = jobLogActivity.quietForMs(now);
             if (quietForMs < jobProgressLogEveryMs)
               return;
-            emitJobLog("stdout", `[WorkerPals] Job ${job.id} still running after ${formatDurationMs(now - jobClaimedAtMs)} (kind=${job.kind}, worker=${opts.workerId}, phase=${currentJobPhase ?? "unknown"}, quiet_for=${formatDurationMs(quietForMs)}).`);
+            emitJobLog("stdout", `[WorkerPals] Job ${job.id} still running after ${formatDurationMs(now - jobClaimedAtMs)} (kind=${job.kind}, worker=${opts.workerId}, phase=${currentJobPhase ?? "unknown"}, quiet_for=${formatDurationMs(quietForMs)}).`, "status");
           }, jobProgressLogEveryMs) : null;
           let directWorktreePath = null;
           let directWorktreeBaselineSha = null;

@@ -63,6 +63,21 @@ claim retry for the diagnostics-upload race; persistently missing or invalid
 evidence holds the retained candidate as `publication_validation_unavailable`
 instead of publishing unchecked changes or blocking the queue indefinitely.
 
+The server freezes this complete plan for ordinary publications too, tied to
+the immutable worker candidate and its worker claim generation. The host compares
+Git tree IDs after applying the candidate: a different commit with an identical
+tree keeps only the deferred gates, while a changed or unreadable tree requires
+the full plan even when the worker deferred nothing. Aggregate script names or
+script contents never justify dropping an independent required gate. Plans are
+bounded to 32 distinct commands; oversized evidence is held, not truncated.
+Up to two claim recoveries allow final diagnostics to arrive. A persistent
+ordinary-plan failure uses a generic, checkpoint-fenced publication hold, without
+inventing PR repair authority or repeatedly entering PR reconciliation. The next
+completion can proceed, and the held candidate is retained for explicit repair.
+Host gate results retain candidate/checkpoint identity and the observed tree
+binding across database restarts. Exact validated-and-published recovery still
+avoids duplicate checks, while original-PR repair keeps its stronger lease policy.
+
 Base movement during validation defers the same completion for fenced claim
 recovery, instead of cloning the coding task with its obsolete base. Immutable
 checkpoints survive restarts. Each claim performs bounded work, and ordinary

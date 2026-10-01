@@ -298,6 +298,11 @@ type AutonomyDiscoveryProgress = {
   retryEligible: boolean;
   nextWindowAvailable?: boolean;
   excludedCandidateCount: number;
+  window?: number;
+  windowCount?: number;
+  globalPage?: number;
+  outcome?: string;
+  retryAt?: string;
 };
 
 function autonomyDiscoveryProgress(value: unknown): AutonomyDiscoveryProgress | null {
@@ -1096,11 +1101,14 @@ const WORK_DIVERSITY_ACTIVE_STATUSES = new Set([
 ]);
 const WORK_DIVERSITY_RECENT_COOLDOWN_MS = 6 * 60 * 60_000;
 
-function isRecentWorkDiversityObjective(
+export function isRecentWorkDiversityObjective(
   objective: SnapshotOpenObjective,
   nowMs = Date.now(),
 ): boolean {
   if (isUnstartedAutonomyInfrastructureOutcome(objective)) return false;
+  // A rejected scheduling proposal is not work performed. Hourly capacity
+  // returning must not leave its untouched target suppressed for six hours.
+  if (!asString(objective.job_id) && asString(objective.status) === "rejected") return false;
   const updatedAt = Date.parse(asString(objective.updated_at));
   return (
     Number.isFinite(updatedAt) &&
@@ -7537,7 +7545,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
+          promptTemplateVersion: "repository-agent-v10-bounded-evidence-followup",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7773,7 +7781,15 @@ export class RemoteBuddyAutonomousEngine {
       ) {
         this.exhaustedDiscovery = {
           key: discoveryKey,
-          recheckAtMs: Date.now() + AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS,
+          recheckAtMs: Math.min(
+            Date.now() + AUTONOMY_EXHAUSTED_DISCOVERY_RECHECK_MS,
+            discoveryProgress.retryAt && Number.isFinite(Date.parse(discoveryProgress.retryAt))
+              ? Math.max(
+                  Date.now() + DISCOVERY_FOLLOWUP_DELAY_MS,
+                  Date.parse(discoveryProgress.retryAt),
+                )
+              : Number.POSITIVE_INFINITY,
+          ),
         };
       }
       if (discoveryProgress)
@@ -7802,7 +7818,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v9-resumable-discovery",
+          promptTemplateVersion: "repository-agent-v10-bounded-evidence-followup",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {

@@ -47,6 +47,11 @@ import {
   type ReviewPublicationClaimAuthority,
 } from "./review_publication_recovery";
 import type { ReviewPublicationValidationPlan } from "../../../packages/shared/src/review_publication_validation.js";
+import {
+  PublicationValidationUnavailableError,
+  resolveOrdinaryPublicationValidation,
+  type PublicationValidationBinding,
+} from "./publication_validation";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { reviewApplyFailureBlocksPublication } from "./review_apply_fallback";
 import {
@@ -1183,6 +1188,7 @@ async function tick(): Promise<void> {
     let trustedValidationAffectedPaths: string[] = [];
     let trustedValidationResults: TrustedValidationExecutionResult[] = [];
     let validationCommandsJson = completion.trustedValidationCommandsJson;
+    let publicationValidationBinding: PublicationValidationBinding | undefined;
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
     let validationCheckpointPersisted = false;
@@ -1202,13 +1208,14 @@ async function tick(): Promise<void> {
       completionClaimGeneration,
     );
     const trustedValidationReport = (): TrustedValidationReport | null =>
-      completion.trustedValidationCommandsJson || isOriginalPrReviewPublication
+      trustedValidationCandidateSha
         ? {
             version: 1,
             baselineSha: trustedValidationBaselineSha,
             candidateSha: trustedValidationCandidateSha,
             candidateRef: trustedValidationCandidateRef,
             results: trustedValidationResults,
+            treeBinding: publicationValidationBinding,
           }
         : null;
     const persistExactValidationCheckpoint = async (): Promise<void> => {
@@ -1710,6 +1717,26 @@ async function tick(): Promise<void> {
           deferredCommandsJson: completion.trustedValidationCommandsJson,
           fullPlan: completion.reviewValidationPlan,
         });
+      } else if (!skipValidationForDurableRecovery && !reviewPublicationLease) {
+        const validation = await resolveOrdinaryPublicationValidation({
+          originalCandidateSha: completion.commitSha,
+          candidateSha: trustedValidationCandidateSha!,
+          claimGeneration: completionClaimGeneration,
+          deferredCommandsJson: completion.trustedValidationCommandsJson,
+          fullPlan: completion.reviewValidationPlan,
+          git: validationGit,
+        });
+        validationCommandsJson = validation.commandsJson;
+        publicationValidationBinding = validation.binding;
+        console.log(
+          `[${ts()}] publicationValidationBinding=${JSON.stringify({
+            completionId: completion.id,
+            jobId: completion.jobId,
+            workerCandidateSha: completion.commitSha,
+            candidateSha: trustedValidationCandidateSha,
+            ...validation.binding,
+          })}`,
+        );
       }
 
       if (
@@ -2216,6 +2243,8 @@ async function tick(): Promise<void> {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err: any) {
+      const ordinaryValidationUnavailable =
+        err instanceof PublicationValidationUnavailableError ? err : null;
       let reviewDeferred = err instanceof ReviewPublicationDeferredError ? err : null;
       let reviewSuperseded = err instanceof ReviewPublicationSupersededError ? err : null;
       const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
@@ -2284,6 +2313,22 @@ async function tick(): Promise<void> {
       }
       let publicationOutcome: Record<string, unknown> | undefined;
       if (
+        ordinaryValidationUnavailable &&
+        !ordinaryValidationUnavailable.pending &&
+        validationCheckpointPersisted &&
+        trustedValidationCandidateSha &&
+        trustedValidationCandidateRef
+      ) {
+        publicationOutcome = {
+          version: 1,
+          code: "publication_validation_unavailable",
+          scope: "ordinary_completion",
+          workerCandidateSha: completion.commitSha,
+          retainedCandidateSha: trustedValidationCandidateSha,
+          retainedCandidateRef: trustedValidationCandidateRef,
+        };
+      }
+      if (
         reviewSuperseded ||
         reviewDeferred?.code === "review_base_conflict" ||
         reviewDeferred?.code === "review_validation_unavailable"
@@ -2314,7 +2359,7 @@ async function tick(): Promise<void> {
                 );
         }
       }
-      const failureDisposition = reviewPublicationFailureDisposition(
+      const baseFailureDisposition = reviewPublicationFailureDisposition(
         reviewDeferred,
         publicationFailureDisposition({
           publicationReadyForFinalization,
@@ -2324,6 +2369,10 @@ async function tick(): Promise<void> {
           validatedCheckpointRecoveryPending,
         }),
       );
+      const failureDisposition =
+        ordinaryValidationUnavailable?.pending && baseFailureDisposition === "fail"
+          ? "reconcile"
+          : baseFailureDisposition;
       if (failureDisposition === "finalize") {
         console.warn(
           `[${ts()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`,
@@ -2341,6 +2390,17 @@ async function tick(): Promise<void> {
           );
         }
       } else if (failureDisposition === "reconcile") {
+        if (ordinaryValidationUnavailable)
+          console.warn(
+            `[${ts()}] publicationValidationDeferred=${JSON.stringify({
+              event: "publication_validation_deferred",
+              completionId: completion.id,
+              jobId: completion.jobId,
+              claimGeneration: completionClaimGeneration,
+              retry: "bounded_next_completion_lease",
+              detail: ordinaryValidationUnavailable.message,
+            })}`,
+          );
         if (reviewDeferred)
           console.warn(
             `[${ts()}] reviewPublicationDeferred=${JSON.stringify({
@@ -2361,9 +2421,11 @@ async function tick(): Promise<void> {
         try {
           await emitPusherMessage(
             comm,
-            reviewDeferred
-              ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.`
-              : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`,
+            ordinaryValidationUnavailable
+              ? `Publication validation evidence is pending for ${completion.id.slice(0, 8)}. The exact candidate is retained for a bounded diagnostics-aware retry; no PR authority or worker coding retry is required.`
+              : reviewDeferred
+                ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.`
+                : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`,
             completion.id,
             completionEventMeta,
           );

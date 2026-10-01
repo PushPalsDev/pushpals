@@ -1,3 +1,5 @@
+import { parseEvidenceFollowup } from "./repository_evidence_followup.js";
+
 /** The RepositoryAgent and autonomy admission must agree on this wire contract. */
 export const AUTONOMY_CANDIDATE_ENUMS = {
   objective_type: [
@@ -41,8 +43,38 @@ const strings = { type: "array", items: { type: "string" } };
 export const AUTONOMY_CANDIDATES_DATA_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["candidates"],
+  required: ["candidates", "outcome"],
   properties: {
+    outcome: {
+      type: "string",
+      enum: ["candidates_found", "no_actionable_candidate", "insufficient_evidence"],
+    },
+    evidenceRequest: {
+      type: "object",
+      additionalProperties: false,
+      required: ["windows", "literalQueries"],
+      properties: {
+        windows: {
+          type: "array",
+          maxItems: 4,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["path", "startLine", "endLine"],
+            properties: {
+              path: { type: "string" },
+              startLine: { type: "integer", minimum: 1, maximum: 20000 },
+              endLine: { type: "integer", minimum: 1, maximum: 20000 },
+            },
+          },
+        },
+        literalQueries: {
+          type: "array",
+          maxItems: 2,
+          items: { type: "string", minLength: 3, maxLength: 120 },
+        },
+      },
+    },
     candidates: {
       type: "array",
       maxItems: 64,
@@ -89,8 +121,22 @@ export function autonomyCandidateContractErrors(data: unknown): string[] {
   if (!object(data) || !Array.isArray(data.candidates)) return ["data.candidates must be an array"];
   if (data.candidates.length > 64) return ["data.candidates exceeds 64 entries"];
   const errors: string[] = [];
-  if (Object.keys(data).some((key) => key !== "candidates"))
+  if (Object.keys(data).some((key) => !["candidates", "outcome", "evidenceRequest"].includes(key)))
     errors.push("data contains unsupported fields");
+  if (
+    !["candidates_found", "no_actionable_candidate", "insufficient_evidence"].includes(
+      String(data.outcome),
+    )
+  )
+    errors.push(
+      "data.outcome must be candidates_found, no_actionable_candidate, or insufficient_evidence",
+    );
+  if (data.candidates.length > 0 !== (data.outcome === "candidates_found"))
+    errors.push("data.outcome must agree with whether candidates were found");
+  if (data.evidenceRequest !== undefined && data.outcome !== "insufficient_evidence")
+    errors.push("data.evidenceRequest is only allowed for insufficient_evidence");
+  if (data.evidenceRequest !== undefined && !parseEvidenceFollowup(data.evidenceRequest))
+    errors.push("data.evidenceRequest must contain bounded safe windows or literal queries");
   const candidateFields = new Set([
     ...stringFields,
     ...arrayFields,

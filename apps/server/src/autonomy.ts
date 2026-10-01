@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { validationObservationState } from "../../../packages/shared/src/validation_observation.js";
 import { createHash, randomUUID } from "crypto";
 import {
   extractTrustedValidationFailureEvidence,
@@ -713,6 +714,9 @@ export interface AutonomyReliabilityMetrics {
   objectiveFirstPassRate: number | null;
   durationMs: { average: number | null; p50: number | null; p95: number | null };
   validationFailureRuns: number;
+  validationExecutedRuns: number;
+  validationDeferredRuns: number;
+  validationNotStartedRuns: number;
   validationEvidenceCoverageRate: number | null;
   validationFingerprintCollisionCount: number;
   transientValidationRetries: number;
@@ -3822,11 +3826,14 @@ export class AutonomyStore {
         )
         .all(nowIso) as typeof validationRows;
     }
-    const validationFailureRows = validationRows.filter((row) => Number(row.passed) !== 1);
+    const executedValidationRows = validationRows.filter(
+      (row) => validationObservationState(parseJsonObject(row.metadataJson)) === "executed",
+    );
+    const validationFailureRows = executedValidationRows.filter((row) => Number(row.passed) !== 1);
     let validationEvidenceCovered = 0;
     const transientRetryKeys = new Set<string>();
     const signaturesByFingerprint = new Map<string, Set<string>>();
-    for (const row of validationRows) {
+    for (const row of executedValidationRows) {
       const metadata = normalizeValidationEvidenceMetadata(parseJsonObject(row.metadataJson));
       const canonical = canonicalValidationFailureEvidence({
         command: asString(row.command),
@@ -3921,6 +3928,13 @@ export class AutonomyStore {
         p95: percentileValue(durations, 95),
       },
       validationFailureRuns: validationFailureRows.length,
+      validationExecutedRuns: executedValidationRows.length,
+      validationDeferredRuns: validationRows.filter(
+        (row) => validationObservationState(parseJsonObject(row.metadataJson)) === "deferred",
+      ).length,
+      validationNotStartedRuns: validationRows.filter(
+        (row) => validationObservationState(parseJsonObject(row.metadataJson)) === "not_started",
+      ).length,
       validationEvidenceCoverageRate:
         validationFailureRows.length > 0
           ? validationEvidenceCovered / validationFailureRows.length

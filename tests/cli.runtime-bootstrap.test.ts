@@ -18,10 +18,12 @@ import {
   resolveLegacyDirectWorktreeRoot,
 } from "../apps/workerpals/src/common/direct_worktree";
 import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
+import { RuntimeLogSinkDiagnostics } from "../packages/shared/src/runtime_diagnostics";
 import {
   buildCliClearTargets,
   buildEmbeddedRuntimeServiceLaunchPlan,
   buildEmbeddedRuntimeCrashEnvelope,
+  buildEmbeddedRuntimeHealthEnvelope,
   buildEmbeddedRuntimeCrashFingerprint,
   embeddedRuntimeRecoveryOutcome,
   embeddedServiceHealthCheck,
@@ -428,6 +430,51 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "[pushpals] embeddedRuntimeAction=Restart pushpals after fixing the runtime failure.",
     ]);
     expect(formatEmbeddedRuntimeHealthLines(null)).toEqual([]);
+  });
+
+  test("health failure and recovery telemetry include observation-only supervisor log sink timing", () => {
+    let now = 0;
+    const sink = new RuntimeLogSinkDiagnostics({ now: () => now });
+    sink.write(() => {
+      now += 1250;
+      throw new Error("private sink path");
+    });
+    const health = {
+      type: "health" as const,
+      service: "server",
+      healthy: false,
+      phase: "degraded" as const,
+      detail: "probe deadline",
+      failureKind: "transport_error" as const,
+      responseStatus: null,
+      consecutiveFailures: 1,
+      failureDurationMs: 0,
+      probeDurationMs: 2500,
+      probeTimeoutMs: 2500,
+      lastHealthyAt: null,
+      restartOnFailure: true,
+      observedAt: "2026-10-01T07:54:07.000Z",
+    };
+    const failed = buildEmbeddedRuntimeHealthEnvelope(health, sink);
+    expect(failed).toMatchObject({
+      event: "embedded_runtime_health",
+      healthy: false,
+      probeTimeoutMs: 2500,
+      supervisorLogSink: { failures: 1, slowWrites: 1, maxWriteDurationMs: 1250 },
+    });
+    now += 5000;
+    const recovered = buildEmbeddedRuntimeHealthEnvelope(
+      { ...health, healthy: true, phase: "recovered", failureKind: null, consecutiveFailures: 0 },
+      sink,
+    );
+    expect(recovered).toMatchObject({
+      healthy: true,
+      supervisorLogSink: { lastSlowWriteAgoMs: 5000, failures: 1 },
+    });
+    expect(JSON.stringify(failed)).not.toContain("private");
+    expect(failed.healthy).toBe(false);
+    expect(recovered.healthy).toBe(true);
+    expect(sink.snapshot().attempts).toBe(1); // Building telemetry must never write to its own sink.
   });
 
   test("embedded health change reporter stays quiet initially and reports each recovery only once", () => {

@@ -356,6 +356,264 @@ function expectLegacyDurableOwners(
 }
 
 describe("server CompletionQueue PR URL persistence", () => {
+  test("ordinary completions freeze every final worker gate and persist full host evidence across SQLite restart", () => {
+    let { jobs, completions, jobId, dbPath } = createSharedQueues();
+    try {
+      const authority = finalizationOptions(jobs, jobId).jobClaimAuthority!;
+      const commands = ["bun run aggregate", "bun run standalone", "git diff --check"];
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: "a".repeat(40),
+          branch: "refs/pushpals/agent/ordinary",
+          message: "ordinary",
+        },
+        finalizationOptions(jobs, jobId),
+      );
+      const completionId = String(handoff.completionId);
+      const first = completions.claim("ordinary-scm").completion!;
+      expect(first.reviewValidationPlan?.status).toBe("pending");
+      expect(
+        jobs.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: commands.map((command) => ({
+                command,
+                attempt: 1,
+                passed: true,
+                exitCode: 0,
+              })),
+              terminal: {
+                terminalStage: "publication_handoff",
+                metadata: { revisionAttempt: 1, validationRuns: commands.length },
+              },
+            },
+          },
+          authority,
+        ).ok,
+      ).toBe(true);
+      let db = (jobs as unknown as { db: Database }).db;
+      db.query(
+        "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+      ).run(completionId);
+      const second = completions.claim("ordinary-scm").completion!;
+      expect(second.reviewValidationPlan).toEqual({ version: 1, status: "ready", commands });
+      // A later partial diagnostic cannot weaken the candidate's frozen plan.
+      expect(
+        jobs.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: [{ command: commands[0], attempt: 1, passed: true, exitCode: 0 }],
+              terminal: { terminalStage: "publication_handoff" },
+            },
+          },
+          authority,
+        ).ok,
+      ).toBe(true);
+      db.query(
+        "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+      ).run(completionId);
+      completions.close();
+      jobs.close();
+      jobs = new JobQueue(dbPath);
+      completions = new CompletionQueue(dbPath);
+      const resumed = completions.claim("ordinary-scm").completion!;
+      expect(resumed.reviewValidationPlan).toEqual(second.reviewValidationPlan);
+      const report = {
+        ...trustedValidationReport({
+          ok: false,
+          command: commands[1],
+          candidateSha: "b".repeat(40),
+        }),
+        treeBinding: {
+          workerTreeSha: "c".repeat(40),
+          candidateTreeSha: "d".repeat(40),
+          planSource: "full_worker_plan",
+        },
+      };
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "standalone gate failed on changed tree",
+          undefined,
+          report,
+          "ordinary-scm",
+          first.claimToken,
+        ).ok,
+      ).toBe(false);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "standalone gate failed on changed tree",
+          undefined,
+          report,
+          "ordinary-scm",
+          resumed.claimToken,
+        ).ok,
+      ).toBe(true);
+      expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+        failureClass: "trusted_validation_failed",
+        terminalStage: "trusted_environment_validation",
+      });
+      db = (jobs as unknown as { db: Database }).db;
+      const row = db
+        .query(
+          "SELECT command, metadataJson FROM job_validation_runs WHERE jobId = ? AND json_extract(metadataJson, '$.source') = 'trusted_host'",
+        )
+        .get(jobId) as { command: string; metadataJson: string };
+      expect(row.command).toBe(commands[1]);
+      expect(JSON.parse(row.metadataJson)).toMatchObject({
+        candidateSha: "b".repeat(40),
+        treeBinding: report.treeBinding,
+      });
+      completions.close();
+      jobs.close();
+      jobs = new JobQueue(dbPath);
+      completions = new CompletionQueue(dbPath);
+      expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+        failureClass: "trusted_validation_failed",
+      });
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test("ordinary missing-plan holds are claim/checkpoint fenced and finite without requiring PR authority or blocking the next completion", () => {
+    let { jobs, completions, jobId, dbPath } = createSharedQueues();
+    try {
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: "a".repeat(40),
+          branch: "refs/pushpals/agent/ordinary-held",
+          message: "ordinary",
+        },
+        finalizationOptions(jobs, jobId),
+      );
+      const completionId = String(handoff.completionId);
+      let claim = completions.claim("ordinary-held-scm").completion!;
+      const firstToken = claim.claimToken;
+      for (let generation = 1; generation < 3; generation++) {
+        expect(claim.reviewValidationPlan?.status).toBe("pending");
+        const db = (jobs as unknown as { db: Database }).db;
+        db.query(
+          "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+        ).run(completionId);
+        completions.close();
+        jobs.close();
+        jobs = new JobQueue(dbPath);
+        completions = new CompletionQueue(dbPath);
+        claim = completions.claim("ordinary-held-scm").completion!;
+      }
+      expect(claim.claimGeneration).toBe(3);
+      const candidateRef = `refs/pushpals/validation/${createHash("sha256").update(completionId).digest("hex").slice(0, 32)}/3/candidate`;
+      const outcome = {
+        version: 1,
+        code: "publication_validation_unavailable",
+        scope: "ordinary_completion",
+        workerCandidateSha: "a".repeat(40),
+        retainedCandidateSha: "b".repeat(40),
+        retainedCandidateRef: candidateRef,
+      };
+      const report = {
+        version: 1,
+        baselineSha: "c".repeat(40),
+        candidateSha: outcome.retainedCandidateSha,
+        candidateRef,
+        results: [],
+      };
+      for (const override of [
+        { workerCandidateSha: "d".repeat(40) },
+        { retainedCandidateRef: candidateRef.replace("/3/", "/4/") },
+        { retainedCandidateSha: "e".repeat(40) },
+        { scope: "invalid" },
+      ]) {
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "missing full validation authority",
+            undefined,
+            report,
+            "ordinary-held-scm",
+            claim.claimToken,
+            { ...outcome, ...override },
+          ).ok,
+        ).toBe(false);
+      }
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "missing full validation authority",
+          undefined,
+          report,
+          "ordinary-held-scm",
+          firstToken,
+          outcome,
+        ).ok,
+      ).toBe(false);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "missing full validation authority",
+          undefined,
+          undefined,
+          "ordinary-held-scm",
+          claim.claimToken,
+          outcome,
+        ).ok,
+      ).toBe(false);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "missing full validation authority",
+          undefined,
+          report,
+          "ordinary-held-scm",
+          claim.claimToken,
+          outcome,
+        ),
+      ).toMatchObject({ ok: true, publicationHeld: true });
+      expect(completions.publicationBacklogSummary().backlog).toBe(0);
+      expect(
+        JSON.parse(completions.getCompletion(completionId)!.error!).publicationOutcome,
+      ).toEqual(outcome);
+      completions.close();
+      jobs.close();
+      jobs = new JobQueue(dbPath);
+      completions = new CompletionQueue(dbPath);
+      expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+        failureClass: "publication_validation_unavailable",
+        terminalStage: "publication",
+      });
+      expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+      const nextJob = enqueueClaimedJob(jobs, "ordinary-next");
+      const next = completions.enqueue(
+        {
+          jobId: nextJob,
+          sessionId: "dev",
+          commitSha: "f".repeat(40),
+          branch: "refs/pushpals/agent/next",
+          message: "next",
+        },
+        finalizationOptions(jobs, nextJob),
+      );
+      expect(completions.claim("ordinary-held-scm").completion?.id).toBe(next.completionId);
+      expect(
+        (jobs as unknown as { db: Database }).db
+          .query("SELECT COUNT(*) AS count FROM pr_repair_lifecycle")
+          .get(),
+      ).toEqual({ count: 0 });
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
   test.each(["passing", "retry-passed", "baseline-only", "missing-report", "failed"])(
     "classifies publication failure from terminal trusted evidence (%s), including SQLite reopen",
     (scenario) => {
@@ -777,6 +1035,24 @@ describe("server CompletionQueue PR URL persistence", () => {
             },
           ],
         };
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "PR repair cannot bypass exact PR authority",
+            undefined,
+            report,
+            "scm-held",
+            claim.claimToken,
+            {
+              version: 1,
+              code: "publication_validation_unavailable",
+              scope: "ordinary_completion",
+              workerCandidateSha: "c".repeat(40),
+              retainedCandidateSha: outcome.retainedCandidateSha,
+              retainedCandidateRef: candidateRef,
+            },
+          ).ok,
+        ).toBe(false);
         expect(
           completions.markFailedAndBlockJob(
             completionId,

@@ -9,6 +9,7 @@ import {
   containsPushPalsInternalUserRepoText,
   discoverRepoTargetProfiles,
   inferRepoValidationIdeas,
+  isRecentWorkDiversityObjective,
   normalizeTargetValidationIdeas,
   rankRepoTargetsForVision,
   resolveCompiledRepoObjectiveAttribution,
@@ -19,6 +20,45 @@ import {
 } from "../apps/remotebuddy/src/autonomous_engine";
 
 describe("RemoteBuddy autonomous engine idea generation", () => {
+  test("never-dispatched scheduling rejections do not create six-hour target cooldowns", () => {
+    const now = Date.parse("2026-10-01T12:00:00Z");
+    const row = {
+      updated_at: new Date(now - 60_000).toISOString(),
+      status: "rejected",
+      job_id: null,
+    } as any;
+    expect(isRecentWorkDiversityObjective(row, now)).toBe(false);
+    // Older snapshots may omit job_id from actual completed work.
+    expect(isRecentWorkDiversityObjective({ ...row, status: "completed" }, now)).toBe(true);
+    expect(isRecentWorkDiversityObjective({ ...row, status: "dispatched" }, now)).toBe(true);
+    expect(
+      isRecentWorkDiversityObjective({ ...row, status: "completed", job_id: "executed-job" }, now),
+    ).toBe(true);
+    expect(
+      isRecentWorkDiversityObjective(
+        {
+          ...row,
+          status: "failed",
+          job_id: "infra-job",
+          execution_started: false,
+          failure_class: "environment.docker",
+        },
+        now,
+      ),
+    ).toBe(false);
+    expect(
+      isRecentWorkDiversityObjective(
+        {
+          ...row,
+          status: "completed",
+          job_id: "executed-job",
+          updated_at: new Date(now - 7 * 60 * 60_000).toISOString(),
+        },
+        now,
+      ),
+    ).toBe(false);
+  });
+
   const vision = {
     one_sentence:
       "Continuously improve autonomous repo delivery with safe, auditable, and high-confidence workflows.",
